@@ -45,7 +45,7 @@ echo "Compiling HIP training backend ($ARCH)..."
     src-hip/cuda_shim.cpp -o build/cuda_shim.o
 g++ -shared -fPIC -fopenmp \
     build/bindings_hip.o build/cuda_shim.o "$STATIC_LIB" "$RAYLIB_NAME/lib/libraylib.a" \
-    -L$ROCM/lib -lamdhip64 -lhipblas -lhiprand -lrocrand -lrccl \
+    -L$ROCM/lib -lamdhip64 -lhipblas -lhiprand -lrocrand -lrccl -lMIOpen \
     -Wl,-rpath,$ROCM/lib -Bsymbolic-functions \
     -lm -lpthread -lomp5 \
     -o "$OUTPUT"

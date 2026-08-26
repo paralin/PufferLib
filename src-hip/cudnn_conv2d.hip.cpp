@@ -6,8 +6,6 @@
 
 #ifndef CUDNN_CONV2D_CU
 #define CUDNN_CONV2D_CU
-#ifndef CUDNN_CONV2D_CU
-#define CUDNN_CONV2D_CU
 
 #include <hip/hip_runtime.h>
 #include <miopen/miopen.h>
