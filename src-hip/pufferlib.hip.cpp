@@ -8,7 +8,7 @@
 
 #include <time.h>
 #include "models.hip.cpp"
-#include "ocean_stub.cpp"
+#include "ocean.hip.cpp"
 #include "muon.hip.cpp"
 #include "vecenv.h"
 // AMD build: ocean.cu custom encoders are unavailable; stubs live at file end.
@@ -2334,14 +2334,4 @@ void close_impl(PuffeRL& pufferl) {
     if (pufferl.nccl_comm != nullptr) {
         ncclCommDestroy(pufferl.nccl_comm);
     }
-}
-
-
-// AMD build: ocean.cu custom encoders/decoders are unavailable.
-// No-op matches upstream behavior for envs without custom networks.
-static void create_custom_encoder(const std::string& env_name, Encoder* enc) {
-    (void)env_name; (void)enc;
-}
-static void create_custom_decoder(const std::string& env_name, Decoder* dec) {
-    (void)env_name; (void)dec;
 }
