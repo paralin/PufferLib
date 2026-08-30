@@ -2033,6 +2033,9 @@ void pufferl_load_policy(PuffeRL* pufferl, int i, const char* path) {
         Prec* state = &pol->buffer_states[buffer];
         cudaMemset(state->data, 0, numel(state->shape) * sizeof(precision_t));
     }
+    if (i == 0 && pufferl->hypers.async) {
+        puf_copy(&pufferl->actor_param, &pol->param, pufferl->default_stream);
+    }
     cudaDeviceSynchronize();
 }
 
@@ -3448,6 +3451,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             pufferl_load_policy(pufferl, 0, model);
         }
     }
+
     Selfplay selfplay = {0};
     if (use_selfplay) {
         char initial_checkpoint[4096];
