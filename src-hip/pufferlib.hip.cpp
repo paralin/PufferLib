@@ -5,6 +5,7 @@
 #include "nvml.h"
 #include <rccl/rccl.h>
 #include <vector>
+#include <thread>
 
 #include <time.h>
 #include "models.hip.cpp"
@@ -101,6 +102,7 @@ struct TrainGraph {
     PrecisionTensor mb_obs;         // (B, T, input_size)
     PrecisionTensor mb_actions;     // (B, T, num_atns)
     PrecisionTensor mb_logprobs;    // (B, T)
+    PrecisionTensor mb_terminals;   // (B, T), reset recurrent state before each marked timestep.
     PrecisionTensor mb_advantages;  // ...
     PrecisionTensor mb_values;
     PrecisionTensor mb_returns;
@@ -117,6 +119,7 @@ void register_train_buffers(TrainGraph& bufs, Allocator* alloc, int B, int T, in
         .mb_obs =           {.shape = {B, T, input_size}},
         .mb_actions =       {.shape = {B, T, num_atns}},
         .mb_logprobs =      {.shape = {B, T}},
+        .mb_terminals =     {.shape = {B, T}},
         .mb_advantages =    {.shape = {B, T}},
         .mb_values =        {.shape = {B, T}},
         .mb_returns =       {.shape = {B, T}},
@@ -129,6 +132,7 @@ void register_train_buffers(TrainGraph& bufs, Allocator* alloc, int B, int T, in
     alloc_register(alloc, &bufs.mb_state);
     alloc_register(alloc, &bufs.mb_actions);
     alloc_register(alloc, &bufs.mb_logprobs);
+    alloc_register(alloc, &bufs.mb_terminals);
     alloc_register(alloc, &bufs.mb_advantages);
     alloc_register(alloc, &bufs.mb_prio);
     alloc_register(alloc, &bufs.mb_values);
@@ -175,6 +179,7 @@ struct PPOKernelArgs {
     int logits_stride_n, logits_stride_t, logits_stride_a;
     int values_stride_n, values_stride_t;
     bool is_continuous;
+    bool llb_autoregressive;
 };
 
 struct PPOBuffersPuf {
@@ -320,6 +325,7 @@ typedef struct {
     // Threading
     int num_threads;
     int seed;
+    bool overlap;  // Native collection/training pipeline; requires cudagraphs = -1.
 } HypersT;
 
 // A frozen weight bank: same shape as the primary, but its own params buffer
@@ -351,10 +357,26 @@ typedef struct {
     ncclComm_t nccl_comm;  // NCCL communicator for multi-GPU
     HypersT hypers;
     bool is_continuous;  // True if all action dimensions are continuous (size==1)
+    bool llb_autoregressive;  // Selects LLB conditional sampling and PPO math.
     PrecisionTensor* buffer_states;  // Per-buffer states for contiguous access
     PolicyActivations* buffer_activations;  // Per-buffer inference activations
     RolloutBuf rollouts;
     RolloutBuf train_rollouts;  // Pre-allocated transposed copy for train_impl
+    // The overlap path has two source buffers. A collector writes one complete
+    // horizon while PPO reads the other. No slot is ever read and written together.
+    RolloutBuf overlap_rollouts[2];
+    long overlap_versions[2];
+    bool overlap_ready[2];
+    bool overlap_consumed[2];
+    int overlap_next_slot;
+    int active_rollout_slot;
+    long trainable_version;
+    WeightBank collector_bank;  // Immutable behavior weights for one horizon.
+    RolloutBuf* active_rollouts;
+    std::thread collector_thread;
+    bool collector_running;
+    bool overlap_busy;
+    double collector_seconds;
     EnvBuf env;
     TrainGraph train_buf;
     PrecisionTensor advantages_puf;  // Pre-allocated for train_impl (B, T)
@@ -492,6 +514,35 @@ static const signed char* get_head_consume_dev(int* stride) {
     return g_hc_dev;
 }
 
+// LLB's ten-frame ABI has five initial/final/switch categorical chains.
+// The decoder stores all conditional tables in group order: S + S*S + S*S*10.
+__device__ __forceinline__ int llb_group_size(int group) {
+    constexpr int sizes[5] = {3, 3, 5, 2, 2};
+    return sizes[group];
+}
+
+__device__ __forceinline__ int llb_sample_head(
+        const precision_t* logits, int base, int offset, int size,
+        hiprandStatePhilox4_32_10_t* state, float* log_prob, float* entropy) {
+    float maximum = -INFINITY;
+    for (int i = 0; i < size; ++i) maximum = fmaxf(maximum, safe_logit(logits, base, offset, i));
+    float sum = 0.0f;
+    for (int i = 0; i < size; ++i) sum += expf(safe_logit(logits, base, offset, i) - maximum);
+    float lse = maximum + logf(sum);
+    float draw = hiprand_uniform(state), cumulative = 0.0f;
+    int selected = size - 1;
+    *entropy = 0.0f;
+    for (int i = 0; i < size; ++i) {
+        float lp = safe_logit(logits, base, offset, i) - lse;
+        float probability = expf(lp);
+        *entropy -= probability * lp;
+        cumulative += probability;
+        if (draw < cumulative && selected == size - 1) selected = i;
+    }
+    *log_prob = safe_logit(logits, base, offset, selected) - lse;
+    return selected;
+}
+
 __global__ void sample_logits(
         PrecisionTensor dec_out,              // (B, logits_dim + 1 for values)
         PrecisionTensor logstd_puf,           // (1, od) - continuous actions only
@@ -503,7 +554,8 @@ __global__ void sample_logits(
         const precision_t* __restrict__ action_mask, // (B, A_total) or nullptr
         int mask_stride,                      // 0 when action_mask is nullptr
         const signed char* __restrict__ head_consume, // (nverbs, num_atns) or nullptr
-        int hc_stride) {
+        int hc_stride,
+        bool llb_autoregressive) {
     int B = dec_out.shape[0];
     int fused_cols = dec_out.shape[1];
     int num_atns = numel(act_sizes_puf.shape);
@@ -550,70 +602,51 @@ __global__ void sample_logits(
             actions[idx * num_atns + h] = stored_action_p;
             total_log_prob += log_prob;
         }
+    } else if (llb_autoregressive) {
+        int offset = 0;
+        for (int group = 0; group < 5; ++group) {
+            int size = llb_group_size(group);
+            float lp, entropy;
+            int initial = llb_sample_head(logits, logits_base, offset, size, &state, &lp, &entropy);
+            total_log_prob += lp;
+            offset += size;
+            int final_offset = offset + initial * size;
+            int final = llb_sample_head(logits, logits_base, final_offset, size, &state, &lp, &entropy);
+            total_log_prob += lp;
+            offset += size * size;
+            int switch_offset = offset + (initial * size + final) * 10;
+            int switch_frame = llb_sample_head(logits, logits_base, switch_offset, 10, &state, &lp, &entropy);
+            total_log_prob += lp;
+            offset += size * size * 10;
+            int action = group * 3;
+            actions[idx * num_atns + action] = from_float(initial);
+            actions[idx * num_atns + action + 1] = from_float(final);
+            actions[idx * num_atns + action + 2] = from_float(switch_frame);
+        }
     } else {
-        // Discrete action sampling (original multinomial logic)
-        int logits_offset = 0;  // offset within row for current action head
+        int logits_offset = 0;
         int mask_base = (action_mask != nullptr) ? idx * mask_stride : 0;
-
         for (int h = 0; h < num_atns; ++h) {
-            int A = act_sizes[h];  // size of this action head
-
-            // Step 1: Find max and sum for numerical stability (with nan_to_num)
+            int A = act_sizes[h];
             float max_val = -INFINITY;
             float sum_exp = 0.0f;
             for (int a = 0; a < A; ++a) {
                 float l = masked_logit(logits, logits_base, logits_offset, a, action_mask, mask_base);
-                if (l > max_val) {
-                    sum_exp *= expf(max_val - l);
-                    max_val = l;
-                }
+                if (l > max_val) { sum_exp *= expf(max_val - l); max_val = l; }
                 sum_exp += expf(l - max_val);
             }
             float logsumexp = max_val + logf(sum_exp);
-
-            // Step 3: Generate random value for this action head
-            float rand_val = hiprand_uniform(&state);
-
-            // Step 4: Multinomial sampling using inverse CDF
-            float cumsum = 0.0f;
-            int sampled_action = -1;  // sentinel: no action chosen yet
-
+            float rand_val = hiprand_uniform(&state), cumsum = 0.0f;
+            int sampled_action = A - 1;
             for (int a = 0; a < A; ++a) {
-                float l = masked_logit(logits, logits_base, logits_offset, a, action_mask, mask_base);
-                float prob = expf(l - logsumexp);
-                cumsum += prob;
-                if (rand_val < cumsum) {
-                    sampled_action = a;
-                    break;
-                }
+                cumsum += expf(masked_logit(logits, logits_base, logits_offset, a, action_mask, mask_base) - logsumexp);
+                if (rand_val < cumsum) { sampled_action = a; break; }
             }
-
-            // Float rounding can leave cumsum < 1.0; fall back to the last legal action.
-            if (sampled_action < 0) {
-                sampled_action = A - 1;
-                if (action_mask != nullptr) {
-                    for (int a = A - 1; a >= 0; --a) {
-                        if (to_float(action_mask[mask_base + logits_offset + a]) != 0.0f) {
-                            sampled_action = a;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Step 5: Gather log probability of sampled action
             float sampled_logit = masked_logit(logits, logits_base, logits_offset, sampled_action, action_mask, mask_base);
-            float log_prob = sampled_logit - logsumexp;
-
-            // Write action for this head
             actions[idx * num_atns + h] = from_float(sampled_action);
-            // consumed-head gating: only heads the sampled verb uses count
             int verb = (int)to_float(actions[idx * num_atns]);
-            int used = (head_consume == nullptr || h == 0)
-                     ? 1 : (int)head_consume[verb * hc_stride + h];
-            if (used) total_log_prob += log_prob;
-
-            // Advance to next action head
+            int used = (head_consume == nullptr || h == 0) ? 1 : (int)head_consume[verb * hc_stride + h];
+            if (used) total_log_prob += sampled_logit - logsumexp;
             logits_offset += A;
         }
     }
@@ -628,12 +661,22 @@ __global__ void sample_logits(
     rng_states[idx] = state;
 }
 
+__global__ void reset_recurrent_state(precision_t* state, const precision_t* terminals,
+        int layers, int batch, int hidden) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = layers * batch * hidden;
+    if (idx >= total) return;
+    int row = (idx / hidden) % batch;
+    if (to_float(terminals[row]) != 0.0f) state[idx] = from_float(0.0f);
+}
+
 // Single step rollout forward pass. Called by each environment worker in their
 // own buffer thread. This operation is cudagraphed.
 extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     PuffeRL* pufferl = (PuffeRL*)ctx;
     HypersT& hypers = pufferl->hypers;
-    int graph = t * hypers.num_buffers + buf;
+    int graph_slot = hypers.overlap ? pufferl->active_rollout_slot : 0;
+    int graph = (graph_slot * hypers.horizon + t) * hypers.num_buffers + buf;
     profile_begin("fused_rollout", hypers.profile);
 
     hipStream_t current_stream = tl_stream;
@@ -650,7 +693,7 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
                 && "hipStreamBeginCapture failed");
     }
 
-    RolloutBuf& rollouts = pufferl->rollouts;
+    RolloutBuf& rollouts = pufferl->active_rollouts ? *pufferl->active_rollouts : pufferl->rollouts;
     EnvBuf& env = pufferl->env;
     int block_size = pufferl->vec->total_agents / hypers.num_buffers;
     int start = buf * block_size;
@@ -701,7 +744,12 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
         PolicyWeights* w_bank;
         PolicyActivations* a_bank;
         PrecisionTensor* s_bank;
-        if (b == 0) {
+        if (b == 0 && pufferl->hypers.overlap) {
+            p_bank = &pufferl->collector_bank.policy;
+            w_bank = &pufferl->collector_bank.weights;
+            a_bank = &pufferl->collector_bank.buffer_activations[buf];
+            s_bank = &pufferl->collector_bank.buffer_states[buf];
+        } else if (b == 0) {
             p_bank = &pufferl->policy;
             w_bank = &pufferl->weights;
             a_bank = &pufferl->buffer_activations[buf];
@@ -726,6 +774,10 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
             mask_stride_b = mask_stride;
         }
 
+        PrecisionTensor term_b = puf_slice(rollouts.terminals, t, sub_start, bank_size);
+        int state_elements = numel(s_bank->shape);
+        reset_recurrent_state<<<grid_size(state_elements), BLOCK_SIZE, 0, stream>>>(
+            s_bank->data, term_b.data, s_bank->shape[0], bank_size, s_bank->shape[2]);
         PrecisionTensor dec_puf = policy_forward(p_bank, *w_bank, *a_bank, obs_b, *s_bank, stream);
 
         PrecisionTensor p_logstd = {};
@@ -741,7 +793,8 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
             dec_puf, p_logstd, pufferl->act_sizes_puf,
             act_b.data, lp_b.data, val_b.data,
             pufferl->rng_states[buf] + bank_off,
-            mask_b.data, mask_stride_b, hc_dev_s, hc_stride_s);
+            mask_b.data, mask_stride_b, hc_dev_s, hc_stride_s,
+            pufferl->llb_autoregressive);
 
         cast<<<grid_size(numel(act_b.shape)), BLOCK_SIZE, 0, stream>>>(
                 env.actions.data + (long)sub_start * act_cols,
@@ -902,23 +955,64 @@ __global__ void ppo_loss_compute(
     int mask_base = (a.action_mask != nullptr)
         ? n * a.mask_stride_n + t * a.mask_stride_t : 0;
 
-    if (!a.is_continuous) {
-        // consumed-head gating: heads the sampled verb (head 0) does not use
-        // contribute no logprob/entropy/gradient (see env_head_consume_map)
+    if (!a.is_continuous && a.llb_autoregressive) {
+        int offset = 0;
+        for (int group = 0; group < 5; ++group) {
+            int size = llb_group_size(group);
+            int initial = static_cast<int>(g.actions[nt * a.num_atns + group * 3]);
+            int final = static_cast<int>(g.actions[nt * a.num_atns + group * 3 + 1]);
+            int switch_frame = static_cast<int>(g.actions[nt * a.num_atns + group * 3 + 2]);
+            float initial_lse, initial_entropy, lp;
+            ppo_discrete_head(a.logits, logits_base, a.logits_stride_a, offset,
+                size, initial, nullptr, 0, &initial_lse, &initial_entropy, &lp);
+            total_log_prob += lp;
+            total_entropy += initial_entropy;
+            for (int i = 0; i < size; ++i) {
+                float initial_logp = load_logit_masked(a.logits, logits_base,
+                    a.logits_stride_a, offset, i, nullptr, 0) - initial_lse;
+                float initial_probability = expf(initial_logp);
+                int final_offset = offset + size + i * size;
+                float final_lse, final_entropy, ignored;
+                ppo_discrete_head(a.logits, logits_base, a.logits_stride_a,
+                    final_offset, size, i == initial ? final : 0, nullptr, 0,
+                    &final_lse, &final_entropy, &ignored);
+                total_entropy += initial_probability * final_entropy;
+                for (int f = 0; f < size; ++f) {
+                    float final_logp = load_logit_masked(a.logits, logits_base,
+                        a.logits_stride_a, final_offset, f, nullptr, 0) - final_lse;
+                    float final_probability = expf(final_logp);
+                    int switch_offset = offset + size + size * size + (i * size + f) * 10;
+                    float switch_lse, switch_entropy;
+                    ppo_discrete_head(a.logits, logits_base, a.logits_stride_a,
+                        switch_offset, 10, (i == initial && f == final) ? switch_frame : 0,
+                        nullptr, 0, &switch_lse, &switch_entropy, &ignored);
+                    total_entropy += initial_probability * final_probability * switch_entropy;
+                }
+            }
+            float selected_lse, selected_entropy;
+            ppo_discrete_head(a.logits, logits_base, a.logits_stride_a,
+                offset + size + initial * size, size, final, nullptr, 0,
+                &selected_lse, &selected_entropy, &lp);
+            total_log_prob += lp;
+            ppo_discrete_head(a.logits, logits_base, a.logits_stride_a,
+                offset + size + size * size + (initial * size + final) * 10,
+                10, switch_frame, nullptr, 0, &selected_lse, &selected_entropy, &lp);
+            total_log_prob += lp;
+            offset += size + size * size + size * size * 10;
+        }
+    } else if (!a.is_continuous) {
         int verb = static_cast<int>(g.actions[nt * a.num_atns]);
         int logits_offset = 0;
         for (int h = 0; h < a.num_atns; ++h) {
             int A = a.act_sizes[h];
             int act = static_cast<int>(g.actions[nt * a.num_atns + h]);
             head_act[h] = act;
-            int used = (a.head_consume == nullptr || h == 0)
-                     ? 1 : (int)a.head_consume[verb * a.hc_stride + h];
+            int used = (a.head_consume == nullptr || h == 0) ? 1 : (int)a.head_consume[verb * a.hc_stride + h];
             head_used[h] = used;
             float lse, ent, lp;
             ppo_discrete_head(a.logits, logits_base, a.logits_stride_a, logits_offset, A, act,
                               a.action_mask, mask_base, &lse, &ent, &lp);
-            head_logsumexp[h] = lse;
-            head_entropy[h] = ent;
+            head_logsumexp[h] = lse; head_entropy[h] = ent;
             if (used) { total_log_prob += lp; total_entropy += ent; }
             logits_offset += A;
         }
@@ -952,29 +1046,91 @@ __global__ void ppo_loss_compute(
     }
     float d_new_logp = d_ratio * ratio;
 
-    if (!a.is_continuous) {
+    if (!a.is_continuous && a.llb_autoregressive) {
+        for (int j = 0; j < a.A_total; ++j) a.grad_logits[grad_logits_base + j] = 0.0f;
+        int offset = 0;
+        for (int group = 0; group < 5; ++group) {
+            int size = llb_group_size(group);
+            int initial = static_cast<int>(g.actions[nt * a.num_atns + group * 3]);
+            int final = static_cast<int>(g.actions[nt * a.num_atns + group * 3 + 1]);
+            int switch_frame = static_cast<int>(g.actions[nt * a.num_atns + group * 3 + 2]);
+            float initial_lse, initial_entropy, ignored;
+            ppo_discrete_head(a.logits, logits_base, a.logits_stride_a, offset,
+                size, initial, nullptr, 0, &initial_lse, &initial_entropy, &ignored);
+            float downstream_initial[5] = {};
+            float expected_downstream = 0.0f;
+            for (int i = 0; i < size; ++i) {
+                int final_offset = offset + size + i * size;
+                float final_lse, final_entropy;
+                ppo_discrete_head(a.logits, logits_base, a.logits_stride_a,
+                    final_offset, size, 0, nullptr, 0, &final_lse, &final_entropy, &ignored);
+                float switch_expectation = 0.0f;
+                float switch_entropies[5] = {};
+                for (int f = 0; f < size; ++f) {
+                    float final_lp = load_logit_masked(a.logits, logits_base,
+                        a.logits_stride_a, final_offset, f, nullptr, 0) - final_lse;
+                    int switch_offset = offset + size + size * size + (i * size + f) * 10;
+                    float switch_lse, switch_entropy;
+                    ppo_discrete_head(a.logits, logits_base, a.logits_stride_a,
+                        switch_offset, 10, 0, nullptr, 0, &switch_lse, &switch_entropy, &ignored);
+                    switch_entropies[f] = switch_entropy;
+                    switch_expectation += expf(final_lp) * switch_entropy;
+                    float prefix_probability = expf(load_logit_masked(a.logits, logits_base,
+                        a.logits_stride_a, offset, i, nullptr, 0) - initial_lse + final_lp);
+                    for (int k = 0; k < 10; ++k) {
+                        float switch_lp = load_logit_masked(a.logits, logits_base,
+                            a.logits_stride_a, switch_offset, k, nullptr, 0) - switch_lse;
+                        float probability = expf(switch_lp);
+                        float entropy_gradient = prefix_probability * probability * (-switch_entropy - switch_lp);
+                        float policy_gradient = (i == initial && f == final)
+                            ? ((k == switch_frame ? d_new_logp : 0.0f) - probability * d_new_logp) : 0.0f;
+                        a.grad_logits[grad_logits_base + switch_offset + k] =
+                            policy_gradient + d_entropy_term * entropy_gradient;
+                    }
+                }
+                downstream_initial[i] = final_entropy + switch_expectation;
+                float initial_probability = expf(load_logit_masked(a.logits, logits_base,
+                    a.logits_stride_a, offset, i, nullptr, 0) - initial_lse);
+                expected_downstream += initial_probability * downstream_initial[i];
+                for (int f = 0; f < size; ++f) {
+                    float final_lp = load_logit_masked(a.logits, logits_base,
+                        a.logits_stride_a, final_offset, f, nullptr, 0) - final_lse;
+                    float probability = expf(final_lp);
+                    float entropy_gradient = initial_probability * probability *
+                        (-final_entropy - final_lp + switch_entropies[f] - switch_expectation);
+                    float policy_gradient = i == initial
+                        ? ((f == final ? d_new_logp : 0.0f) - probability * d_new_logp) : 0.0f;
+                    a.grad_logits[grad_logits_base + final_offset + f] =
+                        policy_gradient + d_entropy_term * entropy_gradient;
+                }
+            }
+            for (int i = 0; i < size; ++i) {
+                float initial_lp = load_logit_masked(a.logits, logits_base,
+                    a.logits_stride_a, offset, i, nullptr, 0) - initial_lse;
+                float probability = expf(initial_lp);
+                float entropy_gradient = probability * (-initial_entropy - initial_lp
+                    + downstream_initial[i] - expected_downstream);
+                float policy_gradient = (i == initial ? d_new_logp : 0.0f) - probability * d_new_logp;
+                a.grad_logits[grad_logits_base + offset + i] =
+                    policy_gradient + d_entropy_term * entropy_gradient;
+            }
+            offset += size + size * size + size * size * 10;
+        }
+    } else if (!a.is_continuous) {
         int logits_offset = 0;
         for (int h = 0; h < a.num_atns; ++h) {
             int A = a.act_sizes[h];
-            if (!head_used[h]) {           // gated head: no gradient
-                for (int j = 0; j < A; ++j)
-                    a.grad_logits[grad_logits_base + logits_offset + j] = 0.0f;
-                logits_offset += A;
-                continue;
+            if (!head_used[h]) {
+                for (int j = 0; j < A; ++j) a.grad_logits[grad_logits_base + logits_offset + j] = 0.0f;
+                logits_offset += A; continue;
             }
-            int act = head_act[h];
-            float logsumexp = head_logsumexp[h];
-            float ent = head_entropy[h];
-
+            int act = head_act[h]; float logsumexp = head_logsumexp[h]; float ent = head_entropy[h];
             for (int j = 0; j < A; ++j) {
-                float l = load_logit_masked(a.logits, logits_base, a.logits_stride_a,
-                                            logits_offset, j, a.action_mask, mask_base);
-                float logp = l - logsumexp;
-                float p = __expf(logp);
-                float d_logit = (j == act) ? d_new_logp : 0.0f;
-                d_logit -= p * d_new_logp;
-                d_logit += d_entropy_term * p * (-ent - logp);
-                a.grad_logits[grad_logits_base + logits_offset + j] = d_logit;
+                float l = load_logit_masked(a.logits, logits_base, a.logits_stride_a, logits_offset, j, a.action_mask, mask_base);
+                float logp = l - logsumexp; float probability = __expf(logp);
+                float gradient = (j == act ? d_new_logp : 0.0f) - probability * d_new_logp;
+                gradient += d_entropy_term * probability * (-ent - logp);
+                a.grad_logits[grad_logits_base + logits_offset + j] = gradient;
             }
             logits_offset += A;
         }
@@ -1101,7 +1257,7 @@ void ppo_loss_fwd_bwd(
         TrainGraph& graph,
         IntTensor& act_sizes, FloatTensor& losses_acc,
         float clip_coef, float vf_clip_coef, float vf_coef, const float* ent_coef,
-        PPOBuffersPuf& bufs, bool is_continuous,
+        PPOBuffersPuf& bufs, bool is_continuous, bool llb_autoregressive,
         hipStream_t stream) {
     int N = dec_out.shape[0], T = dec_out.shape[1], fused_cols = dec_out.shape[2];
     int A_total = fused_cols - 1;  // last column is value
@@ -1164,6 +1320,7 @@ PPOKernelArgs args = {
         .logits_stride_n = T * fused_cols, .logits_stride_t = fused_cols, .logits_stride_a = 1,
         .values_stride_n = T * fused_cols, .values_stride_t = fused_cols,
         .is_continuous = is_continuous,
+        .llb_autoregressive = llb_autoregressive,
     };
 
     ppo_loss_compute<<<ppo_grid, PPO_THREADS, 0, stream>>>(ppo_partials_buf, args, graph_args);
@@ -1522,16 +1679,19 @@ __global__ void select_copy(RolloutBuf rollouts, TrainGraph graph,
         copy_bytes((const char*)rollouts.logprobs.data, (char*)graph.mb_logprobs.data, src_row, mb, lp_row_bytes);
         break;
     case 3:
+        copy_bytes((const char*)rollouts.terminals.data, (char*)graph.mb_terminals.data, src_row, mb, lp_row_bytes);
+        break;
+    case 4:
         copy_values_adv_returns(rollouts.values.data, graph.mb_values.data,
                 advantages, graph.mb_advantages.data,
                 graph.mb_returns.data, src_row, mb, horizon);
         break;
-    case 4:
+    case 5:
         if (threadIdx.x == 0) {
             graph.mb_prio.data[mb] = from_float(mb_prio[mb]);
         }
         break;
-    case 5:
+    case 6:
         if (graph.mb_action_mask.data != nullptr) {
             int mask_row_bytes = (numel(rollouts.action_mask.shape)
                 / rollouts.action_mask.shape[0]) * sizeof(precision_t);
@@ -1549,15 +1709,67 @@ inline float cosine_annealing(float lr_base, float lr_min, long t, long T) {
     return lr_min + 0.5f*(lr_base - lr_min)*(1.0f + std::cos(M_PI * ratio));
 }
 
-void train_impl(PuffeRL& pufferl) {
+struct FiniteDiagnostic {
+    unsigned long long count;
+    unsigned long long first;
+};
+
+__global__ void find_nonfinite_precision(const precision_t* values, long size, FiniteDiagnostic* diagnostic) {
+    long index = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < size && !isfinite(to_float(values[index]))) {
+        atomicAdd(&diagnostic->count, 1ULL);
+        atomicMin(&diagnostic->first, (unsigned long long)index);
+    }
+}
+
+__global__ void find_nonfinite_float(const float* values, long size, FiniteDiagnostic* diagnostic) {
+    long index = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < size && !isfinite(values[index])) {
+        atomicAdd(&diagnostic->count, 1ULL);
+        atomicMin(&diagnostic->first, (unsigned long long)index);
+    }
+}
+
+static void finish_finite_check(const char* label, FiniteDiagnostic* device,
+        FiniteDiagnostic diagnostic, hipStream_t stream) {
+    hipMemcpyAsync(&diagnostic, device, sizeof(diagnostic), hipMemcpyDeviceToHost, stream);
+    hipStreamSynchronize(stream);
+    hipFree(device);
+    if (diagnostic.count != 0) {
+        throw std::runtime_error(std::string("nonfinite stage=") + label
+            + " count=" + std::to_string(diagnostic.count)
+            + " first=" + std::to_string(diagnostic.first));
+    }
+}
+
+static void require_finite_precision(const char* label, const precision_t* values, long count, hipStream_t stream) {
+    FiniteDiagnostic diagnostic = {0, (unsigned long long)count};
+    FiniteDiagnostic* device;
+    hipMalloc(&device, sizeof(FiniteDiagnostic));
+    hipMemcpyAsync(device, &diagnostic, sizeof(diagnostic), hipMemcpyHostToDevice, stream);
+    find_nonfinite_precision<<<grid_size(count), BLOCK_SIZE, 0, stream>>>(values, count, device);
+    finish_finite_check(label, device, diagnostic, stream);
+}
+
+static void require_finite_float(const char* label, const float* values, long count, hipStream_t stream) {
+    FiniteDiagnostic diagnostic = {0, (unsigned long long)count};
+    FiniteDiagnostic* device;
+    hipMalloc(&device, sizeof(FiniteDiagnostic));
+    hipMemcpyAsync(device, &diagnostic, sizeof(diagnostic), hipMemcpyHostToDevice, stream);
+    find_nonfinite_float<<<grid_size(count), BLOCK_SIZE, 0, stream>>>(values, count, device);
+    finish_finite_check(label, device, diagnostic, stream);
+}
+
+void train_impl(PuffeRL& pufferl, RolloutBuf* overlap_source = nullptr) {
     // Update to HypersT& p
     HypersT& hypers = pufferl.hypers;
+    bool finite_debug = getenv("PUFFER_HIP_FINITE_DEBUG") != nullptr;
 
-    hipEventRecord(pufferl.profile.events[0]);  // pre-loop start
     hipStream_t train_stream = pufferl.default_stream;
+    hipEventRecord(pufferl.profile.events[0], train_stream);  // pre-loop start
 
     // Transpose from rollout layout (T, B, ...) to train layout (B, T, ...)
-    RolloutBuf& src = pufferl.rollouts;
+    RolloutBuf& src = overlap_source ? *overlap_source : pufferl.rollouts;
     RolloutBuf& rollouts = pufferl.train_rollouts;
     PrecisionTensor& advantages_puf = pufferl.advantages_puf;
 
@@ -1627,11 +1839,11 @@ void train_impl(PuffeRL& pufferl) {
     // Annealed priority exponent
     float anneal_beta = prio_beta0 + (1.0f - prio_beta0) * prio_alpha * (float)current_epoch/(float)total_epochs;
     TrainGraph& graph = pufferl.train_buf;
-    hipEventRecord(pufferl.profile.events[1]);  // pre-loop end
+    hipEventRecord(pufferl.profile.events[1], train_stream);  // pre-loop end
 
     int total_minibatches = hypers.replay_ratio * batch_size / hypers.minibatch_size;
     for (int mb = 0; mb < total_minibatches; ++mb) {
-        hipEventRecord(pufferl.profile.events[2]);  // start of misc (overwritten each iter)
+        hipEventRecord(pufferl.profile.events[2], train_stream);  // start of misc (overwritten each iter)
         puf_zero(&advantages_puf, train_stream);
 
         profile_begin("compute_advantage", hypers.profile);
@@ -1659,19 +1871,19 @@ void train_impl(PuffeRL& pufferl) {
             RolloutBuf sel_src = rollouts;
             sel_src.values = rollouts.values;
             int mb_segs = pufferl.prio_bufs.idx.shape[0];
-            int channels = (graph.mb_action_mask.data != nullptr) ? 6 : 5;
+            int channels = (graph.mb_action_mask.data != nullptr) ? 7 : 6;
             select_copy<<<dim3(mb_segs, channels), SELECT_COPY_THREADS, 0, train_stream>>>(
                 sel_src, graph, pufferl.prio_bufs.idx.data,
                 advantages_puf.data, pufferl.prio_bufs.mb_prio.data);
         }
         profile_end(hypers.profile);
 
-        hipEventRecord(pufferl.profile.events[3]);  // end misc / start forward
+        hipEventRecord(pufferl.profile.events[3], train_stream);  // end misc / start forward
         profile_begin("train_forward_backward", hypers.profile);
         if (pufferl.train_captured) {
             hipGraphLaunch(pufferl.train_cudagraph, train_stream);
         } else {
-            bool capturing = pufferl.train_warmup == hypers.cudagraphs;
+            bool capturing = !finite_debug && pufferl.train_warmup == hypers.cudagraphs;
             if (capturing) {
                 assert(hipStreamBeginCapture(train_stream, hipStreamCaptureModeGlobal) == hipSuccess
                         && "hipStreamBeginCapture failed");
@@ -1680,7 +1892,7 @@ void train_impl(PuffeRL& pufferl) {
             hipStream_t stream = train_stream;
             PrecisionTensor obs_puf = graph.mb_obs;
             PrecisionTensor state_puf = graph.mb_state;
-            PrecisionTensor dec_puf = policy_forward_train(&pufferl.policy, pufferl.weights, pufferl.train_activations, obs_puf, state_puf, stream);
+            PrecisionTensor dec_puf = policy_forward_train(&pufferl.policy, pufferl.weights, pufferl.train_activations, obs_puf, state_puf, graph.mb_terminals, stream);
             DecoderWeights* dw_train = (DecoderWeights*)pufferl.weights.decoder;
             PrecisionTensor p_logstd;
             if (dw_train->continuous) {
@@ -1691,15 +1903,39 @@ void train_impl(PuffeRL& pufferl) {
                 pufferl.act_sizes_puf, pufferl.losses_puf,
                 hypers.clip_coef, hypers.vf_clip_coef, hypers.vf_coef,
                 pufferl.ppo_bufs_puf.ent_coef.data,
-                pufferl.ppo_bufs_puf, pufferl.is_continuous, stream);
+                pufferl.ppo_bufs_puf, pufferl.is_continuous,
+                pufferl.llb_autoregressive, stream);
+            if (finite_debug) require_finite_float("ppo grad_logits", pufferl.ppo_bufs_puf.grad_logits.data,
+                numel(pufferl.ppo_bufs_puf.grad_logits.shape), stream);
+            if (finite_debug) require_finite_float("ppo grad_values", pufferl.ppo_bufs_puf.grad_values.data,
+                numel(pufferl.ppo_bufs_puf.grad_values.shape), stream);
+            if (finite_debug) require_finite_float("ppo losses", pufferl.losses_puf.data,
+                numel(pufferl.losses_puf.shape), stream);
 
             FloatTensor grad_logits_puf = pufferl.ppo_bufs_puf.grad_logits;
             FloatTensor grad_logstd_puf = pufferl.is_continuous ? pufferl.ppo_bufs_puf.grad_logstd : FloatTensor();
             FloatTensor grad_values_puf = pufferl.ppo_bufs_puf.grad_values;
             policy_backward(&pufferl.policy, pufferl.weights, pufferl.train_activations,
                 grad_logits_puf, grad_logstd_puf, grad_values_puf, stream);
+            MinGRUActivations* recurrent = (MinGRUActivations*)pufferl.train_activations.network;
+            for (int layer = 0; layer < recurrent->num_layers; ++layer) {
+                std::string combined_label = "recurrent grad_combined layer=" + std::to_string(layer);
+                if (finite_debug) require_finite_precision(combined_label.c_str(), recurrent->scan_bufs[layer].grad_combined.data,
+                    numel(recurrent->scan_bufs[layer].grad_combined.shape), stream);
+                std::string input_label = "recurrent grad_input layer=" + std::to_string(layer);
+                if (finite_debug) require_finite_precision(input_label.c_str(), recurrent->scan_bufs[layer].grad_input.data,
+                    numel(recurrent->scan_bufs[layer].grad_input.shape), stream);
+            }
+            if (finite_debug) require_finite_precision("policy grad_puf", pufferl.grad_puf.data,
+                numel(pufferl.grad_puf.shape), stream);
+            if (finite_debug) require_finite_float("master before Muon", pufferl.master_weights.data,
+                numel(pufferl.master_weights.shape), stream);
 
             muon_step(&pufferl.muon, pufferl.master_weights, pufferl.grad_puf, hypers.max_grad_norm, stream);
+            if (finite_debug) require_finite_float("Muon momentum", pufferl.muon.mb_puf.data,
+                numel(pufferl.muon.mb_puf.shape), stream);
+            if (finite_debug) require_finite_float("master after Muon", pufferl.master_weights.data,
+                numel(pufferl.master_weights.shape), stream);
             if (USE_BF16) {
                 int n = numel(pufferl.param_puf.shape);
                 cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
@@ -1735,7 +1971,7 @@ void train_impl(PuffeRL& pufferl) {
                 (char*)rollouts.values.data, pufferl.prio_bufs.idx.data,
                 (const char*)graph.mb_newvalue.data, num_idx, row_bytes);
         }
-        hipEventRecord(pufferl.profile.events[4]);  // end forward
+        hipEventRecord(pufferl.profile.events[4], train_stream);  // end forward
     }
     pufferl.epoch += 1;
 
@@ -1823,7 +2059,8 @@ static void weight_bank_create_for_pufferl(WeightBank* bank, PuffeRL* pufferl,
     int* raw_act_sizes = get_act_sizes();
     int act_n = 0;
     for (int i = 0; i < num_action_heads; i++) act_n += raw_act_sizes[i];
-    int decoder_output_size = pufferl->is_continuous ? num_action_heads : act_n;
+    int decoder_output_size = pufferl->env_name == "llb" ? 576 :
+        (pufferl->is_continuous ? num_action_heads : act_n);
     bank->policy = build_policy(pufferl->env_name.c_str(), input_size, hidden_size,
         num_layers, decoder_output_size, act_n, pufferl->is_continuous, pufferl->hypers.horizon);
     bank->hidden_size = hidden_size;
@@ -1988,15 +2225,57 @@ extern "C" int pufferl_num_envs(PuffeRL* pufferl) {
     return pufferl->vec->size;
 }
 
+// overlap_publish_snapshot copies the completed trainable bank at a rollout
+// boundary. The collector only sees this private bank until its horizon ends.
+static void overlap_publish_snapshot(PuffeRL& pufferl) {
+    WeightBank& snapshot = pufferl.collector_bank;
+    int64_t bytes = numel(pufferl.master_weights.shape) * sizeof(float);
+    hipMemcpy(snapshot.master_weights.data, pufferl.master_weights.data, bytes,
+        hipMemcpyDeviceToDevice);
+    if (USE_BF16) {
+        cast<<<grid_size(numel(snapshot.param_puf.shape)), BLOCK_SIZE, 0,
+            pufferl.default_stream>>>(snapshot.param_puf.data,
+            snapshot.master_weights.data, numel(snapshot.param_puf.shape));
+    }
+    hipStreamSynchronize(pufferl.default_stream);
+}
+
+// overlap_join_collector is the only point where a completed collection becomes
+// visible to PPO. Joining prevents close or the next epoch from reusing its slot.
+static void overlap_join_collector(PuffeRL& pufferl) {
+    if (!pufferl.collector_running) return;
+    pufferl.collector_thread.join();
+    pufferl.collector_running = false;
+    pufferl.active_rollouts = nullptr;
+    pufferl.profile.accum[PROF_ROLLOUT] += pufferl.collector_seconds * 1000.0f;
+    float eval_prof[NUM_EVAL_PROF];
+    static_vec_read_profile(pufferl.vec, eval_prof);
+    pufferl.profile.accum[PROF_EVAL_GPU] += eval_prof[EVAL_GPU];
+    pufferl.profile.accum[PROF_EVAL_ENV] += eval_prof[EVAL_ENV_STEP];
+    pufferl.global_step += pufferl.hypers.horizon * pufferl.hypers.total_agents;
+}
+
 std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         const std::string& env_name, Dict* vec_kwargs, Dict* env_kwargs) {
     auto pufferl = std::make_unique<PuffeRL>();
     pufferl->hypers = hypers;
+    pufferl->overlap_ready[0] = false;
+    pufferl->overlap_ready[1] = false;
+    pufferl->overlap_consumed[0] = false;
+    pufferl->overlap_consumed[1] = false;
+    pufferl->collector_running = false;
+    pufferl->overlap_busy = false;
+    pufferl->active_rollouts = nullptr;
+    pufferl->active_rollout_slot = 0;
     pufferl->nccl_comm = nullptr;
     pufferl->default_stream = 0;
     pufferl->env_name = env_name;
+    pufferl->llb_autoregressive = env_name == "llb";
 
     hipSetDevice(hypers.gpu_id);
+    if (hypers.overlap) {
+        hipStreamCreateWithFlags(&pufferl->default_stream, hipStreamNonBlocking);
+    }
 
     // Multi-GPU: initialize NCCL
     if (hypers.world_size > 1) {
@@ -2054,7 +2333,8 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     int hidden_size = hypers.hidden_size;
     int num_layers = hypers.num_layers;
     bool is_continuous = pufferl->is_continuous;
-    int decoder_output_size = is_continuous ? num_action_heads : act_n;
+    int decoder_output_size = env_name == "llb" ? 576 :
+        (is_continuous ? num_action_heads : act_n);
     int minibatch_segments = hypers.minibatch_size / hypers.horizon;
     int inf_batch = vec->total_agents / hypers.num_buffers;
     int B_TT = minibatch_segments * hypers.horizon;
@@ -2087,6 +2367,12 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     int mask_size = pufferl->vec->action_mask_size;
     register_rollout_buffers(pufferl->rollouts,
         acts, horizon, total_agents, input_size, num_action_heads, mask_size);
+    if (hypers.overlap) {
+        register_rollout_buffers(pufferl->overlap_rollouts[0],
+            acts, horizon, total_agents, input_size, num_action_heads, mask_size);
+        register_rollout_buffers(pufferl->overlap_rollouts[1],
+            acts, horizon, total_agents, input_size, num_action_heads, mask_size);
+    }
     register_train_buffers(pufferl->train_buf,
         acts, minibatch_segments, horizon, input_size,
         hidden_size, num_action_heads, num_layers, mask_size);
@@ -2139,6 +2425,21 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
             pufferl->master_weights.data, pufferl->param_puf.data, n);
     }
 
+    if (hypers.overlap) {
+        if (hypers.world_size != 1) {
+            throw std::runtime_error("overlap requires world_size = 1");
+        }
+        weight_bank_create_for_pufferl(&pufferl->collector_bank, pufferl.get(),
+            total_agents / num_buffers, hidden_size, num_layers);
+        pufferl->trainable_version = 0;
+        pufferl->overlap_next_slot = 0;
+        overlap_publish_snapshot(*pufferl);
+        for (int i = 0; i < num_buffers; i++) {
+            puf_zero(&pufferl->collector_bank.buffer_states[i], pufferl->default_stream);
+        }
+        hipStreamSynchronize(pufferl->default_stream);
+    }
+
     // Per-buffer persistent RNG states
     int agents_per_buf = total_agents / num_buffers;
     pufferl->rng_states = (hiprandStatePhilox4_32_10_t**)calloc(num_buffers, sizeof(hiprandStatePhilox4_32_10_t*));
@@ -2185,7 +2486,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
 
     // Cudagraph rolluts and entire training step
     if (hypers.cudagraphs >= 0) {
-        pufferl->fused_rollout_cudagraphs = (hipGraphExec_t*)calloc(horizon*num_buffers, sizeof(hipGraphExec_t));
+        pufferl->fused_rollout_cudagraphs = (hipGraphExec_t*)calloc(horizon*num_buffers*(hypers.overlap ? 2 : 1), sizeof(hipGraphExec_t));
         pufferl->train_warmup = 0;
 
         // Snapshot weights + optimizer state before init-time capture
@@ -2201,7 +2502,11 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         // captured and replayed on the same streams.
         pufferl->streams = (hipStream_t*)calloc(num_buffers, sizeof(hipStream_t));
         for (int i = 0; i < num_buffers; i++) {
-            hipStreamCreate(&pufferl->streams[i]);
+            if (hypers.overlap) {
+                hipStreamCreateWithFlags(&pufferl->streams[i], hipStreamNonBlocking);
+            } else {
+                hipStreamCreate(&pufferl->streams[i]);
+            }
             vec->streams[i] = pufferl->streams[i];
         }
 
@@ -2211,14 +2516,20 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         hipStreamCreate(&warmup_stream);
         pufferl->default_stream = warmup_stream;
 
-        for (pufferl->epoch = 0; pufferl->epoch <= hypers.cudagraphs; pufferl->epoch++) {
-            for (int i = 0; i < num_buffers * horizon; ++i) {
-                int buf = i % num_buffers;
-                tl_stream = pufferl->streams[buf];
-                net_callback_wrapper(pufferl.get(), buf, i / num_buffers);
-                hipDeviceSynchronize();
+        int graph_slots = hypers.overlap ? 2 : 1;
+        for (int slot = 0; slot < graph_slots; ++slot) {
+            pufferl->active_rollout_slot = slot;
+            pufferl->active_rollouts = hypers.overlap ? &pufferl->overlap_rollouts[slot] : nullptr;
+            for (pufferl->epoch = 0; pufferl->epoch <= hypers.cudagraphs; pufferl->epoch++) {
+                for (int i = 0; i < num_buffers * horizon; ++i) {
+                    int buf = i % num_buffers;
+                    tl_stream = pufferl->streams[buf];
+                    net_callback_wrapper(pufferl.get(), buf, i / num_buffers);
+                    hipDeviceSynchronize();
+                }
             }
         }
+        pufferl->active_rollouts = nullptr;
         pufferl->rollout_captured = true;
 
         tl_stream = warmup_stream;
@@ -2252,13 +2563,23 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
 
         pufferl->epoch = 0;
         pufferl->global_step = 0;
+        if (hypers.overlap) {
+            for (int i = 0; i < num_buffers; i++) {
+                puf_zero(&pufferl->collector_bank.buffer_states[i], pufferl->default_stream);
+            }
+            hipStreamSynchronize(pufferl->default_stream);
+        }
     }
 
     // Create per-buffer streams if not already created by cudagraph path
     if (!pufferl->streams) {
         pufferl->streams = (hipStream_t*)calloc(num_buffers, sizeof(hipStream_t));
         for (int i = 0; i < num_buffers; i++) {
-            hipStreamCreate(&pufferl->streams[i]);
+            if (hypers.overlap) {
+                hipStreamCreateWithFlags(&pufferl->streams[i], hipStreamNonBlocking);
+            } else {
+                hipStreamCreate(&pufferl->streams[i]);
+            }
             vec->streams[i] = pufferl->streams[i];
         }
     }
@@ -2281,14 +2602,31 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
 }
 
 void close_impl(PuffeRL& pufferl) {
+    overlap_join_collector(pufferl);
     hipDeviceSynchronize();
+    if (pufferl.hypers.overlap) {
+        hipStreamDestroy(pufferl.default_stream);
+        pufferl.default_stream = 0;
+    }
     if (pufferl.hypers.profile) {
         hipProfilerStop();
     }
 
-    hipGraphExecDestroy(pufferl.train_cudagraph);
-    for (int i = 0; i < pufferl.hypers.horizon * pufferl.hypers.num_buffers; i++) {
-        hipGraphExecDestroy(pufferl.fused_rollout_cudagraphs[i]);
+    if (pufferl.train_cudagraph != nullptr) {
+        hipGraphExecDestroy(pufferl.train_cudagraph);
+    }
+    if (pufferl.fused_rollout_cudagraphs != nullptr) {
+        for (int i = 0;
+             i < pufferl.hypers.horizon * pufferl.hypers.num_buffers * (pufferl.hypers.overlap ? 2 : 1);
+             i++) {
+            if (pufferl.fused_rollout_cudagraphs[i] != nullptr) {
+                hipGraphExecDestroy(pufferl.fused_rollout_cudagraphs[i]);
+            }
+        }
+    }
+
+    if (pufferl.hypers.overlap) {
+        weight_bank_destroy(&pufferl.collector_bank, &pufferl);
     }
 
     policy_weights_free(&pufferl.policy, &pufferl.weights);

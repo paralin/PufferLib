@@ -29,7 +29,7 @@ typedef PrecisionTensor (*decoder_backward_fn)(void* weights, void* activations,
 typedef PrecisionTensor (*network_forward_fn)(void* weights, PrecisionTensor x,
     PrecisionTensor state, void* activations, hipStream_t stream);
 typedef PrecisionTensor (*network_forward_train_fn)(void* weights, PrecisionTensor x,
-    PrecisionTensor state, void* activations, hipStream_t stream);
+    PrecisionTensor state, PrecisionTensor terminals, void* activations, hipStream_t stream);
 typedef PrecisionTensor (*network_backward_fn)(void* weights,
     PrecisionTensor grad, void* activations, hipStream_t stream);
 
@@ -143,6 +143,7 @@ struct PrefixScan {
     precision_t* combined_ptr = nullptr;
     precision_t* state_ptr = nullptr;
     precision_t* input_ptr = nullptr;  // (B, T, H) original input before projection (for highway gate)
+    const precision_t* terminals_ptr = nullptr;  // (B, T), reset before this timestep.
     int B = 0, T = 0, H = 0;
     FloatTensor a_star, s_vals, log_values_buf;
     PrecisionTensor out, next_state;
@@ -206,6 +207,11 @@ __global__ void mingru_scan_forward(PrefixScan scan) {
         float gate_val = to_float(combined_g_base[t_offset]);
         float proj_val = to_float(combined_p_base[t_offset]);
         float x_val = to_float(input[out_base + (t - 1) * H]);
+
+        if (scan.terminals_ptr != nullptr && to_float(scan.terminals_ptr[b * T_seq + t - 1]) != 0.0f) {
+            a_star = 0.0f;
+            s = -INFINITY;
+        }
 
         float log_coeff_val;
         log_coeffs_and_values_fwd(gate_val, hidden_val, &log_coeff_val, &log_value);
@@ -306,6 +312,11 @@ __global__ void mingru_scan_backward(PrefixScan scan,
             float hv = to_float(combined_h_base[t_offset]);
             float gv = to_float(combined_g_base[t_offset]);
 
+            if (scan.terminals_ptr != nullptr && to_float(scan.terminals_ptr[b * T_seq + t - 1]) != 0.0f) {
+                recomp_a_star = 0.0f;
+                recomp_s = -INFINITY;
+            }
+
             float lc;
             log_coeffs_and_values_fwd(gv, hv, &lc, &recomp_log_value);
             recomp_a_star += lc;
@@ -349,12 +360,14 @@ __global__ void mingru_scan_backward(PrefixScan scan,
             float grad_log_h = grad_scan_result * scan_result;
             float grad_s = grad_log_h;
 
-            if (t == T_seq) {
+            if (t == T_seq || acc == 0.0f) {
+                // A terminal cut sets acc to zero. Do not evaluate 0*exp across
+                // unrelated log-space prefixes: the exponential can overflow.
                 acc = grad_s;
             } else {
                 acc = grad_s + acc * __expf(s_t - s_val_next);
             }
-            float grad_z = acc * __expf(z - s_t);
+            float grad_z = acc == 0.0f ? 0.0f : acc * __expf(z - s_t);
             s_val_next = s_t;
 
             float grad_a = grad_log_h + carry_grad_a - grad_z;
@@ -366,6 +379,10 @@ __global__ void mingru_scan_backward(PrefixScan scan,
             grad_combined_h_base[t_offset] = from_float(grad_h);
             grad_combined_g_base[t_offset] = from_float(grad_g);
             grad_combined_p_base[t_offset] = from_float(grad_proj);
+            if (scan.terminals_ptr != nullptr && to_float(scan.terminals_ptr[b * T_seq + t - 1]) != 0.0f) {
+                acc = 0.0f;
+                carry_grad_a = 0.0f;
+            }
         }
     }
 
@@ -374,17 +391,21 @@ __global__ void mingru_scan_backward(PrefixScan scan,
     float s_0 = s_buf[ckpt_0_idx];
     float log_value_0 = log_values_buf[ckpt_0_idx];
 
-    float scan_result_0 = __expf(a_star_0 + s_0);
-    float z_0 = log_value_0 - a_star_0;
-
-    float grad_scan_result_0 = 0.0f;
-    float grad_log_h_0 = grad_scan_result_0 * scan_result_0;
-    float grad_s_0 = grad_log_h_0;
-
-    acc = grad_s_0 + acc * __expf(s_0 - s_val_next);
-    float grad_z_0 = acc * __expf(z_0 - s_0);
-
-    grad_state[state_idx] = from_float(grad_z_0 / to_float(state[state_idx]));
+    float state_value = to_float(state[state_idx]);
+    if (state_value == 0.0f) {
+        // A terminal prefix has no derivative with respect to the prior episode.
+        // Avoid evaluating the undefined log-space zero-state quotient.
+        grad_state[state_idx] = from_float(0.0f);
+    } else {
+        float scan_result_0 = __expf(a_star_0 + s_0);
+        float z_0 = log_value_0 - a_star_0;
+        float grad_log_h_0 = 0.0f * scan_result_0;
+        float grad_s_0 = grad_log_h_0;
+        acc = acc == 0.0f ? grad_s_0
+                          : grad_s_0 + acc * __expf(s_0 - s_val_next);
+        float grad_z_0 = acc == 0.0f ? 0.0f : acc * __expf(z_0 - s_0);
+        grad_state[state_idx] = from_float(grad_z_0 / state_value);
+    }
 }
 
 __global__ void sum_rows_to_precision_kernel(precision_t* __restrict__ dst,
@@ -721,7 +742,7 @@ static PrecisionTensor mingru_forward(void* w, PrecisionTensor x, PrecisionTenso
 }
 
 static PrecisionTensor mingru_forward_train(void* w, PrecisionTensor x, PrecisionTensor state,
-        void* activations, hipStream_t stream) {
+        PrecisionTensor terminals, void* activations, hipStream_t stream) {
     MinGRUWeights* m = (MinGRUWeights*)w;
     MinGRUActivations* a = (MinGRUActivations*)activations;
     int B = x.shape[0];
@@ -732,6 +753,7 @@ static PrecisionTensor mingru_forward_train(void* w, PrecisionTensor x, Precisio
         a->scan_bufs[i].combined_ptr = a->combined_bufs[i].data;
         a->scan_bufs[i].state_ptr = state_i.data;
         a->scan_bufs[i].input_ptr = a->saved_inputs[i].data;
+        a->scan_bufs[i].terminals_ptr = terminals.data;
         mingru_scan_forward<<<grid_size(B*m->hidden), BLOCK_SIZE, 0, stream>>>(a->scan_bufs[i]);
         x = a->scan_bufs[i].out;
     }
@@ -741,6 +763,10 @@ static PrecisionTensor mingru_forward_train(void* w, PrecisionTensor x, Precisio
 static PrecisionTensor mingru_backward(void* w, PrecisionTensor grad, void* activations, hipStream_t stream) {
     MinGRUWeights* m = (MinGRUWeights*)w;
     MinGRUActivations* a = (MinGRUActivations*)activations;
+    // No loss follows the recurrent state beyond the selected training window.
+    // Allocator memory is uninitialized, so an implicit terminal-state gradient
+    // can poison every MinGRU parameter on the first optimizer step.
+    puf_zero(&a->grad_next_state, stream);
     for (int i = m->num_layers - 1; i >= 0; i--) {
         PrefixScan& scan = a->scan_bufs[i];
         mingru_scan_backward<<<grid_size(scan.B*scan.H), BLOCK_SIZE, 0, stream>>>(
@@ -789,10 +815,10 @@ PrecisionTensor policy_forward(Policy* p, PolicyWeights& w, PolicyActivations& a
 }
 
 PrecisionTensor policy_forward_train(Policy* p, PolicyWeights& w, PolicyActivations& activations,
-        PrecisionTensor x, PrecisionTensor state, hipStream_t stream) {
+        PrecisionTensor x, PrecisionTensor state, PrecisionTensor terminals, hipStream_t stream) {
     int B = x.shape[0], TT = x.shape[1];
     PrecisionTensor h = p->encoder.forward(w.encoder, activations.encoder, *puf_squeeze(&x, 0), stream);
-    h = p->network.forward_train(w.network, *puf_unsqueeze(&h, 0, B, TT), state, activations.network, stream);
+    h = p->network.forward_train(w.network, *puf_unsqueeze(&h, 0, B, TT), state, terminals, activations.network, stream);
     PrecisionTensor dec_out = p->decoder.forward(w.decoder, activations.decoder, *puf_squeeze(&h, 0), stream);
     return *puf_unsqueeze(&dec_out, 0, B, TT);
 }

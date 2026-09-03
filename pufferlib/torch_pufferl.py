@@ -17,6 +17,8 @@ from torch.distributions.utils import logits_to_probs
 import pufferlib
 import pufferlib.pufferl
 from pufferlib.muon import Muon
+from pufferlib.llb_autoregressive import (AutoregressiveCategorical,
+                                           AutoregressiveLogits)
 from pufferlib import _C
 if _C.precision_bytes != 4:
     raise RuntimeError(
@@ -47,6 +49,18 @@ def _entropy(logits):
     return -p_log_p.sum(-1)
 
 def sample_logits(logits, action=None):
+    if isinstance(logits, AutoregressiveLogits):
+        distribution = AutoregressiveCategorical(logits.raw)
+        if action is None:
+            action = distribution.sample()
+            shape = action.shape[:-1]
+            flat_action = action
+        else:
+            shape = action.shape[:-1]
+            flat_action = action.reshape(-1, action.shape[-1])
+        return (action, distribution.log_prob(flat_action).reshape(shape),
+                distribution.entropy().reshape(shape))
+
     is_discrete = isinstance(logits, torch.Tensor)
     if isinstance(logits, torch.distributions.Normal):
         batch = logits.loc.shape[0]
@@ -98,6 +112,12 @@ _TORCH_TO_CTYPE = {
     torch.uint8:   ctypes.c_uint8,
     torch.float32: ctypes.c_float,
 }
+
+def _reset_state(state, terminals):
+    if not state or not terminals.any():
+        return state
+    return tuple(value * (1.0 - terminals).view(
+        *((1,) * (value.ndim - 2)), -1, 1) for value in state)
 
 def _actions_for_vec_step(action):
     if action.dim() == 1:
@@ -218,6 +238,7 @@ class PuffeRL:
 
             prof.mark(1)
             with torch.no_grad():
+                self.state = _reset_state(self.state, d)
                 logits, value, state = self.policy.forward_eval(o_device, self.state)
                 action, logprob, _ = sample_logits(logits)
             prof.mark(2)
@@ -301,9 +322,10 @@ class PuffeRL:
             mb_values = val[idx]
             mb_returns = advantages[idx] + mb_values
             mb_advantages = advantages[idx]
+            mb_terminals = ter[idx]
 
             prof.mark(1)
-            logits, newvalue = self.policy(mb_obs)
+            logits, newvalue = self.policy(mb_obs, mb_terminals)
             actions, newlogprob, entropy = sample_logits(logits, action=mb_actions)
             prof.mark(2)
             prof.elapsed(P.TRAIN_FORWARD, 1, 2)
@@ -513,4 +535,3 @@ def load_policy(args, vec):
         policy.load_state_dict(state_dict)
 
     return policy
-

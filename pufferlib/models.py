@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from pufferlib.llb_autoregressive import AutoregressiveLogits, NUM_LOGITS
+
 class Policy(nn.Module):
     def __init__(self, encoder, decoder, network):
         super().__init__()
@@ -20,10 +22,10 @@ class Policy(nn.Module):
         logits, values = self.decoder(h)
         return logits, values, state
 
-    def forward(self, x):
+    def forward(self, x, terminals=None):
         B, TT = x.shape[:2]
         h = self.encoder(x.reshape(B*TT, *x.shape[2:]))
-        h = self.network.forward_train(h.reshape(B, TT, -1))
+        h = self.network.forward_train(h.reshape(B, TT, -1), terminals)
         logits, values = self.decoder(h.reshape(B*TT, -1))
         return logits, values.reshape(B, TT)
 
@@ -85,6 +87,19 @@ class DefaultDecoder(nn.Module):
         values = self.value_function(hidden)
         return logits, values
 
+class AutoregressiveDecoder(nn.Module):
+    """Decode LLB's five within-group categorical action chains."""
+
+    def __init__(self, nvec, hidden_size=128):
+        super().__init__()
+        if tuple(nvec) != (3, 3, 10, 3, 3, 10, 5, 5, 10, 2, 2, 10, 2, 2, 10):
+            raise ValueError("AutoregressiveDecoder requires the ten-frame LLB action ABI")
+        self.decoder = nn.Linear(hidden_size, NUM_LOGITS)
+        self.value_function = nn.Linear(hidden_size, 1)
+
+    def forward(self, hidden):
+        return AutoregressiveLogits(self.decoder(hidden)), self.value_function(hidden)
+
 class MLP(nn.Module):
     def __init__(self, hidden_size, num_layers=1, **kwargs):
         super().__init__()
@@ -99,7 +114,7 @@ class MLP(nn.Module):
     def forward_eval(self, h, state):
         return self.net(h), state
 
-    def forward_train(self, h):
+    def forward_train(self, h, terminals=None):
         return self.net(h)
 
 class MinGRU(nn.Module):
@@ -141,15 +156,16 @@ class MinGRU(nn.Module):
             state_out.append(out[:, -1:])
         return h.squeeze(1), (torch.stack(state_out, 0).squeeze(2),)
 
-    def forward_train(self, h):
-        T = h.shape[1]
-        for i in range(self.num_layers):
-            hidden, gate, proj = self.layers[i](h).chunk(3, dim=-1)
-            log_coeffs = -F.softplus(gate)
-            log_values = -F.softplus(-gate) + self._log_g(hidden)
-            out = self._heinsen_scan(log_coeffs, log_values)[:, -T:]
-            h = self._highway(h, out, proj)
-        return h
+    def forward_train(self, h, terminals=None):
+        state = self.initial_state(h.shape[0], h.device)
+        outputs = []
+        for time in range(h.shape[1]):
+            if terminals is not None:
+                state = tuple(value * (1.0 - terminals[:, time]).view(1, -1, 1)
+                              for value in state)
+            output, state = self.forward_eval(h[:, time], state)
+            outputs.append(output)
+        return torch.stack(outputs, dim=1)
 
 class LSTM(nn.Module):
     def __init__(self, hidden_size, num_layers=1, **kwargs):
@@ -189,11 +205,16 @@ class LSTM(nn.Module):
             lstm_c[i] = c
         return h, (lstm_h, lstm_c)
 
-    def forward_train(self, h):
-        # h: [B, T, H]
-        h = h.transpose(0, 1)
-        h, _ = self.lstm(h)
-        return h.transpose(0, 1)
+    def forward_train(self, h, terminals=None):
+        state = self.initial_state(h.shape[0], h.device)
+        outputs = []
+        for time in range(h.shape[1]):
+            if terminals is not None:
+                state = tuple(value * (1.0 - terminals[:, time]).view(1, -1, 1)
+                              for value in state)
+            output, state = self.forward_eval(h[:, time], state)
+            outputs.append(output)
+        return torch.stack(outputs, dim=1)
 
 class GRU(nn.Module):
     def __init__(self, hidden_size, num_layers=1, **kwargs):
@@ -235,14 +256,16 @@ class GRU(nn.Module):
             h = self.norm(h)
         return h, (state,)
 
-    def forward_train(self, h):
-        # h: [B, T, H]
-        h = h.transpose(0, 1)
-        h_in = h
-        h, _ = self.gru(h)
-        h = h + h_in
-        h = self.norm(h)
-        return h.transpose(0, 1)
+    def forward_train(self, h, terminals=None):
+        state = self.initial_state(h.shape[0], h.device)
+        outputs = []
+        for time in range(h.shape[1]):
+            if terminals is not None:
+                state = tuple(value * (1.0 - terminals[:, time]).view(1, -1, 1)
+                              for value in state)
+            output, state = self.forward_eval(h[:, time], state)
+            outputs.append(output)
+        return torch.stack(outputs, dim=1)
 
 class NatureEncoder(nn.Module):
     '''NatureCNN encoder (Mnih et al. 2015). Returns [batch, hidden_size].'''
