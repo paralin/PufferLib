@@ -58,12 +58,12 @@ def overlapping_range(used: list[tuple[int, int]], candidate: tuple[int, int]) -
     return None
 
 
-def tensors(batch):
+def tensors(batch, bootstrap_truncations=False):
     context = np.concatenate((batch.observations, batch.actor_contexts.reshape(len(batch.actions), -1)), 1)
     next_context = np.concatenate((batch.next_observations, batch.next_actor_contexts.reshape(len(batch.actions), -1)), 1)
     return tuple(torch.from_numpy(value) for value in (
         context, batch.actions, batch.reward_targets, next_context, batch.next_actions,
-        batch.terminals | batch.truncated))
+        batch.terminals if bootstrap_truncations else batch.terminals | batch.truncated))
 
 
 def evaluate_rows(model, records, discount=None):
@@ -172,7 +172,8 @@ def main(adapter, argv=None):
     trainer = CriticTrainer(args.device, args.seed, context_size=adapter.context_size,
                             limits=adapter.action_limits, replay_capacity=args.replay_capacity,
                             reward_discount=getattr(adapter, "reward_discount", None),
-                            gaussian_sigma=getattr(adapter, "gaussian_sigma", None))
+                            gaussian_sigma=getattr(adapter, "gaussian_sigma", None),
+                            learning_rate=getattr(adapter, "learning_rate", .0003))
     resume_checkpoint_hash = None
     batch = None
     if previous_manifest:
@@ -242,7 +243,7 @@ def main(adapter, argv=None):
                 "actor_device": "cpu", "critic_device": args.device,
                 "replay_sampling": "proportional-td-error", "replay_eviction": "fifo",
                 "gaussian_sigma": trainer.model.gaussian_sigma,
-                "reward_discount": trainer.reward_discount, "target_ema": .01, "learning_rate": .0003, "batch_size": 256,
+                "reward_discount": trainer.reward_discount, "target_ema": .01, "learning_rate": trainer.optimizer.param_groups[0]["lr"], "batch_size": 256,
                 "runtime_note": adapter.runtime_note}
     with manifest_path.open("x") as output:
         json.dump(manifest, output, indent=2)
@@ -281,7 +282,7 @@ def main(adapter, argv=None):
     if batch is None:
         batch = ReplayStore.open(replay_path, identity, held_out_seeds=held_out).read_all(max_rows=args.replay_capacity)
     replay_digest = hashlib.sha256((replay_path / "manifest.jsonl").read_bytes()).hexdigest()
-    data = tensors(batch)
+    data = tensors(batch, getattr(adapter, "bootstrap_truncations", False))
     del batch
     collection_seconds = time.perf_counter() - started
     update_started = time.perf_counter()

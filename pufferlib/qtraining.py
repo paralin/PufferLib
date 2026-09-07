@@ -111,14 +111,16 @@ class PrioritizedSampler:
 
 class CriticTrainer:
     def __init__(self, device: str, seed: int, *, context_size: int,
-                 limits: tuple[int, ...], replay_capacity: int = 131_072, reward_discount: float | None = None, gaussian_sigma: float | None = None):
+                 limits: tuple[int, ...], replay_capacity: int = 131_072, reward_discount: float | None = None, gaussian_sigma: float | None = None, learning_rate: float = .0003):
         if reward_discount is not None and not 0 <= reward_discount <= 1:
             raise ValueError("reward discount must be between zero and one")
+        if not np.isfinite(learning_rate) or learning_rate <= 0:
+            raise ValueError("learning rate must be finite and positive")
         self.device = device
         self.reward_discount = reward_discount
         self.model = FactorCritic(context_size, limits, reward_mode=reward_discount is not None, gaussian_sigma=gaussian_sigma).to(device)
         self.target = deepcopy(self.model).requires_grad_(False)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=.0003)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
         self.updates = 0
         self.replay_capacity = replay_capacity
         self.sampler = PrioritizedSampler(replay_capacity, seed)
