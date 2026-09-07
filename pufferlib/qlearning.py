@@ -18,7 +18,7 @@ import time
 import numpy as np
 import torch
 
-from pufferlib.qtraining import CriticTrainer
+from pufferlib.qtraining import CriticTrainer, initialization_identity_matches
 from qplan import CandidateBatch, ContextBatch, critic_diagnostics
 from qplan.critic import FactorCritic
 from qplan.replay import ReplayStore, ShardWriter
@@ -100,7 +100,11 @@ def main(adapter, argv=None):
     parser.add_argument("--replay-capacity", type=int, help="maximum retained transitions (default 131072; inherited on resume)")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--seed", type=int, help="initial collection seed (default 7000; inherited on resume)")
+    parser.add_argument("--allow-environment-change", action="store_true",
+                        help="allow --init-from weights on a different kernel or reset distribution; actor and learned formats must match")
     args = parser.parse_args(argv)
+    if args.allow_environment_change and args.init_from is None:
+        parser.error("--allow-environment-change requires --init-from")
     previous_manifest = None
     if args.resume is not None:
         args.resume = args.resume.resolve()
@@ -167,12 +171,13 @@ def main(adapter, argv=None):
         checkpoint = init_from / "critic.pt"
         if not checkpoint.is_file():
             parser.error("--init-from points to a directory without a critic checkpoint")
-        if prior_manifest.get("identity") != asdict(identity):
+        if not initialization_identity_matches(prior_manifest.get("identity", {}), asdict(identity), args.allow_environment_change):
             parser.error("--init-from manifest actor, kernel, formats or objective differ")
         if not isinstance(prior_manifest.get("updates"), int):
             parser.error("--init-from manifest must record completed updates")
         try:
-            init_updates = trainer.load_weights(checkpoint, identity, prior_manifest["updates"])
+            init_updates = trainer.load_weights(checkpoint, identity, prior_manifest["updates"],
+                                                allow_environment_change=args.allow_environment_change)
         except ValueError as error:
             parser.error(str(error))
         collector = deepcopy(trainer.model).cpu().eval().requires_grad_(False)

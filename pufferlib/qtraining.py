@@ -18,6 +18,14 @@ BETA_ANNEAL_UPDATES = 1_000_000
 EPSILON = 1e-6
 
 
+def initialization_identity_matches(actual: dict, expected: dict, allow_environment_change: bool = False) -> bool:
+    """Weight transfer may change the environment, but never the actor or learned contract."""
+    if allow_environment_change:
+        actual = {key: value for key, value in actual.items() if key != "opponent"}
+        expected = {key: value for key, value in expected.items() if key != "opponent"}
+    return actual == expected
+
+
 class PrioritizedSampler:
     """Sample proportional TD priorities in O(batch log capacity) on the CPU."""
 
@@ -186,15 +194,16 @@ class CriticTrainer:
         self.updates = checkpoint["updates"]
         self.sampler.load(checkpoint["priorities"])
 
-    def load_weights(self, path: Path, identity, expected_updates: int | None = None) -> int:
+    def load_weights(self, path: Path, identity, expected_updates: int | None = None, *,
+                     allow_environment_change: bool = False) -> int:
         """Load model weights into model and target from one checkpoint.
 
-        Requires the checkpoint identity to equal `identity` and to carry
-        completed updates. Optimizer, sampler, RNG and update counter stay
-        fresh. Returns the checkpoint's completed update count.
+        Requires a matching actor and learned contract plus completed updates.
+        Environment changes require explicit opt-in. Optimizer, sampler, RNG
+        and update counter stay fresh. Returns the checkpoint's completed update count.
         """
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-        if checkpoint.get("identity") != asdict(identity):
+        if not initialization_identity_matches(checkpoint.get("identity", {}), asdict(identity), allow_environment_change):
             raise ValueError("init checkpoint actor, runtime, formats or objective differ")
         updates = checkpoint.get("updates")
         if not isinstance(updates, int) or updates < 1:
