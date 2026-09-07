@@ -108,6 +108,8 @@ def main(adapter, argv=None):
     parser.add_argument("--held-out", type=int, help="matched evaluation seeds (default 16; inherited on resume)")
     parser.add_argument("--updates", type=int, default=5000, help="total completed critic updates, including resumed updates")
     parser.add_argument("--replay-capacity", type=int, help="maximum retained transitions (default 131072; inherited on resume)")
+    parser.add_argument("--checkpoint-seconds", type=float, default=300.,
+                        help="seconds between checkpoints (default 300); always saves the final update")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--seed", type=int, help="initial collection seed (default 7000; inherited on resume)")
     parser.add_argument("--allow-environment-change", action="store_true",
@@ -119,6 +121,8 @@ def main(adapter, argv=None):
         parser.error("--reset-value-head requires --init-from")
     if args.allow_environment_change and args.init_from is None:
         parser.error("--allow-environment-change requires --init-from")
+    if not np.isfinite(args.checkpoint_seconds) or args.checkpoint_seconds <= 0:
+        parser.error("--checkpoint-seconds must be finite and positive")
     previous_manifest = None
     if args.resume is not None:
         args.resume = args.resume.resolve()
@@ -208,7 +212,9 @@ def main(adapter, argv=None):
                 "init_from": str(init_from) if init_from else None,
                 "init_checkpoint_sha256": init_checkpoint_hash,
                 "collection_policy": collection_policy,
-                "collection_objective": prior_manifest["identity"]["reward_target"] if init_from else identity.reward_target,
+                "collection_objective": (previous_manifest.get("collection_objective", identity.reward_target)
+                                         if previous_manifest else
+                                         prior_manifest["identity"]["reward_target"] if init_from else identity.reward_target),
                 "used_seed_ranges": [list(r) for r in used_ranges],
                 "starting_updates": trainer.updates, "replay_path": str(replay_path),
                 "init_updates": init_updates,
@@ -250,11 +256,19 @@ def main(adapter, argv=None):
     update_started = time.perf_counter()
     emit("training", device=args.device, transitions=len(data[0]), updates=args.updates,
          starting_updates=trainer.updates)
+    last_checkpoint = update_started
     while trainer.updates < args.updates:
         loss = trainer.step(data)
-        if trainer.updates % 500 == 0 or trainer.updates == args.updates:
+        now = time.perf_counter()
+        final = trainer.updates == args.updates
+        if now - last_checkpoint >= args.checkpoint_seconds or final:
             trainer.save(args.output / "critic.pt", identity, replay_digest)
-            emit("trained", update=trainer.updates, loss=loss)
+            last_checkpoint = time.perf_counter()
+            emit("checkpoint", update=trainer.updates)
+        if trainer.updates % 500 == 0 or final:
+            emit("trained", update=trainer.updates, loss=loss,
+                 updates_per_second=(trainer.updates - manifest["starting_updates"]) /
+                                    (time.perf_counter() - update_started))
     update_seconds = time.perf_counter() - update_started
     evaluation_started = time.perf_counter()
     model = trainer.model
