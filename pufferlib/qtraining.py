@@ -18,11 +18,14 @@ BETA_ANNEAL_UPDATES = 1_000_000
 EPSILON = 1e-6
 
 
-def initialization_identity_matches(actual: dict, expected: dict, allow_environment_change: bool = False) -> bool:
-    """Weight transfer may change the environment, but never the actor or learned contract."""
+def initialization_identity_matches(actual: dict, expected: dict, allow_environment_change: bool = False, reset_value_head: bool = False) -> bool:
+    """Explicit transfer can replace the environment or value objective, never the actor."""
     if allow_environment_change:
         actual = {key: value for key, value in actual.items() if key != "opponent"}
         expected = {key: value for key, value in expected.items() if key != "opponent"}
+    if reset_value_head:
+        actual = {key: value for key, value in actual.items() if key != "reward_target"}
+        expected = {key: value for key, value in expected.items() if key != "reward_target"}
     return actual == expected
 
 
@@ -108,9 +111,12 @@ class PrioritizedSampler:
 
 class CriticTrainer:
     def __init__(self, device: str, seed: int, *, context_size: int,
-                 limits: tuple[int, ...], replay_capacity: int = 131_072):
+                 limits: tuple[int, ...], replay_capacity: int = 131_072, reward_discount: float | None = None):
+        if reward_discount is not None and not 0 <= reward_discount <= 1:
+            raise ValueError("reward discount must be between zero and one")
         self.device = device
-        self.model = FactorCritic(context_size, limits).to(device)
+        self.reward_discount = reward_discount
+        self.model = FactorCritic(context_size, limits, reward_mode=reward_discount is not None).to(device)
         self.target = deepcopy(self.model).requires_grad_(False)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=.0003)
         self.updates = 0
@@ -144,7 +150,10 @@ class CriticTrainer:
         with torch.no_grad():
             bootstrap = self.target.score(
                 ContextBatch(next_context), CandidateBatch(next_action[:, None]))[:, 0]
-            returns = torch.where(done, reward, bootstrap)
+            returns = (torch.where(done, reward, bootstrap) if self.reward_discount is None else
+                       reward + self.reward_discount * torch.where(done, 0., bootstrap))
+            # Categorical projection saturates only outside the declared return support.
+            returns = returns.clamp(self.model.support[0], self.model.support[-1])
         rows = self.model.loss(context, action, returns, reduction="none")
         loss = (rows * torch.as_tensor(weights, device=self.device, dtype=rows.dtype)).sum() / 256
         if not torch.isfinite(loss):
@@ -195,21 +204,29 @@ class CriticTrainer:
         self.sampler.load(checkpoint["priorities"])
 
     def load_weights(self, path: Path, identity, expected_updates: int | None = None, *,
-                     allow_environment_change: bool = False) -> int:
+                     allow_environment_change: bool = False, reset_value_head: bool = False) -> int:
         """Load model weights into model and target from one checkpoint.
 
         Requires a matching actor and learned contract plus completed updates.
-        Environment changes require explicit opt-in. Optimizer, sampler, RNG
+        Environment changes require explicit opt-in. Resetting the value head
+        permits a new objective while retaining context/action features. Optimizer, sampler, RNG
         and update counter stay fresh. Returns the checkpoint's completed update count.
         """
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-        if not initialization_identity_matches(checkpoint.get("identity", {}), asdict(identity), allow_environment_change):
+        if not initialization_identity_matches(checkpoint.get("identity", {}), asdict(identity), allow_environment_change, reset_value_head):
             raise ValueError("init checkpoint actor, runtime, formats or objective differ")
         updates = checkpoint.get("updates")
         if not isinstance(updates, int) or updates < 1:
             raise ValueError("init checkpoint must contain completed critic updates")
         if expected_updates is not None and updates != expected_updates:
             raise ValueError("init manifest does not match its critic checkpoint updates")
-        self.model.load_state_dict(checkpoint["model"])
-        self.target.load_state_dict(checkpoint["model"])
+        weights = checkpoint["model"]
+        if reset_value_head:
+            weights = {key: value for key, value in weights.items()
+                       if key not in ("support", "network.4.weight", "network.4.bias")}
+        loaded = self.model.load_state_dict(weights, strict=not reset_value_head)
+        if reset_value_head and (set(loaded.missing_keys) != {"support", "network.4.weight", "network.4.bias"}
+                                 or loaded.unexpected_keys):
+            raise ValueError("init checkpoint critic feature weights differ")
+        self.target.load_state_dict(self.model.state_dict())
         return updates

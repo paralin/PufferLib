@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
-from copy import deepcopy
 from dataclasses import asdict
 import hashlib
 import json
@@ -67,11 +66,22 @@ def tensors(batch):
         batch.terminals | batch.truncated))
 
 
-def evaluate_rows(model, records):
+def evaluate_rows(model, records, discount=None):
     rows = [row for episode in records for row in episode]
     contexts = torch.from_numpy(np.stack([np.concatenate((row.observation, row.actor_context.ravel())) for row in rows]))
     actions = torch.from_numpy(np.stack([row.action for row in rows]))
-    returns = torch.tensor([episode[-1].reward_target for episode in records for row in episode])
+    realized = []
+    for episode in records:
+        if discount is None:
+            realized.extend([episode[-1].reward_target] * len(episode))
+        else:
+            returns_to_go = []
+            value = 0.
+            for row in reversed(episode):
+                value = row.reward_target + discount * value
+                returns_to_go.append(value)
+            realized.extend(reversed(returns_to_go))
+    returns = torch.tensor(realized)
     with torch.no_grad():
         prediction = model.score(ContextBatch(contexts), CandidateBatch(actions[:, None]))[:, 0]
         shuffled = model.score(ContextBatch(contexts), CandidateBatch(actions.roll(1, 0)[:, None]))[:, 0]
@@ -79,10 +89,10 @@ def evaluate_rows(model, records):
         probabilities = model(contexts, actions).softmax(-1)
     return {**{key: value if not isinstance(value, float) or np.isfinite(value) else None
                for key, value in asdict(facts).items()},
-            "terminal_target_min": float(returns.min()), "terminal_target_max": float(returns.max()),
+            "return_target_min": float(returns.min()), "return_target_max": float(returns.max()),
             "shuffled_action_mae": float((shuffled - returns).abs().mean()),
             "edge_probability": float(probabilities[:, [0, -1]].sum(-1).mean()),
-            "has_outcome_variation": bool(returns.max() > returns.min()),
+            "has_return_variation": bool(returns.max() > returns.min()),
             "is_degenerate": facts.is_degenerate or bool(returns.max() == returns.min())}
 
 
@@ -102,7 +112,11 @@ def main(adapter, argv=None):
     parser.add_argument("--seed", type=int, help="initial collection seed (default 7000; inherited on resume)")
     parser.add_argument("--allow-environment-change", action="store_true",
                         help="allow --init-from weights on a different kernel or reset distribution; actor and learned formats must match")
+    parser.add_argument("--reset-value-head", action="store_true",
+                        help="with --init-from, retain critic features but reset the return head for a changed reward objective")
     args = parser.parse_args(argv)
+    if args.reset_value_head and args.init_from is None:
+        parser.error("--reset-value-head requires --init-from")
     if args.allow_environment_change and args.init_from is None:
         parser.error("--allow-environment-change requires --init-from")
     previous_manifest = None
@@ -134,7 +148,8 @@ def main(adapter, argv=None):
     used_range = (args.seed, args.seed + args.episodes + args.held_out)
     replay_path = args.output / "replay"
     trainer = CriticTrainer(args.device, args.seed, context_size=adapter.context_size,
-                            limits=adapter.action_limits, replay_capacity=args.replay_capacity)
+                            limits=adapter.action_limits, replay_capacity=args.replay_capacity,
+                            reward_discount=getattr(adapter, "reward_discount", None))
     resume_checkpoint_hash = None
     batch = None
     if previous_manifest:
@@ -171,16 +186,19 @@ def main(adapter, argv=None):
         checkpoint = init_from / "critic.pt"
         if not checkpoint.is_file():
             parser.error("--init-from points to a directory without a critic checkpoint")
-        if not initialization_identity_matches(prior_manifest.get("identity", {}), asdict(identity), args.allow_environment_change):
+        if not initialization_identity_matches(prior_manifest.get("identity", {}), asdict(identity), args.allow_environment_change, args.reset_value_head):
             parser.error("--init-from manifest actor, kernel, formats or objective differ")
         if not isinstance(prior_manifest.get("updates"), int):
             parser.error("--init-from manifest must record completed updates")
         try:
             init_updates = trainer.load_weights(checkpoint, identity, prior_manifest["updates"],
-                                                allow_environment_change=args.allow_environment_change)
+                                                allow_environment_change=args.allow_environment_change,
+                                                reset_value_head=args.reset_value_head)
         except ValueError as error:
             parser.error(str(error))
-        collector = deepcopy(trainer.model).cpu().eval().requires_grad_(False)
+        collector = FactorCritic(adapter.context_size, adapter.action_limits)
+        collector.load_state_dict(torch.load(checkpoint, map_location="cpu", weights_only=True)["model"])
+        collector.eval().requires_grad_(False)
         init_checkpoint_hash = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
         collection_policy = "q-guided"
         used_ranges = sorted(set(prior_ranges) | {used_range})
@@ -190,6 +208,7 @@ def main(adapter, argv=None):
                 "init_from": str(init_from) if init_from else None,
                 "init_checkpoint_sha256": init_checkpoint_hash,
                 "collection_policy": collection_policy,
+                "collection_objective": prior_manifest["identity"]["reward_target"] if init_from else identity.reward_target,
                 "used_seed_ranges": [list(r) for r in used_ranges],
                 "starting_updates": trainer.updates, "replay_path": str(replay_path),
                 "init_updates": init_updates,
@@ -197,7 +216,7 @@ def main(adapter, argv=None):
                 **adapter.runtime_metadata,
                 "actor_device": "cpu", "critic_device": args.device,
                 "replay_sampling": "proportional-td-error", "replay_eviction": "fifo",
-                "target_ema": .01, "learning_rate": .0003, "batch_size": 256,
+                "reward_discount": trainer.reward_discount, "target_ema": .01, "learning_rate": .0003, "batch_size": 256,
                 "runtime_note": adapter.runtime_note}
     with manifest_path.open("x") as output:
         json.dump(manifest, output, indent=2)
@@ -215,7 +234,7 @@ def main(adapter, argv=None):
             for episode in records:
                 retained.extend(episode)
                 collected += len(episode)
-            emit("collected", episodes=first + len(seeds), targets=[e[-1].reward_target for e in records],
+            emit("collected", episodes=first + len(seeds), combined_returns=[sum(float(r.reward_diagnostics[0]) for r in e) for e in records],
                  actor_p95_ms=latency, retained_transitions=len(retained),
                  evicted_transitions=max(0, collected - len(retained)))
         with ShardWriter(replay_path, identity, held_out_seeds=held_out, shard_capacity=4096) as writer:
@@ -253,16 +272,14 @@ def main(adapter, argv=None):
         baseline_records.extend(baseline)
         guided_records.extend(guided)
         latencies.append(latency)
-        emit("compared", seeds=len(baseline_records), baseline=[e[-1].reward_target for e in baseline],
-             guided=[e[-1].reward_target for e in guided],
-             baseline_combined_return=[sum(float(r.reward_diagnostics[0]) for r in e) for e in baseline],
+        emit("compared", seeds=len(baseline_records), baseline_combined_return=[sum(float(r.reward_diagnostics[0]) for r in e) for e in baseline],
              guided_combined_return=[sum(float(r.reward_diagnostics[0]) for r in e) for e in guided],
              planner_p95_ms=latency)
     baseline_returns = [sum(float(row.reward_diagnostics[0]) for row in episode)
                         for episode in baseline_records]
     guided_returns = [sum(float(row.reward_diagnostics[0]) for row in episode)
                       for episode in guided_records]
-    facts = evaluate_rows(model, baseline_records)
+    facts = evaluate_rows(model, baseline_records, trainer.reward_discount)
     result = {"learner": "q", "training_decisions": collected,
               "retained_transitions": len(data[0]), "updates": trainer.updates,
               "collection_seconds": collection_seconds, "update_seconds": update_seconds,
@@ -272,8 +289,8 @@ def main(adapter, argv=None):
                   "seeds": held_out, "baseline": baseline_returns, "guided": guided_returns,
                   "mean_paired_gain": float(np.mean(np.subtract(guided_returns, baseline_returns))),
                   "decisions": sum(map(len, baseline_records)) + sum(map(len, guided_records))},
-              "diagnostics": facts, "baseline": [e[-1].reward_target for e in baseline_records],
-              "guided": [e[-1].reward_target for e in guided_records],
+              "diagnostics": facts, "baseline": baseline_returns,
+              "guided": guided_returns,
               "planner_max_p95_ms": max(latencies), "elapsed_seconds": time.perf_counter() - started,
               "accepted": False, "acceptance_note": adapter.acceptance_note}
     (args.output / "results.json").write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
