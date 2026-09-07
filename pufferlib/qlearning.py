@@ -153,7 +153,8 @@ def main(adapter, argv=None):
     replay_path = args.output / "replay"
     trainer = CriticTrainer(args.device, args.seed, context_size=adapter.context_size,
                             limits=adapter.action_limits, replay_capacity=args.replay_capacity,
-                            reward_discount=getattr(adapter, "reward_discount", None))
+                            reward_discount=getattr(adapter, "reward_discount", None),
+                            gaussian_sigma=getattr(adapter, "gaussian_sigma", None))
     resume_checkpoint_hash = None
     batch = None
     if previous_manifest:
@@ -222,6 +223,7 @@ def main(adapter, argv=None):
                 **adapter.runtime_metadata,
                 "actor_device": "cpu", "critic_device": args.device,
                 "replay_sampling": "proportional-td-error", "replay_eviction": "fifo",
+                "gaussian_sigma": trainer.model.gaussian_sigma,
                 "reward_discount": trainer.reward_discount, "target_ema": .01, "learning_rate": .0003, "batch_size": 256,
                 "runtime_note": adapter.runtime_note}
     with manifest_path.open("x") as output:

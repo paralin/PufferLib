@@ -111,12 +111,12 @@ class PrioritizedSampler:
 
 class CriticTrainer:
     def __init__(self, device: str, seed: int, *, context_size: int,
-                 limits: tuple[int, ...], replay_capacity: int = 131_072, reward_discount: float | None = None):
+                 limits: tuple[int, ...], replay_capacity: int = 131_072, reward_discount: float | None = None, gaussian_sigma: float | None = None):
         if reward_discount is not None and not 0 <= reward_discount <= 1:
             raise ValueError("reward discount must be between zero and one")
         self.device = device
         self.reward_discount = reward_discount
-        self.model = FactorCritic(context_size, limits, reward_mode=reward_discount is not None).to(device)
+        self.model = FactorCritic(context_size, limits, reward_mode=reward_discount is not None, gaussian_sigma=gaussian_sigma).to(device)
         self.target = deepcopy(self.model).requires_grad_(False)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=.0003)
         self.updates = 0
@@ -177,13 +177,15 @@ class CriticTrainer:
                     "optimizer": self.optimizer.state_dict(), "updates": self.updates,
                     "identity": asdict(identity), "rng": self.generator.get_state(),
                     "replay_sha256": replay_sha256, "training_runtime": self.runtime,
-                    "priorities": self.sampler.state()}, temporary)
+                    "gaussian_sigma": self.model.gaussian_sigma, "priorities": self.sampler.state()}, temporary)
         temporary.replace(path)
 
     def restore(self, path: Path, identity, replay_sha256: str) -> None:
         # Keep the sampling RNG on CPU; optimizer.load_state_dict moves its
         # tensors to their parameter devices.
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        if checkpoint.get("gaussian_sigma") != self.model.gaussian_sigma:
+            raise ValueError("checkpoint categorical loss differs")
         if checkpoint.get("replay_sha256") != replay_sha256:
             raise ValueError("checkpoint replay digest differs or is absent")
         if checkpoint.get("training_runtime") != self.runtime:
@@ -220,6 +222,8 @@ class CriticTrainer:
             raise ValueError("init checkpoint must contain completed critic updates")
         if expected_updates is not None and updates != expected_updates:
             raise ValueError("init manifest does not match its critic checkpoint updates")
+        if not reset_value_head and checkpoint.get("gaussian_sigma") != self.model.gaussian_sigma:
+            raise ValueError("init categorical loss differs; reset the value head explicitly")
         weights = checkpoint["model"]
         if reset_value_head:
             weights = {key: value for key, value in weights.items()
