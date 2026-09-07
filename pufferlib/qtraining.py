@@ -120,7 +120,7 @@ class CriticTrainer:
         self.reward_discount = reward_discount
         self.model = FactorCritic(context_size, limits, reward_mode=reward_discount is not None, gaussian_sigma=gaussian_sigma).to(device)
         self.target = deepcopy(self.model).requires_grad_(False)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=float(learning_rate))
         self.updates = 0
         self.replay_capacity = replay_capacity
         self.sampler = PrioritizedSampler(replay_capacity, seed)
