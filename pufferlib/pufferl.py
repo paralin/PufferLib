@@ -23,9 +23,10 @@ import pufferlib
 try:
     from pufferlib import _C
 except ImportError:
-    raise ImportError('Failed to import PufferLib C++ backend. If you have non-default PyTorch, try installing with --no-build-isolation')
+    _C = None
 
-from pufferlib import selfplay
+if _C is not None:
+    from pufferlib import selfplay
 
 import rich
 import rich.traceback
@@ -169,6 +170,8 @@ def validate_config(args):
         f'minibatch_size {minibatch_size} > total_agents {total_agents} * horizon {horizon}'
 
 def _resolve_backend(args):
+    if _C is None:
+        raise ImportError('PPO requires the compiled PufferLib backend; build it for the selected environment')
     compiled_env = getattr(_C, 'env_name', None)
     assert compiled_env is None or compiled_env == args['env_name'], \
         f'build.sh was run for {compiled_env}, not {args["env_name"]}'
@@ -617,6 +620,9 @@ def load_config(env_name):
     parser.add_argument('--wandb-project', type=str, default='puffer4')
     parser.add_argument('--wandb-group', type=str, default='debug')
     parser.add_argument('--tag', type=str, default=None, help='Tag for experiment')
+    parser.add_argument('--learner', choices=('ppo', 'q'), default='ppo',
+        help='PPO (default) or frozen-proposal Q learning')
+    parser.add_argument('--q-adapter', help='Q environment adapter as module:class')
     parser.add_argument('--slowly', action='store_true', help='Use PyTorch training backend')
     parser.add_argument('--save-frames', type=int, default=0)
     parser.add_argument('--gif-path', type=str, default='eval.gif')
@@ -680,6 +686,29 @@ def main():
 
     mode = sys.argv.pop(1)
     env_name = sys.argv.pop(1)
+    selector = argparse.ArgumentParser(add_help=False)
+    selector.add_argument('--learner', choices=('ppo', 'q'), default='ppo')
+    selector.add_argument('--q-adapter', help='Q environment adapter as module:class')
+    selection, remaining = selector.parse_known_args(sys.argv[1:])
+    if selection.learner == 'q':
+        if mode != 'train':
+            selector.error('Q mode currently supports train, including matched evaluation')
+        if not selection.q_adapter:
+            selector.error('--learner q requires --q-adapter module:class')
+        import importlib
+        from pufferlib.qlearning import main as train_q
+        module, separator, name = selection.q_adapter.partition(':')
+        if not separator or not module or not name:
+            selector.error('--q-adapter must be module:class')
+        adapter = getattr(importlib.import_module(module), name)()
+        if env_name not in adapter.environments:
+            selector.error(f'Q adapter does not support environment {env_name}')
+        return train_q(adapter, remaining)
+    if selection.q_adapter:
+        selector.error('--q-adapter requires --learner q')
+    if _C is None:
+        raise ImportError('PPO requires the compiled PufferLib backend; build it for the selected environment')
+    sys.argv[1:] = remaining
     args = load_config(env_name)
 
     if 'train' in mode:
