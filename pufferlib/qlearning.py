@@ -325,12 +325,16 @@ def main(adapter, argv=None):
     guided_returns = [sum(float(row.reward_diagnostics[0]) for row in episode)
                       for episode in guided_records]
     facts = evaluate_rows(model, baseline_records, trainer.reward_discount)
+    summaries = {}
+    if hasattr(adapter, "evaluation_summary"):
+        summaries = {"baseline_behavior": adapter.evaluation_summary(baseline_records),
+                     "guided_behavior": adapter.evaluation_summary(guided_records)}
     result = {"learner": "q", "training_decisions": collected,
               "retained_transitions": len(data[0]), "updates": trainer.updates,
               "collection_seconds": collection_seconds, "update_seconds": update_seconds,
               "evaluation_seconds": time.perf_counter() - evaluation_started,
               "evaluation": {
-                  **adapter.evaluation_metadata,
+                  **adapter.evaluation_metadata, **summaries,
                   "seeds": held_out, "baseline": baseline_returns, "guided": guided_returns,
                   "mean_paired_gain": float(np.mean(np.subtract(guided_returns, baseline_returns))),
                   "decisions": sum(map(len, baseline_records)) + sum(map(len, guided_records))},
