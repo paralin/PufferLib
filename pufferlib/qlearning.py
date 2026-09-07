@@ -98,6 +98,10 @@ def evaluate_rows(model, records, discount=None):
 
 def main(adapter, argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--rounds", type=int, default=1,
+                        help="fresh collection/update rounds; each retains bounded replay from the previous round")
+    parser.add_argument("--retain-replay", action="store_true",
+                        help="with --init-from, retain prior replay under the same environment and reward contract")
     parser.add_argument("--actor", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     group = parser.add_mutually_exclusive_group()
@@ -123,6 +127,20 @@ def main(adapter, argv=None):
         parser.error("--allow-environment-change requires --init-from")
     if not np.isfinite(args.checkpoint_seconds) or args.checkpoint_seconds <= 0:
         parser.error("--checkpoint-seconds must be finite and positive")
+    if args.rounds < 1:
+        parser.error("--rounds must be positive")
+    if args.retain_replay and args.init_from is None:
+        parser.error("--retain-replay requires --init-from")
+    if any(value is not None and value < 1 for value in
+           (args.episodes, args.held_out, args.replay_capacity)) or args.updates < 1:
+        parser.error("episode counts, updates and replay capacity must be positive")
+    if args.seed is not None and (args.seed < 0 or
+            args.seed + args.rounds * ((args.episodes or 64) + (args.held_out or 16)) > 2**32):
+        parser.error("campaign seeds must fit the kernel's unsigned 32-bit range")
+    if args.rounds > 1:
+        if args.resume:
+            parser.error("resume a specific round with --rounds 1")
+        return run_rounds(adapter, args)
     previous_manifest = None
     if args.resume is not None:
         args.resume = args.resume.resolve()
@@ -234,6 +252,16 @@ def main(adapter, argv=None):
         emit("collecting", episodes=args.episodes, actor_hash=digest,
              collection_policy=collection_policy)
         retained = deque(maxlen=args.replay_capacity)
+        if args.retain_replay:
+            if prior_manifest["identity"] != asdict(identity):
+                raise ValueError("retained replay requires identical actor, environment and reward")
+            previous_replay = Path(prior_manifest.get("replay_path", init_from / "replay"))
+            prior_batch = ReplayStore.open(previous_replay, identity,
+                held_out_seeds=prior_manifest["held_out_seeds"]).read_all(
+                    max_rows=prior_manifest.get("replay_capacity", 131072))
+            retained.extend(prior_batch.transitions())
+            del prior_batch
+        inherited = len(retained)
         for first in range(0, args.episodes, 8):
             seeds = list(range(args.seed + first, args.seed + min(first + 8, args.episodes)))
             records, latency = (adapter.episodes(actor, seeds, 16, collector)
@@ -244,7 +272,8 @@ def main(adapter, argv=None):
                 collected += len(episode)
             emit("collected", episodes=first + len(seeds), combined_returns=[sum(float(r.reward_diagnostics[0]) for r in e) for e in records],
                  actor_p95_ms=latency, retained_transitions=len(retained),
-                 evicted_transitions=max(0, collected - len(retained)))
+                 inherited_transitions=inherited,
+                 evicted_transitions=max(0, inherited + collected - len(retained)))
         with ShardWriter(replay_path, identity, held_out_seeds=held_out, shard_capacity=4096) as writer:
             for row in retained:
                 writer.add(row)
@@ -313,3 +342,42 @@ def main(adapter, argv=None):
     emit("complete", **result)
     return result
 
+
+def run_rounds(adapter, args):
+    """Collect with each updated critic and carry bounded experience into the next round."""
+    output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    manifest = output / "campaign.json"
+    with manifest.open("x") as stream:
+        json.dump({"rounds": args.rounds, "episodes_per_round": args.episodes or 64,
+                   "updates_per_round": args.updates, "seed": args.seed if args.seed is not None else 7000}, stream)
+    parent = args.init_from
+    results = []
+    episodes, held_out = args.episodes or 64, args.held_out or 16
+    seed = args.seed if args.seed is not None else 7000
+    for index in range(args.rounds):
+        destination = output / f"round-{index:03d}"
+        command = ["--actor", str(args.actor), "--output", str(destination),
+                   "--episodes", str(episodes), "--held-out", str(held_out),
+                   "--updates", str(args.updates), "--device", args.device,
+                   "--seed", str(seed + index * (episodes + held_out)),
+                   "--replay-capacity", str(args.replay_capacity or 131072),
+                   "--checkpoint-seconds", str(args.checkpoint_seconds)]
+        if parent is not None:
+            command += ["--init-from", str(parent)]
+            if index > 0 or args.retain_replay:
+                command += ["--retain-replay"]
+            if index == 0:
+                if args.allow_environment_change:
+                    command += ["--allow-environment-change"]
+                if args.reset_value_head:
+                    command += ["--reset-value-head"]
+        result = main(adapter, command)
+        results.append({"round": index, "output": str(destination),
+                        "training_decisions": result["training_decisions"],
+                        "evaluation": result["evaluation"]})
+        temporary = output / "rounds.tmp"
+        temporary.write_text(json.dumps(results, indent=2, allow_nan=False) + "\n")
+        temporary.replace(output / "rounds.json")
+        parent = destination
+    return results
