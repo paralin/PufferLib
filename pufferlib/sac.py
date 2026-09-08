@@ -83,19 +83,23 @@ class Replay:
         self.priority = torch.ones(capacity, device=device)
 
     def add(self, obs, actions, reward, next_obs, terminal):
+        """Retain the newest capacity transitions, including oversized collections."""
         n = len(obs)
-        indices = (torch.arange(n, device=self.obs.device) + self.position) % self.capacity
-        self.obs[indices], self.actions[indices] = obs, actions
-        self.reward[indices], self.next_obs[indices], self.terminal[indices] = reward, next_obs, terminal
+        start = max(0, n - self.capacity)
+        indices = (torch.arange(start, n, device=self.obs.device) + self.position) % self.capacity
+        self.obs[indices], self.actions[indices] = obs[start:], actions[start:]
+        self.reward[indices] = reward[start:]
+        self.next_obs[indices], self.terminal[indices] = next_obs[start:], terminal[start:]
         self.priority[indices] = self.priority[:max(self.size, 1)].max()
         self.position = (self.position + n) % self.capacity
         self.size = min(self.size + n, self.capacity)
 
     def sample(self, count, beta):
+        """Normalize importance weights against the least likely replay transition."""
         mass = self.priority[:self.size].pow(.6)
         indices = torch.multinomial(mass, count, replacement=True)
-        weights = (self.size * mass[indices] / mass.sum()).pow(-beta)
-        weights /= weights.max()
+        # The replay-wide maximum IS weight cancels the common N and total mass.
+        weights = (mass.min() / mass[indices]).pow(beta)
         return indices, weights, (self.obs[indices], self.actions[indices], self.reward[indices],
                                  self.next_obs[indices], self.terminal[indices])
 
