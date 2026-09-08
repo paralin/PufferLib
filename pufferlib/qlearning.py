@@ -179,7 +179,8 @@ def main(adapter, argv=None):
                             reward_discount=getattr(adapter, "reward_discount", None),
                             gaussian_sigma=getattr(adapter, "gaussian_sigma", None),
                             learning_rate=getattr(adapter, "learning_rate", .0003),
-                            target_ema=getattr(adapter, "target_ema", .01))
+                            target_ema=getattr(adapter, "target_ema", .01),
+                            canonical_schedules=getattr(adapter, "canonical_schedules", False))
     resume_checkpoint_hash = None
     batch = None
     if previous_manifest:
@@ -250,6 +251,7 @@ def main(adapter, argv=None):
                 "actor_device": "cpu", "critic_device": args.device,
                 "replay_sampling": "proportional-td-error", "replay_eviction": "fifo",
                 "gaussian_sigma": trainer.model.gaussian_sigma,
+                "canonical_schedules": trainer.model.canonical_schedules,
                 "reward_discount": trainer.reward_discount, "target_ema": trainer.target_ema, "learning_rate": trainer.optimizer.param_groups[0]["lr"], "batch_size": 256,
                 "runtime_note": adapter.runtime_note}
     with manifest_path.open("x") as output:

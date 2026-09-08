@@ -112,7 +112,7 @@ class PrioritizedSampler:
 class CriticTrainer:
     def __init__(self, device: str, seed: int, *, context_size: int,
                  limits: tuple[int, ...], replay_capacity: int = 131_072, reward_discount: float | None = None, gaussian_sigma: float | None = None, learning_rate: float = .0003,
-                 target_ema: float = .01):
+                 target_ema: float = .01, canonical_schedules: bool = False):
         if reward_discount is not None and not 0 <= reward_discount <= 1:
             raise ValueError("reward discount must be between zero and one")
         if not np.isfinite(learning_rate) or learning_rate <= 0:
@@ -122,7 +122,7 @@ class CriticTrainer:
         self.target_ema = float(target_ema)
         self.device = device
         self.reward_discount = reward_discount
-        self.model = FactorCritic(context_size, limits, reward_mode=reward_discount is not None, gaussian_sigma=gaussian_sigma).to(device)
+        self.model = FactorCritic(context_size, limits, reward_mode=reward_discount is not None, gaussian_sigma=gaussian_sigma, canonical_schedules=canonical_schedules).to(device)
         self.target = deepcopy(self.model).requires_grad_(False)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=float(learning_rate))
         self.updates = 0
@@ -191,6 +191,9 @@ class CriticTrainer:
         # Keep the sampling RNG on CPU; optimizer.load_state_dict moves its
         # tensors to their parameter devices.
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        encoding = checkpoint["model"].get("_canonical_schedules", torch.tensor(False))
+        if bool(encoding.item()) != self.model.canonical_schedules:
+            raise ValueError("checkpoint action encoding differs; use explicit weight initialization")
         # Historical checkpoints used the fixed .01 update coefficient.
         if checkpoint.get("target_ema", .01) != self.target_ema:
             raise ValueError("checkpoint target EMA differs; use explicit weight initialization")
@@ -238,7 +241,10 @@ class CriticTrainer:
             raise ValueError("init manifest does not match its critic checkpoint updates")
         if not reset_value_head and checkpoint.get("gaussian_sigma") != self.model.gaussian_sigma:
             raise ValueError("init categorical loss differs; reset the value head explicitly")
-        weights = checkpoint["model"]
+        # Explicit initialization transfers parameters into the requested encoding.
+        # Replay stores raw actions, so their transition meaning is unchanged.
+        weights = {**checkpoint["model"],
+                   "_canonical_schedules": torch.tensor(self.model.canonical_schedules)}
         if transfer_value_head and not torch.equal(weights["support"], self.model.support.cpu()):
             raise ValueError("value support differs; reset the value head instead")
         if reset_value_head:
