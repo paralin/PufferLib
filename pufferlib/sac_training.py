@@ -65,7 +65,10 @@ def main(argv=None):
         limits = envs[0].action_space.nvec.tolist()
         observations = np.stack([env.reset(seed=args.seed + i)[0] for i, env in enumerate(envs)]).reshape(rows, width)
         history = np.repeat(observations[:, None, :], args.history, axis=1)
-        learner = Learner(width * args.history, limits, args.device, args.learning_rate, spr_weight=args.spr_weight, entropy_fraction=args.entropy_fraction)
+        action_schedule = bool(getattr(envs[0], "action_schedule", False))
+        configuration["action_schedule"] = action_schedule
+        (args.output / 'config.json').write_text(json.dumps(configuration, indent=2) + '\n')
+        learner = Learner(width * args.history, limits, args.device, args.learning_rate, spr_weight=args.spr_weight, entropy_fraction=args.entropy_fraction, action_schedule=action_schedule)
         collector = deepcopy(learner.actor).cpu().eval()
         replay = Replay(args.capacity, width * args.history, len(limits), args.device)
         returns = np.zeros(rows)
@@ -75,8 +78,8 @@ def main(argv=None):
         decisions, completed = 0, 0
         if args.resume:
             state = torch.load(args.resume, map_location=args.device, weights_only=False)
-            for key in ('env_factory', 'capacity', 'history', 'learning_rate', 'reward_scale', 'spr_weight', 'seed', 'num_envs', 'entropy_fraction'):
-                if state['configuration'].get(key, .5 if key == 'entropy_fraction' else None) != configuration[key]:
+            for key in ('env_factory', 'capacity', 'history', 'learning_rate', 'reward_scale', 'spr_weight', 'seed', 'num_envs', 'entropy_fraction', 'action_schedule'):
+                if state['configuration'].get(key, .5 if key == 'entropy_fraction' else False if key == 'action_schedule' else None) != configuration[key]:
                     raise ValueError(f'resume must preserve {key}')
             learner.load_state_dict(state['learner'])
             replay.load_state_dict(state['replay'])
@@ -101,6 +104,11 @@ def main(argv=None):
                 if initial['configuration'][key] != configuration[key]:
                     raise ValueError(f'learner transfer must preserve {key}')
             learner.load_state_dict(initial['learner'])
+            if initial['configuration'].get('action_schedule', False) != action_schedule:
+                # The old temperature was optimized for a different entropy space.
+                with torch.no_grad():
+                    learner.log_alpha.fill_(-3.)
+                learner.alpha_opt.state.clear()
             collector.load_state_dict(learner.actor.state_dict())
         if args.init_actor:
             if args.resume:
@@ -113,7 +121,7 @@ def main(argv=None):
         starting_decisions = decisions
         next_save, next_report = started + args.checkpoint_seconds, started + 30
         metrics = None
-        torch.save(dict(actor=collector.state_dict(), limits=limits, width=width, history=args.history), args.output / 'initial.pt')
+        torch.save(dict(actor=collector.state_dict(), limits=limits, width=width, history=args.history, action_schedule=action_schedule), args.output / 'initial.pt')
 
         def save(final=False):
             payload = dict(learner=learner.state_dict(), replay=replay.state_dict(),
@@ -124,7 +132,7 @@ def main(argv=None):
             torch.save(payload, temporary)
             temporary.replace(args.output / 'checkpoint.pt')
             policy = dict(actor={k: v.cpu() for k, v in learner.actor.state_dict().items()},
-                          limits=limits, width=width, history=args.history, decisions=decisions)
+                          limits=limits, width=width, history=args.history, decisions=decisions, action_schedule=action_schedule)
             torch.save(policy, args.output / f'actor-{decisions:012d}.pt')
             torch.save(policy, args.output / 'actor.pt')
             emit(event='checkpoint', decisions=decisions, updates=learner.updates, final=final)

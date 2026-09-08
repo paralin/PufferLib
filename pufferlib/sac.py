@@ -18,11 +18,45 @@ def mlp(inputs, outputs):
                          nn.Linear(256, 256), nn.SiLU(), nn.Linear(256, outputs))
 
 
+def canonical_schedule(actions):
+    """Collapse ignored initial controls and switch times in three-field groups."""
+    grouped = actions.reshape(*actions.shape[:-1], -1, 3)
+    initial, final, switch = grouped.unbind(-1)
+    constant = (initial == final) | (switch == 0)
+    return torch.stack((torch.where(constant, final, initial), final,
+                        torch.where(constant, 0, switch)), -1).flatten(-2)
+
+
+def schedule_statistics(logits, actions):
+    """Sum encoding masses into executed constant and switching controls."""
+    logp = 0.
+    entropy = 0.
+    for index in range(0, len(logits), 3):
+        li, lf, lk = [value.log_softmax(-1) for value in logits[index:index+3]]
+        # Constant c includes k=0 with any initial, plus i=f=c at all k>0.
+        constant = lf + torch.logaddexp(lk[..., :1], li + lk[..., 1:].logsumexp(-1, keepdim=True))
+        switched = li[..., :, None, None] + lf[..., None, :, None] + lk[..., None, None, 1:]
+        different = ~torch.eye(li.shape[-1], dtype=torch.bool, device=li.device)
+        switched = switched[..., different, :].flatten(-2)
+        masses = torch.cat((constant, switched), -1)
+        entropy = entropy - (masses.exp() * masses).sum(-1)
+        initial, final, switch = actions[..., index:index+3].unbind(-1)
+        def selected(values, indices):
+            return values.expand(*indices.shape, values.shape[-1]).gather(-1, indices[..., None]).squeeze(-1)
+        raw = selected(li, initial) + selected(lf, final) + selected(lk, switch)
+        logp = logp + torch.where((initial == final) | (switch == 0), selected(constant, final), raw)
+    return logp, entropy
+
+
 class Actor(nn.Module):
     """Independent categorical factors; samples are legal whole actions."""
-    def __init__(self, observations, limits):
+    def __init__(self, observations, limits, action_schedule=False):
         super().__init__()
         self.limits = tuple(limits)
+        self.action_schedule = action_schedule
+        if action_schedule and (len(limits) % 3 or any(
+                limits[i] != limits[i+1] or limits[i+2] < 2 for i in range(0, len(limits), 3))):
+            raise ValueError("schedule actions require initial/final/switch triples with matching controls")
         self.network = mlp(observations, sum(limits))
 
     def forward(self, observations):
@@ -34,13 +68,18 @@ class Actor(nn.Module):
         actions = [d.sample((count,)) for d in distributions]
         logp = sum(d.log_prob(a) for d, a in zip(distributions, actions))
         entropy = sum(d.entropy() for d in distributions)
-        return torch.stack(actions, -1), logp, entropy
+        actions = torch.stack(actions, -1)
+        if self.action_schedule:
+            logp, entropy = schedule_statistics(logits, actions)
+            actions = canonical_schedule(actions)
+        return actions, logp, entropy
 
 
 class Critic(nn.Module):
-    def __init__(self, observations, limits, bins=101):
+    def __init__(self, observations, limits, bins=101, action_schedule=False):
         super().__init__()
         self.limits = tuple(limits)
+        self.action_schedule = action_schedule
         self.encoder = mlp(observations, 128)
         self.head = mlp(128 + sum(limits), bins)
         self.predictor = mlp(128 + sum(limits), 128)
@@ -48,6 +87,8 @@ class Critic(nn.Module):
         self.register_buffer('support', torch.linspace(-100, 100, bins))
 
     def features(self, observations, actions):
+        if self.action_schedule:
+            actions = canonical_schedule(actions)
         encoded = self.encoder(observations)
         onehot = torch.cat([F.one_hot(actions[..., i], n) for i, n in enumerate(self.limits)], -1)
         return torch.cat((encoded, onehot.to(encoded.dtype)), -1)
@@ -123,16 +164,18 @@ class Replay:
 class Learner:
     """SAC owns actor, twin critics, entropy temperature and target updates."""
     def __init__(self, observations, limits, device='cuda', learning_rate=3e-4,
-                 gamma=.99, tau=.005, spr_weight=.1, entropy_fraction=.5):
-        self.actor = Actor(observations, limits).to(device)
-        self.critics = nn.ModuleList([Critic(observations, limits) for _ in range(2)]).to(device)
+                 gamma=.99, tau=.005, spr_weight=.1, entropy_fraction=.5, action_schedule=False):
+        self.actor = Actor(observations, limits, action_schedule).to(device)
+        self.critics = nn.ModuleList([Critic(observations, limits, action_schedule=action_schedule) for _ in range(2)]).to(device)
         self.targets = deepcopy(self.critics).requires_grad_(False)
         self.log_alpha = nn.Parameter(torch.tensor(-3., device=device))
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=learning_rate)
         self.critic_opt = torch.optim.Adam(self.critics.parameters(), lr=learning_rate)
         self.alpha_opt = torch.optim.Adam([self.log_alpha], lr=learning_rate)
         self.gamma, self.tau, self.spr_weight = gamma, tau, spr_weight
-        self.target_entropy = entropy_fraction * sum(math.log(n) for n in limits)
+        counts = ([limits[i] + limits[i] * (limits[i] - 1) * (limits[i+2] - 1)
+                   for i in range(0, len(limits), 3)] if action_schedule else limits)
+        self.target_entropy = entropy_fraction * sum(math.log(n) for n in counts)
         self.updates = 0
 
     def update(self, batch, weights):
