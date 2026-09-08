@@ -620,7 +620,7 @@ def load_config(env_name):
     parser.add_argument('--wandb-project', type=str, default='puffer4')
     parser.add_argument('--wandb-group', type=str, default='debug')
     parser.add_argument('--tag', type=str, default=None, help='Tag for experiment')
-    parser.add_argument('--learner', choices=('ppo', 'q'), default='ppo',
+    parser.add_argument('--learner', choices=('ppo', 'q', 'sac'), default='ppo',
         help='PPO (default) or frozen-proposal Q learning')
     parser.add_argument('--q-adapter', help='Q environment adapter as module:class')
     parser.add_argument('--slowly', action='store_true', help='Use PyTorch training backend')
@@ -687,9 +687,14 @@ def main():
     mode = sys.argv.pop(1)
     env_name = sys.argv.pop(1)
     selector = argparse.ArgumentParser(add_help=False)
-    selector.add_argument('--learner', choices=('ppo', 'q'), default='ppo')
+    selector.add_argument('--learner', choices=('ppo', 'q', 'sac'), default='ppo')
     selector.add_argument('--q-adapter', help='Q environment adapter as module:class')
     selection, remaining = selector.parse_known_args(sys.argv[1:])
+    if selection.learner == 'sac':
+        if mode != 'train':
+            selector.error('SAC mode supports train')
+        from pufferlib.sac_training import main as train_sac
+        return train_sac(remaining)
     if selection.learner == 'q':
         if mode != 'train':
             selector.error('Q mode currently supports train, including matched evaluation')
