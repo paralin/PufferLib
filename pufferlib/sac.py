@@ -168,8 +168,9 @@ class Replay:
 class Learner:
     """SAC owns actor, twin critics, entropy temperature and target updates."""
     def __init__(self, observations, limits, device='cuda', learning_rate=3e-4,
-                 gamma=.99, tau=.005, spr_weight=.1, entropy_fraction=.5, action_schedule=False):
-        self.actor = Actor(observations, limits, action_schedule).to(device)
+                 gamma=.99, tau=.005, spr_weight=.1, entropy_fraction=.5, action_schedule=False,
+                 actor=None):
+        self.actor = (Actor(observations, limits, action_schedule) if actor is None else actor).to(device)
         self.critics = nn.ModuleList([Critic(observations, limits, action_schedule=action_schedule) for _ in range(2)]).to(device)
         self.targets = deepcopy(self.critics).requires_grad_(False)
         self.log_alpha = nn.Parameter(torch.tensor(-3., device=device))
@@ -182,11 +183,17 @@ class Learner:
         self.target_entropy = entropy_fraction * sum(math.log(n) for n in counts)
         self.updates = 0
 
-    def update(self, batch, weights):
+    def update(self, batch, weights, *, actor_inputs=None):
+        """Update from critic transitions and optional reconstructed policy inputs.
+
+        Recurrent callers reconstruct current and next policy inputs from reset
+        prefixes. Critic observations remain in their fixed representation.
+        """
         obs, actions, rewards, next_obs, terminal = batch
+        current_input, next_input = (obs, next_obs) if actor_inputs is None else actor_inputs
         alpha = self.log_alpha.exp().detach()
         with torch.no_grad():
-            next_actions, next_logp, _ = self.actor.sample(next_obs)
+            next_actions, next_logp, _ = self.actor.sample(next_input)
             distributions = torch.stack([q(next_obs, next_actions[0]).softmax(-1) for q in self.targets])
             support = self.targets[0].support
             values = (distributions * support).sum(-1)
@@ -212,7 +219,7 @@ class Learner:
         self.critic_opt.step()
 
         # Leave-one-out baseline gives an unbiased sampled discrete policy gradient.
-        sampled, logp, entropy = self.actor.sample(obs, count=4)
+        sampled, logp, entropy = self.actor.sample(current_input, count=4)
         with torch.no_grad():
             repeated = obs.unsqueeze(0).expand(4, -1, -1).reshape(-1, obs.shape[-1])
             sampled_q = torch.stack([q.value(repeated, sampled.reshape(-1, sampled.shape[-1]))
