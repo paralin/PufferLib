@@ -62,16 +62,20 @@ class Actor(nn.Module):
     def forward(self, observations):
         return self.network(observations).split(self.limits, dim=-1)
 
-    def sample(self, observations, count=1):
+    def sample(self, observations, count=1, *, statistics=True):
+        """Sample controls; collection can omit the unused log-probability and entropy."""
         logits = self(observations)
-        distributions = [torch.distributions.Categorical(logits=x) for x in logits]
+        distributions = [torch.distributions.Categorical(logits=x, validate_args=False) for x in logits]
         actions = [d.sample((count,)) for d in distributions]
-        logp = sum(d.log_prob(a) for d, a in zip(distributions, actions))
-        entropy = sum(d.entropy() for d in distributions)
         actions = torch.stack(actions, -1)
+        if not statistics:
+            return canonical_schedule(actions) if self.action_schedule else actions, None, None
         if self.action_schedule:
             logp, entropy = schedule_statistics(logits, actions)
             actions = canonical_schedule(actions)
+        else:
+            logp = sum(d.log_prob(actions[..., i]) for i, d in enumerate(distributions))
+            entropy = sum(d.entropy() for d in distributions)
         return actions, logp, entropy
 
 

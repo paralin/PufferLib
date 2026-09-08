@@ -82,3 +82,15 @@ def test_schedule_critic_aliases_and_learning():
     torch.testing.assert_close(learner.critics[0](obs, a), learner.critics[0](obs, c))
     _, metrics = learner.update((obs, a, torch.ones(8), obs, torch.zeros(8)), torch.ones(8))
     assert torch.isfinite(metrics).all()
+
+
+def test_collection_without_statistics_preserves_actions():
+    from pufferlib.sac import Actor
+    torch.manual_seed(17)
+    obs = torch.randn(8, 4)
+    actor = Actor(4, (2, 2, 3), action_schedule=True)
+    torch.manual_seed(5)
+    sampled, _, _ = actor.sample(obs, 4)
+    torch.manual_seed(5)
+    actions, logp, entropy = actor.sample(obs, 4, statistics=False)
+    assert torch.equal(sampled, actions) and logp is None and entropy is None

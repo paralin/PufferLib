@@ -149,7 +149,7 @@ def main(argv=None):
                 if decisions < args.warmup:
                     action = np.stack([np.random.randint(n, size=rows) for n in limits], -1)
                 else:
-                    action = collector.sample(torch.from_numpy(flat))[0][0].numpy()
+                    action = collector.sample(torch.from_numpy(flat), statistics=False)[0][0].numpy()
             match_actions = action.reshape(args.num_envs, agents_per_env, -1)
             results = [env.step(a if agents_per_env > 1 else a[0]) for env, a in zip(envs, match_actions)]
             following = np.stack([row[0] for row in results]).reshape(rows, width)
