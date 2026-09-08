@@ -36,3 +36,18 @@ remain independently evaluable. `--resume checkpoint.pt` restores training and
 starts fresh matches on unused seeds; it does not restore simulator mid-match
 state. `--steps` is the cumulative decision limit. Only load trusted checkpoints.
 At `--stop-at`, the active collection/update finishes and final state is saved.
+
+## Protein tuning
+
+Use `pufferl sweep ENV --learner sac --env-factory module:factory
+--score-function module:score --output NEW_DIRECTORY --stop-at ISO_TIMESTAMP`.
+The score function returns episode rows containing `combined_return`. Protein
+receives held-out combined reward and measured training-plus-evaluation cost.
+The default eight trials each collect 200000 decisions and use the same32
+calibration seeds. Three Sobol suggestions precede GP-guided suggestions.
+Search dimensions are learning rate, batch size, entropy fraction and prediction
+loss weight. The controller keeps all trial checkpoints and resumes the highest
+calibration-score trial for the remaining time. This selection is not a claim
+of held-out superiority: evaluate it on fresh seeds before promotion.
+Protein's small GP runs on CPU; SAC retains the GPU. Trials run sequentially.
+SIGTERM/SIGINT request a final save at the next training-loop boundary.

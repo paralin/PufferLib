@@ -691,8 +691,11 @@ def main():
     selector.add_argument('--q-adapter', help='Q environment adapter as module:class')
     selection, remaining = selector.parse_known_args(sys.argv[1:])
     if selection.learner == 'sac':
+        if mode == 'sweep':
+            from pufferlib.sac_sweep import main as sweep_sac
+            return sweep_sac(remaining)
         if mode != 'train':
-            selector.error('SAC mode supports train')
+            selector.error('SAC mode supports train and sweep')
         from pufferlib.sac_training import main as train_sac
         return train_sac(remaining)
     if selection.learner == 'q':

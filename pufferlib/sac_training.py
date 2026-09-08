@@ -5,6 +5,7 @@ from copy import deepcopy
 from datetime import datetime
 import importlib
 import json
+import signal
 from pathlib import Path
 import time
 
@@ -35,6 +36,7 @@ def main(argv=None):
     parser.add_argument('--checkpoint-seconds', type=float, default=300)
     parser.add_argument('--learning-rate', type=float, default=3e-4)
     parser.add_argument('--reward-scale', type=float, default=.1)
+    parser.add_argument('--entropy-fraction', type=float, default=.5)
     parser.add_argument('--spr-weight', type=float, default=.1)
     args = parser.parse_args(argv)
     if args.stop_at.tzinfo is None:
@@ -59,7 +61,7 @@ def main(argv=None):
         limits = envs[0].action_space.nvec.tolist()
         observations = np.stack([env.reset(seed=args.seed + i)[0] for i, env in enumerate(envs)])
         history = np.repeat(observations[:, None, :], args.history, axis=1)
-        learner = Learner(width * args.history, limits, args.device, args.learning_rate, spr_weight=args.spr_weight)
+        learner = Learner(width * args.history, limits, args.device, args.learning_rate, spr_weight=args.spr_weight, entropy_fraction=args.entropy_fraction)
         collector = deepcopy(learner.actor).cpu().eval()
         replay = Replay(args.capacity, width * args.history, len(limits), args.device)
         returns = np.zeros(args.num_envs)
@@ -69,8 +71,8 @@ def main(argv=None):
         decisions, completed = 0, 0
         if args.resume:
             state = torch.load(args.resume, map_location=args.device, weights_only=False)
-            for key in ('env_factory', 'capacity', 'history', 'learning_rate', 'reward_scale', 'spr_weight', 'seed', 'num_envs'):
-                if state['configuration'][key] != configuration[key]:
+            for key in ('env_factory', 'capacity', 'history', 'learning_rate', 'reward_scale', 'spr_weight', 'seed', 'num_envs', 'entropy_fraction'):
+                if state['configuration'].get(key, .5 if key == 'entropy_fraction' else None) != configuration[key]:
                     raise ValueError(f'resume must preserve {key}')
             learner.load_state_dict(state['learner'])
             replay.load_state_dict(state['replay'])
@@ -103,7 +105,13 @@ def main(argv=None):
             torch.save(policy, args.output / 'actor.pt')
             emit(event='checkpoint', decisions=decisions, updates=learner.updates, final=final)
 
-        while decisions < args.steps and time.time() < args.stop_at.timestamp():
+        stopping = False
+        def request_stop(signum, frame):
+            nonlocal stopping
+            stopping = True
+        signal.signal(signal.SIGTERM, request_stop)
+        signal.signal(signal.SIGINT, request_stop)
+        while not stopping and decisions < args.steps and time.time() < args.stop_at.timestamp():
             flat = history.reshape(args.num_envs, -1)
             with torch.no_grad():
                 if decisions < args.warmup:

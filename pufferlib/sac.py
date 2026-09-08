@@ -119,7 +119,7 @@ class Replay:
 class Learner:
     """SAC owns actor, twin critics, entropy temperature and target updates."""
     def __init__(self, observations, limits, device='cuda', learning_rate=3e-4,
-                 gamma=.99, tau=.005, spr_weight=.1):
+                 gamma=.99, tau=.005, spr_weight=.1, entropy_fraction=.5):
         self.actor = Actor(observations, limits).to(device)
         self.critics = nn.ModuleList([Critic(observations, limits) for _ in range(2)]).to(device)
         self.targets = deepcopy(self.critics).requires_grad_(False)
@@ -128,7 +128,7 @@ class Learner:
         self.critic_opt = torch.optim.Adam(self.critics.parameters(), lr=learning_rate)
         self.alpha_opt = torch.optim.Adam([self.log_alpha], lr=learning_rate)
         self.gamma, self.tau, self.spr_weight = gamma, tau, spr_weight
-        self.target_entropy = .5 * sum(math.log(n) for n in limits)
+        self.target_entropy = entropy_fraction * sum(math.log(n) for n in limits)
         self.updates = 0
 
     def update(self, batch, weights):
