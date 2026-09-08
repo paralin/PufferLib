@@ -111,11 +111,15 @@ class PrioritizedSampler:
 
 class CriticTrainer:
     def __init__(self, device: str, seed: int, *, context_size: int,
-                 limits: tuple[int, ...], replay_capacity: int = 131_072, reward_discount: float | None = None, gaussian_sigma: float | None = None, learning_rate: float = .0003):
+                 limits: tuple[int, ...], replay_capacity: int = 131_072, reward_discount: float | None = None, gaussian_sigma: float | None = None, learning_rate: float = .0003,
+                 target_ema: float = .01):
         if reward_discount is not None and not 0 <= reward_discount <= 1:
             raise ValueError("reward discount must be between zero and one")
         if not np.isfinite(learning_rate) or learning_rate <= 0:
             raise ValueError("learning rate must be finite and positive")
+        if not np.isfinite(target_ema) or not 0 <= target_ema <= 1:
+            raise ValueError("target EMA must be finite and between zero and one")
+        self.target_ema = float(target_ema)
         self.device = device
         self.reward_discount = reward_discount
         self.model = FactorCritic(context_size, limits, reward_mode=reward_discount is not None, gaussian_sigma=gaussian_sigma).to(device)
@@ -169,7 +173,7 @@ class CriticTrainer:
                         - returns).abs()
             self.sampler.update(indices, residual.cpu().numpy())
             for slow, fast in zip(self.target.parameters(), self.model.parameters()):
-                slow.lerp_(fast, .01)
+                slow.lerp_(fast, self.target_ema)
         self.updates += 1
         return float(loss.detach())
 
@@ -179,13 +183,17 @@ class CriticTrainer:
                     "optimizer": self.optimizer.state_dict(), "updates": self.updates,
                     "identity": asdict(identity), "rng": self.generator.get_state(),
                     "replay_sha256": replay_sha256, "training_runtime": self.runtime,
-                    "gaussian_sigma": self.model.gaussian_sigma, "priorities": self.sampler.state()}, temporary)
+                    "gaussian_sigma": self.model.gaussian_sigma, "target_ema": self.target_ema,
+                    "priorities": self.sampler.state()}, temporary)
         temporary.replace(path)
 
     def restore(self, path: Path, identity, replay_sha256: str) -> None:
         # Keep the sampling RNG on CPU; optimizer.load_state_dict moves its
         # tensors to their parameter devices.
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        # Historical checkpoints used the fixed .01 update coefficient.
+        if checkpoint.get("target_ema", .01) != self.target_ema:
+            raise ValueError("checkpoint target EMA differs; use explicit weight initialization")
         if checkpoint.get("gaussian_sigma") != self.model.gaussian_sigma:
             raise ValueError("checkpoint categorical loss differs")
         if checkpoint.get("replay_sha256") != replay_sha256:
