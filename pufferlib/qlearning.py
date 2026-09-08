@@ -58,12 +58,38 @@ def overlapping_range(used: list[tuple[int, int]], candidate: tuple[int, int]) -
     return None
 
 
-def tensors(batch, bootstrap_truncations=False):
+def tensors(batch, bootstrap_truncations=False, *, n_step=1, discount=None):
+    """Build targets along contiguous recorded episodes, never across a reset.
+
+    Multi-step returns follow the recorded behavior policy and bootstrap from
+    its recorded continuation action. Replay boundaries shorten the return.
+    """
+    if n_step < 1 or (n_step > 1 and (discount is None or not 0 <= discount <= 1)):
+        raise ValueError("multi-step targets require a positive horizon and reward discount")
     context = np.concatenate((batch.observations, batch.actor_contexts.reshape(len(batch.actions), -1)), 1)
     next_context = np.concatenate((batch.next_observations, batch.next_actor_contexts.reshape(len(batch.actions), -1)), 1)
-    return tuple(torch.from_numpy(value) for value in (
+    data = tuple(torch.from_numpy(value) for value in (
         context, batch.actions, batch.reward_targets, next_context, batch.next_actions,
         batch.terminals if bootstrap_truncations else batch.terminals | batch.truncated))
+    if n_step == 1:
+        return data
+    count = len(batch.actions)
+    rewards = np.zeros(count, dtype=np.float32)
+    discounts = np.ones(count, dtype=np.float32)
+    ends = np.arange(count)
+    for start in range(count):
+        for end in range(start, min(start + n_step, count)):
+            if end > start and (batch.episode_ids[end] != batch.episode_ids[start]
+                    or batch.seeds[end] != batch.seeds[start]
+                    or batch.steps[end] != batch.steps[end - 1] + 1):
+                break
+            rewards[start] += discounts[start] * batch.reward_targets[end]
+            discounts[start] *= discount
+            ends[start] = end
+            if batch.terminals[end] or batch.truncated[end]:
+                break
+    return (data[0], data[1], torch.from_numpy(rewards), data[3][ends],
+            data[4][ends], data[5][ends], torch.from_numpy(discounts))
 
 
 def evaluate_rows(model, records, discount=None):
@@ -111,6 +137,7 @@ def main(adapter, argv=None):
     parser.add_argument("--episodes", type=int, help="training episodes (default 64; inherited on resume)")
     parser.add_argument("--held-out", type=int, help="matched evaluation seeds (default 16; inherited on resume)")
     parser.add_argument("--updates", type=int, default=5000, help="total completed critic updates, including resumed updates")
+    parser.add_argument("--n-step", type=int, help="recorded reward steps per target (default 1; inherited on resume)")
     parser.add_argument("--replay-capacity", type=int, help="maximum retained transitions (default 131072; inherited on resume)")
     parser.add_argument("--checkpoint-seconds", type=float, default=300.,
                         help="seconds between checkpoints (default 300); always saves the final update")
@@ -150,13 +177,13 @@ def main(adapter, argv=None):
     if args.resume is not None:
         args.resume = args.resume.resolve()
         previous_manifest = json.loads((args.resume / "experiment.json").read_text())
-    for name, default in (("episodes", 64), ("held_out", 16), ("seed", 7000), ("replay_capacity", 131072)):
+    for name, default in (("episodes", 64), ("held_out", 16), ("seed", 7000), ("replay_capacity", 131072), ("n_step", 1)):
         previous_value = previous_manifest.get(name, default) if previous_manifest else default
         supplied = getattr(args, name)
         if previous_manifest and supplied is not None and supplied != previous_value:
             parser.error(f"--{name.replace('_', '-')} must match the resumed experiment")
         setattr(args, name, previous_value if supplied is None else supplied)
-    if min(args.episodes, args.held_out, args.updates, args.replay_capacity) < 1 or args.seed < 0:
+    if min(args.episodes, args.held_out, args.updates, args.replay_capacity, args.n_step) < 1 or args.seed < 0:
         parser.error("episode counts, updates and replay capacity must be positive; seed must be nonnegative")
     if args.seed + args.episodes + args.held_out > 2**32:
         parser.error("training and held-out seeds must fit the kernel's unsigned 32-bit seed range")
@@ -180,7 +207,7 @@ def main(adapter, argv=None):
                             gaussian_sigma=getattr(adapter, "gaussian_sigma", None),
                             learning_rate=getattr(adapter, "learning_rate", .0003),
                             target_ema=getattr(adapter, "target_ema", .01),
-                            canonical_schedules=getattr(adapter, "canonical_schedules", False))
+                            canonical_schedules=getattr(adapter, "canonical_schedules", False), n_step=args.n_step)
     resume_checkpoint_hash = None
     batch = None
     if previous_manifest:
@@ -250,7 +277,7 @@ def main(adapter, argv=None):
                 **adapter.runtime_metadata,
                 "actor_device": "cpu", "critic_device": args.device,
                 "replay_sampling": "proportional-td-error", "replay_eviction": "fifo",
-                "gaussian_sigma": trainer.model.gaussian_sigma,
+                "gaussian_sigma": trainer.model.gaussian_sigma, "n_step": trainer.n_step,
                 "canonical_schedules": trainer.model.canonical_schedules,
                 "reward_discount": trainer.reward_discount, "target_ema": trainer.target_ema, "learning_rate": trainer.optimizer.param_groups[0]["lr"], "batch_size": 256,
                 "runtime_note": adapter.runtime_note}
@@ -291,7 +318,8 @@ def main(adapter, argv=None):
     if batch is None:
         batch = ReplayStore.open(replay_path, identity, held_out_seeds=held_out).read_all(max_rows=args.replay_capacity)
     replay_digest = hashlib.sha256((replay_path / "manifest.jsonl").read_bytes()).hexdigest()
-    data = tensors(batch, getattr(adapter, "bootstrap_truncations", False))
+    data = tensors(batch, getattr(adapter, "bootstrap_truncations", False),
+                   n_step=args.n_step, discount=trainer.reward_discount)
     del batch
     collection_seconds = time.perf_counter() - started
     update_started = time.perf_counter()
@@ -376,7 +404,8 @@ def run_rounds(adapter, args):
                    "--updates", str(args.updates), "--device", args.device,
                    "--seed", str(seed + index * (episodes + held_out)),
                    "--replay-capacity", str(args.replay_capacity or 131072),
-                   "--checkpoint-seconds", str(args.checkpoint_seconds)]
+                   "--checkpoint-seconds", str(args.checkpoint_seconds),
+                   "--n-step", str(args.n_step or 1)]
         if parent is not None:
             command += ["--init-from", str(parent)]
             if index > 0 or args.retain_replay:

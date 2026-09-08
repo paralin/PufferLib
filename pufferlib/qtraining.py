@@ -112,7 +112,10 @@ class PrioritizedSampler:
 class CriticTrainer:
     def __init__(self, device: str, seed: int, *, context_size: int,
                  limits: tuple[int, ...], replay_capacity: int = 131_072, reward_discount: float | None = None, gaussian_sigma: float | None = None, learning_rate: float = .0003,
-                 target_ema: float = .01, canonical_schedules: bool = False):
+                 target_ema: float = .01, canonical_schedules: bool = False, n_step: int = 1):
+        if n_step < 1 or (n_step > 1 and reward_discount is None):
+            raise ValueError("multi-step targets require a positive horizon and reward discount")
+        self.n_step = n_step
         if reward_discount is not None and not 0 <= reward_discount <= 1:
             raise ValueError("reward discount must be between zero and one")
         if not np.isfinite(learning_rate) or learning_rate <= 0:
@@ -152,12 +155,15 @@ class CriticTrainer:
         indices, weights = self.sampler.sample(256, self.beta)
         self.last_sampled_indices = indices
         context, action, reward, next_context, next_action, done = [
-            torch.as_tensor(x)[torch.from_numpy(indices)].to(self.device) for x in data]
+            torch.as_tensor(x)[torch.from_numpy(indices)].to(self.device) for x in data[:6]]
+        discount = self.reward_discount
+        if self.n_step > 1:
+            discount = data[6][torch.from_numpy(indices)].to(self.device)
         with torch.no_grad():
             bootstrap = self.target.score(
                 ContextBatch(next_context), CandidateBatch(next_action[:, None]))[:, 0]
             returns = (torch.where(done, reward, bootstrap) if self.reward_discount is None else
-                       reward + self.reward_discount * torch.where(done, 0., bootstrap))
+                       reward + discount * torch.where(done, 0., bootstrap))
             # Categorical projection saturates only outside the declared return support.
             returns = returns.clamp(self.model.support[0], self.model.support[-1])
         rows = self.model.loss(context, action, returns, reduction="none")
@@ -184,6 +190,7 @@ class CriticTrainer:
                     "identity": asdict(identity), "rng": self.generator.get_state(),
                     "replay_sha256": replay_sha256, "training_runtime": self.runtime,
                     "gaussian_sigma": self.model.gaussian_sigma, "target_ema": self.target_ema,
+                    "n_step": self.n_step,
                     "priorities": self.sampler.state()}, temporary)
         temporary.replace(path)
 
@@ -191,6 +198,8 @@ class CriticTrainer:
         # Keep the sampling RNG on CPU; optimizer.load_state_dict moves its
         # tensors to their parameter devices.
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        if checkpoint.get("n_step", 1) != self.n_step:
+            raise ValueError("checkpoint target horizon differs; use explicit weight initialization")
         encoding = checkpoint["model"].get("_canonical_schedules", torch.tensor(False))
         if bool(encoding.item()) != self.model.canonical_schedules:
             raise ValueError("checkpoint action encoding differs; use explicit weight initialization")
