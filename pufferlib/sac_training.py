@@ -24,6 +24,7 @@ def main(argv=None):
     parser.add_argument('--env-factory', required=True, help='module:callable accepting seed=')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--resume', type=Path, help='trusted checkpoint.pt; restores learner/replay, resets matches')
+    parser.add_argument('--init-actor', type=Path, help='transfer actor weights only; fresh critics, optimizers and replay')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--stop-at', type=datetime.fromisoformat, required=True)
     parser.add_argument('--steps', type=int, default=100_000_000)
@@ -85,6 +86,14 @@ def main(argv=None):
             np.random.set_state(state['numpy_rng'])
             if args.device.startswith('cuda'):
                 torch.cuda.set_rng_state(state['device_rng'].cpu())
+            collector.load_state_dict(learner.actor.state_dict())
+        if args.init_actor:
+            if args.resume:
+                parser.error('--init-actor cannot be combined with --resume')
+            initial = torch.load(args.init_actor, map_location=args.device, weights_only=True)
+            if initial['history'] != args.history or initial['width'] != width or initial['limits'] != limits:
+                raise ValueError('initial actor observation or action contract differs')
+            learner.actor.load_state_dict(initial['actor'])
             collector.load_state_dict(learner.actor.state_dict())
         starting_decisions = decisions
         next_save, next_report = started + args.checkpoint_seconds, started + 30
