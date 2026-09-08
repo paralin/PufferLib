@@ -18,12 +18,12 @@ BETA_ANNEAL_UPDATES = 1_000_000
 EPSILON = 1e-6
 
 
-def initialization_identity_matches(actual: dict, expected: dict, allow_environment_change: bool = False, reset_value_head: bool = False) -> bool:
+def initialization_identity_matches(actual: dict, expected: dict, allow_environment_change: bool = False, reset_value_head: bool = False, transfer_value_head: bool = False) -> bool:
     """Explicit transfer can replace the environment or value objective, never the actor."""
     if allow_environment_change:
         actual = {key: value for key, value in actual.items() if key != "opponent"}
         expected = {key: value for key, value in expected.items() if key != "opponent"}
-    if reset_value_head:
+    if reset_value_head or transfer_value_head:
         actual = {key: value for key, value in actual.items() if key != "reward_target"}
         expected = {key: value for key, value in expected.items() if key != "reward_target"}
     return actual == expected
@@ -208,16 +208,20 @@ class CriticTrainer:
         self.sampler.load(checkpoint["priorities"])
 
     def load_weights(self, path: Path, identity, expected_updates: int | None = None, *,
-                     allow_environment_change: bool = False, reset_value_head: bool = False) -> int:
+                     allow_environment_change: bool = False, reset_value_head: bool = False,
+                     transfer_value_head: bool = False) -> int:
         """Load model weights into model and target from one checkpoint.
 
         Requires a matching actor and learned contract plus completed updates.
-        Environment changes require explicit opt-in. Resetting the value head
-        permits a new objective while retaining context/action features. Optimizer, sampler, RNG
+        Environment changes require explicit opt-in. A new objective requires
+        explicitly resetting or transferring the value head. Transfer retains
+        its initial estimates; subsequent targets use the new objective. Optimizer, sampler, RNG
         and update counter stay fresh. Returns the checkpoint's completed update count.
         """
+        if reset_value_head and transfer_value_head:
+            raise ValueError("cannot both reset and transfer the value head")
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-        if not initialization_identity_matches(checkpoint.get("identity", {}), asdict(identity), allow_environment_change, reset_value_head):
+        if not initialization_identity_matches(checkpoint.get("identity", {}), asdict(identity), allow_environment_change, reset_value_head, transfer_value_head):
             raise ValueError("init checkpoint actor, runtime, formats or objective differ")
         updates = checkpoint.get("updates")
         if not isinstance(updates, int) or updates < 1:
@@ -227,6 +231,8 @@ class CriticTrainer:
         if not reset_value_head and checkpoint.get("gaussian_sigma") != self.model.gaussian_sigma:
             raise ValueError("init categorical loss differs; reset the value head explicitly")
         weights = checkpoint["model"]
+        if transfer_value_head and not torch.equal(weights["support"], self.model.support.cpu()):
+            raise ValueError("value support differs; reset the value head instead")
         if reset_value_head:
             weights = {key: value for key, value in weights.items()
                        if key not in ("support", "network.4.weight", "network.4.bias")}

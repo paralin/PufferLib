@@ -118,11 +118,16 @@ def main(adapter, argv=None):
     parser.add_argument("--seed", type=int, help="initial collection seed (default 7000; inherited on resume)")
     parser.add_argument("--allow-environment-change", action="store_true",
                         help="allow --init-from weights on a different kernel or reset distribution; actor and learned formats must match")
-    parser.add_argument("--reset-value-head", action="store_true",
+    head = parser.add_mutually_exclusive_group()
+    head.add_argument("--reset-value-head", action="store_true",
                         help="with --init-from, retain critic features but reset the return head for a changed reward objective")
+    head.add_argument("--transfer-value-head", action="store_true",
+                      help="with --init-from, warm-start the entire critic across a changed reward objective; collect fresh replay")
     args = parser.parse_args(argv)
     if args.reset_value_head and args.init_from is None:
         parser.error("--reset-value-head requires --init-from")
+    if args.transfer_value_head and (args.init_from is None or args.retain_replay):
+        parser.error("--transfer-value-head requires --init-from and fresh replay")
     if args.allow_environment_change and args.init_from is None:
         parser.error("--allow-environment-change requires --init-from")
     if not np.isfinite(args.checkpoint_seconds) or args.checkpoint_seconds <= 0:
@@ -210,14 +215,15 @@ def main(adapter, argv=None):
         checkpoint = init_from / "critic.pt"
         if not checkpoint.is_file():
             parser.error("--init-from points to a directory without a critic checkpoint")
-        if not initialization_identity_matches(prior_manifest.get("identity", {}), asdict(identity), args.allow_environment_change, args.reset_value_head):
+        if not initialization_identity_matches(prior_manifest.get("identity", {}), asdict(identity), args.allow_environment_change, args.reset_value_head, args.transfer_value_head):
             parser.error("--init-from manifest actor, kernel, formats or objective differ")
         if not isinstance(prior_manifest.get("updates"), int):
             parser.error("--init-from manifest must record completed updates")
         try:
             init_updates = trainer.load_weights(checkpoint, identity, prior_manifest["updates"],
                                                 allow_environment_change=args.allow_environment_change,
-                                                reset_value_head=args.reset_value_head)
+                                                reset_value_head=args.reset_value_head,
+                                                transfer_value_head=args.transfer_value_head)
         except ValueError as error:
             parser.error(str(error))
         collector = FactorCritic(adapter.context_size, adapter.action_limits)
@@ -377,6 +383,8 @@ def run_rounds(adapter, args):
                     command += ["--allow-environment-change"]
                 if args.reset_value_head:
                     command += ["--reset-value-head"]
+                if args.transfer_value_head:
+                    command += ["--transfer-value-head"]
         result = main(adapter, command)
         results.append({"round": index, "output": str(destination),
                         "training_decisions": result["training_decisions"],
