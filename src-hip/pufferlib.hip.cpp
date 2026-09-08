@@ -1330,7 +1330,7 @@ __device__ void puff_advantage_row_scalar(
         float r_nxt = to_float(rewards[t_next]);
         float v = to_float(values[t]);
         float v_nxt = to_float(values[t_next]);
-        float delta = rho_t*r_nxt + gamma*v_nxt*nextnonterminal - v;
+        float delta = rho_t * (r_nxt + gamma * v_nxt * nextnonterminal - v);
         lastpufferlam = delta + gamma*lambda*c_t*lastpufferlam*nextnonterminal;
         advantages[t] = from_float(lastpufferlam);
     }
