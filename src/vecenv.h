@@ -550,6 +550,10 @@ void static_vec_set_env_tags(StaticVec* vec, const int* tags) {
         envs[i].tag = tags[i];
         envs[i].boundary_reached = 0;
     }
+#ifdef MY_TAGS_REQUIRE_RESET
+    // Tag-dependent controllers must own the new episode before collection.
+    static_vec_reset(vec);
+#endif
 }
 
 int static_vec_count_aligned(StaticVec* vec, int tag_value, int reset_flags) {
