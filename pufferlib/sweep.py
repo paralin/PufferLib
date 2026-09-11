@@ -6,7 +6,6 @@ from copy import deepcopy
 from contextlib import contextmanager
 
 import numpy as np
-import pufferlib
 
 import torch
 import gpytorch

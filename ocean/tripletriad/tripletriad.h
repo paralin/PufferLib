@@ -2,6 +2,12 @@
 #include <math.h>
 #include "raylib.h"
 #include <stdio.h>
+typedef float obs_t;
+#include "pufferenv.h"
+
+#define ACT_SIZES {14}
+#define OBS_SIZE 114
+#define NUM_ATNS 1
 
 #define SELECT_CARD_1 0
 #define SELECT_CARD_2 1
@@ -19,6 +25,7 @@
 #define PLACE_CARD_9 13
 #define TICK_RATE 1.0f/60.0f
 #define MAX_EPISODE_LENGTH 30
+#define HOLD_FRAMES 18
 
 const Color PUFF_RED = (Color){187, 0, 0, 255};
 const Color PUFF_CYAN = (Color){0, 187, 187, 255};
@@ -37,14 +44,12 @@ struct Log {
 };
 
 typedef struct Client Client;
-typedef struct CTripleTriad CTripleTriad;
-struct CTripleTriad {
-    float* observations;
-    float* actions;
-    float* rewards;
-    float* terminals;
+struct Env {
     int num_agents;
     Log log;
+    Agent agents[1];
+    int tag;
+    int boundary_reached;
     int card_width;
     int card_height;
     float* board_x;
@@ -64,9 +69,14 @@ struct CTripleTriad {
     float perf;
     float episode_return;
     float episode_length;
+    int last_opp_slot;
+    int last_opp_cell;
+    int show_anim;
+    int pending_reset;
     Client* client;
     unsigned int rng;
 };
+typedef Env CTripleTriad;
 
 void add_log(CTripleTriad* env) {
     env->log.perf += env->perf;
@@ -172,15 +182,7 @@ void init_ctripletriad(CTripleTriad* env) {
     generate_scores(env);
 }
 
-void allocate_ctripletriad(CTripleTriad* env) {
-    env->actions = (float*)calloc(1, sizeof(float));
-    env->observations = (float*)calloc(env->width*env->height, sizeof(float));
-    env->terminals = (float*)calloc(1, sizeof(float));
-    env->rewards = (float*)calloc(1, sizeof(float));
-    init_ctripletriad(env);
-}
-
-void c_close(CTripleTriad* env) {
+void puf_close(CTripleTriad* env) {
     free(env->board_x);
     free(env->board_y);
     for(int i=0; i< 2; i++) {
@@ -208,39 +210,32 @@ void c_close(CTripleTriad* env) {
     free(env->score);
 }
 
-void free_allocated_ctripletriad(CTripleTriad* env) {
-    free(env->actions);
-    free(env->observations);
-    free(env->terminals);
-    free(env->rewards);
-    c_close(env);
-}
-
 void compute_observations(CTripleTriad* env) {
+    obs_t* obs = env->agents[0].observations;
     int idx=0;
     for (int i = 0; i < 3; i++) {
         for (int j = 0; j < 3; j++) {
-            env->observations[idx] = env->board_states[i][j];
+            obs[idx] = env->board_states[i][j];
             idx++;
         }
     }
     for (int i = 0; i < 15; i++) {
-        env->observations[idx] = env->action_masks[i];
+        obs[idx] = env->action_masks[i];
         idx++;
     }
 
     for (int i = 0; i < 2; i++) {
-        env->observations[idx] = env->card_selected[i];
+        obs[idx] = env->card_selected[i];
         idx++;
     }
     for (int i = 0; i < 2; i++) {
-        env->observations[idx] = env->score[i];
+        obs[idx] = env->score[i];
         idx++;
     }
     for (int i=0;i<3;i++) {
         for (int j=0;j<3;j++) {
             for (int k=0;k<4;k++) {
-                env->observations[idx] = env->board_card_values[i][j][k];
+                obs[idx] = env->board_card_values[i][j][k];
                 idx++;
             }
         }
@@ -248,20 +243,20 @@ void compute_observations(CTripleTriad* env) {
     for (int i=0;i<2;i++){
         for (int j=0;j<5;j++) {
             for (int k=0;k<4;k++) {
-                env->observations[idx] = env->cards_in_hand[i][j][k];
+                obs[idx] = env->cards_in_hand[i][j][k];
                 idx++;
             }
         }
     }
     for (int i=0;i<2;i++) {
         for (int j=0;j<5;j++) {
-            env->observations[idx] = env->card_locations[i][j];
+            obs[idx] = env->card_locations[i][j];
             idx++;
         }
     }
 }
 
-void c_reset(CTripleTriad* env) {
+void puf_reset(CTripleTriad* env) {
     env->game_over = 0;
     for(int i=0; i< 2; i++) {
         for(int j=0; j< 5; j++) {
@@ -296,11 +291,15 @@ void c_reset(CTripleTriad* env) {
     for(int i=0; i< 2; i++) {
         env->score[i] = 5;
     }
-    env->terminals[0] = 0;
+    env->agents[0].terminals[0] = 0;
     compute_observations(env);
     env->tick = 0;
     env->episode_length = 0;
     env->episode_return = 0;
+    env->show_anim = 0;
+    env->pending_reset = 0;
+    env->last_opp_slot = -1;
+    env->last_opp_cell = 0;
 }
 
 void select_card(CTripleTriad* env, int card_selected, int player) {
@@ -352,13 +351,13 @@ void check_win_condition(CTripleTriad* env, int player) {
     if (count == 9) {
         // add a draw condition and winner value is 0
         if (env->score[0] == env->score[1]) {
-            env->terminals[0] = 1;
-            env->rewards[0] = 0.0;
+            env->agents[0].terminals[0] = 1;
+            env->agents[0].rewards[0] = 0.0;
             env->game_over = 1;
         } else {
             int winner = env->score[0] > env->score[1] ? 1 : -1;
-            env->terminals[0] = 1;
-            env->rewards[0] = winner; // 1 for player win, -1 for opponent win
+            env->agents[0].terminals[0] = 1;
+            env->agents[0].rewards[0] = winner; // 1 for player win, -1 for opponent win
             env->episode_return += winner;
             env->game_over = 1;
         }
@@ -459,29 +458,72 @@ void check_card_conversions(CTripleTriad* env, int card_placement, int player) {
     }
 }
 
-void c_step(CTripleTriad* env) {
+// Hold Left Shift + 1-5 to pick a card, click a board cell to place.
+static void tripletriad_human_controls(CTripleTriad *env) {
+    if (!IsWindowReady() || !IsKeyDown(KEY_LEFT_SHIFT)) {
+        return;
+    }
+    if (IsKeyPressed(KEY_ONE)) {
+        env->agents[0].actions[0] = SELECT_CARD_1;
+        return;
+    }
+    if (IsKeyPressed(KEY_TWO)) {
+        env->agents[0].actions[0] = SELECT_CARD_2;
+        return;
+    }
+    if (IsKeyPressed(KEY_THREE)) {
+        env->agents[0].actions[0] = SELECT_CARD_3;
+        return;
+    }
+    if (IsKeyPressed(KEY_FOUR)) {
+        env->agents[0].actions[0] = SELECT_CARD_4;
+        return;
+    }
+    if (IsKeyPressed(KEY_FIVE)) {
+        env->agents[0].actions[0] = SELECT_CARD_5;
+        return;
+    }
+    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+        Vector2 mousePos = GetMousePosition();
+        int boardOffsetX = 196 + 10;
+        int boardOffsetY = 30;
+        int relativeX = (int)mousePos.x - boardOffsetX;
+        int relativeY = (int)mousePos.y - boardOffsetY;
+        int cellX = relativeX / env->card_width;
+        int cellY = relativeY / env->card_height;
+        if (cellX >= 0 && cellX < 3 && cellY >= 0 && cellY < 3) {
+            env->agents[0].actions[0] = cellY * 3 + cellX + 1 + 4;
+        }
+    }
+}
+
+void puf_step(CTripleTriad* env) {
     env->episode_length += 1;
-    env->rewards[0] = 0.0;
-    int action = env->actions[0];
+    env->agents[0].rewards[0] = 0.0;
+    int action = env->agents[0].actions[0];
 
     if (env->episode_length >= MAX_EPISODE_LENGTH) {
         env->game_over = 1;
         env->episode_return -= 1.0;
-        env->rewards[0] -= 1.0;
+        env->agents[0].rewards[0] -= 1.0;
     }
 
     // reset the game if game over
     if (env->game_over == 1) {
         env->perf = (env->score[0] > env->score[1]) ? 1.0 : 0.0;
         add_log(env);
-        c_reset(env);
+        if (env->client) {
+            env->pending_reset = 1;
+        } else {
+            puf_reset(env);
+        }
         return;
     }
     // select a card if the card is in the range of 1-5 and the card is not placed
     if (action >= SELECT_CARD_1 && action <= SELECT_CARD_5 ) {
         // Prevent model from just swapping between selected cards to avoid playing
         env->episode_return -= 0.1;
-        env->rewards[0] -= 0.1;
+        env->agents[0].rewards[0] -= 0.1;
 
         int card_selected = action + 1;
         
@@ -495,6 +537,9 @@ void c_step(CTripleTriad* env) {
         bool card_placed = false;
         if(env->card_selected[0] >= 0) {
             if(check_legal_placement(env, card_placement, 1)) {
+                env->last_opp_slot = -1;
+                env->last_opp_cell = 0;
+                env->show_anim = 1;
                 place_card(env,card_placement, 1);
                 check_card_conversions(env, card_placement, 1);
                 check_win_condition(env, 1);
@@ -503,19 +548,21 @@ void c_step(CTripleTriad* env) {
                 card_placed = true;
             } else {
                 env->episode_return -= 0.1;
-                env->rewards[0] -= 0.1;
+                env->agents[0].rewards[0] -= 0.1;
             }
         } else {
             env->episode_return -= 0.1;
-            env->rewards[0] -= 0.1;
+            env->agents[0].rewards[0] -= 0.1;
         }
 
         // opponent turn 
-        if (env->terminals[0] == 0 && card_placed == true ) {
+        if (env->agents[0].terminals[0] == 0 && card_placed == true ) {
             int bot_card_selected = get_bot_card_selection(env);
             if(bot_card_selected > 0) {
                 select_card(env,bot_card_selected, -1);
                 int bot_card_placement = get_bot_card_placement(env);
+                env->last_opp_slot = env->card_selected[1];
+                env->last_opp_cell = bot_card_placement;
                 place_card(env,bot_card_placement, -1);
                 check_card_conversions(env, bot_card_placement, -1);
                 check_win_condition(env, -1);
@@ -525,7 +572,7 @@ void c_step(CTripleTriad* env) {
             
         }
     }
-    if (env->terminals[0] == 1) {
+    if (env->agents[0].terminals[0] == 1) {
         env->game_over=1;
     }
     compute_observations(env);
@@ -548,15 +595,27 @@ Client* make_client(int width, int height) {
     return client;
 }
 
-void c_render(CTripleTriad* env) {
+void puf_render(CTripleTriad* env) {
     if (IsKeyDown(KEY_ESCAPE)) {
         exit(0);
     }
+
+    tripletriad_human_controls(env);
 
     if (env->client == NULL) {
         env->client = make_client(env->width, env->height);
     }
 
+    int frames = env->show_anim ? HOLD_FRAMES : 0;
+    int slot = env->last_opp_slot;
+    int cell = env->last_opp_cell;
+    env->show_anim = 0;
+    if (frames && slot >= 0) {
+        env->card_locations[1][slot] = 0;
+        env->board_states[(cell - 1) / 3][(cell - 1) % 3] = 0;
+    }
+    int f = 0;
+redraw:
     BeginDrawing();
     ClearBackground(PUFF_BACKGROUND);
 
@@ -645,11 +704,41 @@ void c_render(CTripleTriad* env) {
         }
     }
     EndDrawing();
-
-    //PlaySound(client->sound);
+    puf_web_vsync();
+    if (f++ < frames) {
+        goto redraw;
+    }
+    if (frames && slot >= 0) {
+        env->card_locations[1][slot] = cell;
+        env->board_states[(cell - 1) / 3][(cell - 1) % 3] = -1;
+    }
+    if (env->pending_reset) {
+        puf_reset(env);
+    }
 }
 
 void close_client(Client* client) {
     CloseWindow();
     free(client);
 }
+
+// --- Native trainer (pufferl) API ---
+void puf_log(Log* log, Dict* out) {
+    dict_set(out, "perf", log->perf);
+    dict_set(out, "score", log->score);
+    dict_set(out, "episode_return", log->episode_return);
+    dict_set(out, "episode_length", log->episode_length);
+    dict_set(out, "n", log->n);
+}
+
+void puf_init(Env* env, Dict* kwargs) {
+    env->num_agents = 1;
+    env->width = dict_get(kwargs, "width");
+    env->height = dict_get(kwargs, "height");
+    env->card_width = dict_get(kwargs, "card_width");
+    env->card_height = dict_get(kwargs, "card_height");
+    env->agents[0].action_mask = NULL;
+    env->agents[0].policy = 0;
+    init_ctripletriad(env);
+}
+

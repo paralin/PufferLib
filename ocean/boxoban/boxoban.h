@@ -3,7 +3,16 @@
 #include <stdint.h>
 #include <string.h>
 #include "raylib.h"
+typedef unsigned char obs_t;
+#include "pufferenv.h"
+
+#define BOXOBAN_MAPS_IMPLEMENTATION
 #include "boxoban_maps.h"
+
+#define ACT_SIZES {5}
+#define OBS_SIZE 400
+#define NUM_ATNS 1
+#define PUF_STEPS_PER_SEC 6
 
 const unsigned char NOOP = 0;
 const unsigned char DOWN = 1;
@@ -17,7 +26,7 @@ const unsigned char BOXES = 2;
 const unsigned char TARGET = 3;
 
 // Required struct. Only use floats!
-typedef struct {
+struct Log {
     float perf; // Recommended 0-1 normalized single real number perf metric
     float score; // Recommended unnormalized single real number perf metric
     float episode_return; // Recommended metric: sum of agent rewards over episode
@@ -25,7 +34,7 @@ typedef struct {
     // Any extra fields you add here may be exported to Python in binding.c
     float on_targets; // Number of targets currently boxed
     float n; // Required as the last field 
-} Log;
+};
 
 typedef struct {
     Texture2D wall;
@@ -38,12 +47,11 @@ typedef struct {
 
 // Required that you have some struct for your env
 // Recommended that you name it the same as the env file
-typedef struct {
+struct Env {
     Log log; // Required field. Env binding code uses this to aggregate logs
-    unsigned char* observations; // Required. You can use any obs type, but make sure it matches in Python!
-    float* actions; // Required. int* for discrete/multidiscrete, float* for box
-    float* rewards; // Required
-    float* terminals; // Required. We don't yet have truncations as standard yet
+    Agent agents[1];
+    int tag;
+    int boundary_reached;
     unsigned int rng;
     int size;
     int num_agents;
@@ -62,11 +70,15 @@ typedef struct {
     Client* client;
     int win;
     float episode_return;
-} Boxoban;
+};
+typedef Env Boxoban;
 
 void ensure_map_loaded(void);
 
 static int boxoban_configure_maps_from_env(Boxoban* env) {
+    if (BOXOBAN_MAP_PATH != NULL) {
+        return 0;
+    }
     if (env->difficulty_id == -1) {
         return 0;
     }
@@ -92,11 +104,13 @@ static int boxoban_configure_maps_from_env(Boxoban* env) {
 //Entity,x,y  convention y moves top to bottom
 
 static inline void set_entity(Boxoban *env, int entity, int x, int y, unsigned char value) {
-    env->observations[(entity)*env->size*env->size + (y)*env->size + (x)] = value;
+    unsigned char* obs = env->agents[0].observations;
+    obs[(entity)*env->size*env->size + (y)*env->size + (x)] = value;
 }
 
 static inline unsigned char get_entity(Boxoban *env, int entity, int x, int y) {
-    return env->observations[(entity)*env->size*env->size + (y)*env->size + (x)];
+    unsigned char* obs = env->agents[0].observations;
+    return obs[(entity)*env->size*env->size + (y)*env->size + (x)];
 }
 
 static inline void set_intermediate_reward(Boxoban *env, int x, int y, unsigned char value) {
@@ -107,11 +121,10 @@ static inline unsigned char get_intermediate_reward_status(Boxoban *env, int x, 
     return env->intermediate_rewards[(y)*env->size + (x)];
 }
 
-static inline const uint32_t get_random_puzzle_idx(const Boxoban *env) {
+static inline uint32_t get_random_puzzle_idx(Boxoban *env) {
     int idx = rand_r(&env->rng) % PUZZLE_COUNT;
     return idx;
 }
-
 
 void init (Boxoban* env) {
     static int boxoban_maps_ready = 0;
@@ -123,11 +136,10 @@ void init (Boxoban* env) {
         ensure_map_loaded();
         boxoban_maps_ready = 1;
     }
-    env->intermediate_rewards = calloc(env->size*env->size, sizeof(unsigned char));
+    env->intermediate_rewards = (unsigned char*)calloc(env->size*env->size, sizeof(unsigned char));
     env->win = 0;
     env->initialized = false;
   }
-
 
 void add_log(Boxoban* env) {
     float denom = (float)env->n_boxes;
@@ -141,7 +153,6 @@ void add_log(Boxoban* env) {
     env->log.n++;
 }
 
-
 bool clear(Boxoban* env, int x, int y) {
     if (x < 0 || y < 0 || x >= env->size || y >= env->size) {
         return false;
@@ -150,10 +161,11 @@ bool clear(Boxoban* env, int x, int y) {
 }
 
 // Required function
-void c_reset(Boxoban* env) {
+void puf_reset(Boxoban* env) {
+    unsigned char* obs = env->agents[0].observations;
     const uint32_t i = get_random_puzzle_idx(env);
     const uint8_t* puzzle = MAP_BASE + (size_t)i * PUZZLE_SIZE;
-    memcpy(env->observations, puzzle, PUZZLE_OBS_BYTES);
+    memcpy(obs, puzzle, PUZZLE_OBS_BYTES);
 
     const uint8_t* meta = puzzle + PUZZLE_OBS_BYTES;
     env->agent_x = (int)meta[0];
@@ -163,7 +175,7 @@ void c_reset(Boxoban* env) {
     env->on_target = (int)meta[4];
 
     memcpy(env->intermediate_rewards,
-            env->observations + TARGET * env->size * env->size,env->size * env->size);
+            obs + TARGET * env->size * env->size,env->size * env->size);
 
     env->tick = 0;
     env->win = 0;
@@ -181,12 +193,12 @@ void move_entity(Boxoban* env,unsigned char entity,int x, int y, int dx, int dy)
     set_entity(env, entity, x + dx, y + dy, 1);
 }
 
-//Updates state and intermediate reward array in place
+// Returns target_delta for the pushed box: +1 onto a target, -1 off a target.
 int take_action(Boxoban* env, int action) {
 
     int dx = 0;
     int dy = 0;
-    int int_r = 0;
+    int target_delta = 0;
 
     if (action == NOOP) {
         return 0;
@@ -212,77 +224,99 @@ int take_action(Boxoban* env, int action) {
         env->agent_x += dx;
         return 0;
     }
+
+    int box_x = env->agent_x + dx;
+    int box_y = env->agent_y + dy;
+    int box_dest_x = box_x + dx;
+    int box_dest_y = box_y + dy;
+
     //if its not clear, but its a box and box is clear to move, move both
-    else if (clear(env, env->agent_x+ 2*dx, env->agent_y + 2*dy)
-            && get_entity(env, BOXES, env->agent_x + dx, env->agent_y + dy) == 1) {
+    if (clear(env, box_dest_x, box_dest_y)
+            && get_entity(env, BOXES, box_x, box_y) == 1) {
 
-            //if box is on target currently, remove from on_target count
-            if (get_entity(env, TARGET, env->agent_x + dx, env->agent_y + dy) == 1) {
-
+            if (get_entity(env, TARGET, box_x, box_y) == 1) {
                 env->on_target -= 1;
+                target_delta -= 1;
             }
-            //move both entities
-            move_entity(env, BOXES, env->agent_x + dx, env->agent_y + dy, dx, dy);
+            move_entity(env, BOXES, box_x, box_y, dx, dy);
             move_entity(env, AGENT, env->agent_x, env->agent_y, dx, dy);
             env->agent_y += dy;
             env->agent_x += dx;
-        
-            //if box is now on target, add to on_target count
-            //if its a new target recieve intermediate reward and zero out intermediate reward
-            if (get_entity(env, TARGET, env->agent_x + dx, env->agent_y + dy) == 1) {
-                
+
+            if (get_entity(env, TARGET, box_dest_x, box_dest_y) == 1) {
                 env->on_target += 1;
-                int_r = get_intermediate_reward_status(env, env->agent_x + dx, env->agent_y + dy);
-                set_intermediate_reward(env, env->agent_x + dx, env->agent_y + dy, 0);
+                target_delta += 1;
             }
-            return int_r;
+            return target_delta;
     }
     return 0;
 }
 
-// Required function
-void c_step(Boxoban* env) {
-    env->tick += 1;
-    env->terminals[0] = 0;
-    env->rewards[0] = 0.0;
-       
-    int action = (int)env->actions[0];
-
-    float on_target = env->on_target;
-    int int_r = take_action(env, action); //int_r _new_ tgts covered, modifies observations in place
-    float on_target_after = env->on_target;
-                                          
-    env->rewards[0] += (float)int_r * env->int_r_coeff; //coeff in .ini
- 
-    if (on_target_after < on_target) { //target loss penalty
-        env->rewards[0] -= env->target_loss_pen_coeff; //coeff in .ini
+// Hold Shift + WASD/arrows. Skip the step when no direction this frame.
+static int boxoban_human_controls(Boxoban *env) {
+    if (!IsWindowReady()
+            || (!IsKeyDown(KEY_LEFT_SHIFT) && !IsKeyDown(KEY_RIGHT_SHIFT))) {
+        return 0;
     }
+    int new_action = -1;
+    if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W)) {
+        new_action = UP;
+    }
+    if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S)) {
+        new_action = DOWN;
+    }
+    if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A)) {
+        new_action = LEFT;
+    }
+    if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D)) {
+        new_action = RIGHT;
+    }
+    if (new_action < 0) {
+        return -1;
+    }
+    env->agents[0].actions[0] = new_action;
+    return 1;
+}
+
+// Required function
+void puf_step(Boxoban* env) {
+    if (boxoban_human_controls(env) < 0) {
+        return;
+    }
+    env->tick += 1;
+    env->agents[0].terminals[0] = 0;
+    env->agents[0].rewards[0] = 0.0;
+       
+    int action = (int)env->agents[0].actions[0];
+
+    int target_delta = take_action(env, action);
+    env->agents[0].rewards[0] += (float)target_delta * env->int_r_coeff;
 
     //Terminals
     if (env->on_target == env->n_targets) {
-        env->terminals[0] = 1;
-        env->rewards[0] += 1.0;
+        env->agents[0].terminals[0] = 1;
+        env->agents[0].rewards[0] += 1.0;
         env->win = 1;
-        env->episode_return += env->rewards[0];
+        env->episode_return += env->agents[0].rewards[0];
         add_log(env);
-        c_reset(env);
+        puf_reset(env);
         return;
     }
 
     if (env->tick >= env->max_steps) {
-        env->terminals[0] = 1;
-        env->rewards[0] -= 1.0; 
-        env->episode_return += env->rewards[0];
+        env->agents[0].terminals[0] = 1;
+        env->agents[0].rewards[0] -= 1.0; 
+        env->episode_return += env->agents[0].rewards[0];
         add_log(env);
-        c_reset(env);
+        puf_reset(env);
         return;
     }
-    env->episode_return += env->rewards[0];
+    env->episode_return += env->agents[0].rewards[0];
 
 }
 
-Client* c_create(Boxoban* env) {
-    Client* client = calloc(1,sizeof(Client));
+Client* make_client(Boxoban* env) {
+    Client* client = (Client*)calloc(1,sizeof(Client));
     client->wall = LoadTexture("resources/boxoban/Wall_Black.jpg");
     client->box = LoadTexture("resources/boxoban/Crate_Black.jpg");
     client->target = LoadTexture("resources/boxoban/EndPoint_Black.jpg");
@@ -357,12 +391,11 @@ void draw_tile(Boxoban *env, int x, int y) {
       }
   }
 
-
 // Required function. Should handle creating the client on first call
-void c_render(Boxoban* env) {
+void puf_render(Boxoban* env) {
     if (!IsWindowReady()) {
         InitWindow(TILE*env->size, TILE*env->size, "PufferLib Boxoban");
-        SetTargetFPS(10);
+        SetTargetFPS(60);
     }
 
     // Standard across our envs so exiting is always the same
@@ -370,8 +403,10 @@ void c_render(Boxoban* env) {
         exit(0);
     }
 
+    boxoban_human_controls(env);
+
     if (env->client == NULL) {
-        env->client = c_create(env);
+        env->client = make_client(env);
     }
 
     BeginDrawing();
@@ -383,13 +418,13 @@ void c_render(Boxoban* env) {
         }
     }
 
-
     EndDrawing();
+    puf_web_vsync();
 }
 
 // Required function. Should clean up anything you allocated
-// Do not free env->observations, actions, rewards, terminals
-void c_close(Boxoban* env) {
+// Do not free observations, actions, rewards, terminals
+void puf_close(Boxoban* env) {
     if (env->intermediate_rewards) {
           free(env->intermediate_rewards);
           env->intermediate_rewards = NULL;
@@ -407,3 +442,33 @@ void c_close(Boxoban* env) {
         CloseWindow();
     }
 }
+
+// --- Native trainer (pufferl) API ---
+void puf_log(Log* log, Dict* out) {
+    dict_set(out, "perf", log->perf);
+    dict_set(out, "score", log->score);
+    dict_set(out, "episode_return", log->episode_return);
+    dict_set(out, "episode_length", log->episode_length);
+    dict_set(out, "targets_hit", log->on_targets);
+    dict_set(out, "n", log->n);
+}
+
+void puf_init(Env* env, Dict* kwargs) {
+    env->difficulty_id = dict_get(kwargs, "difficulty");
+    env->size = 10;
+    env->num_agents = 1;
+    env->max_steps = dict_get(kwargs, "max_steps");
+    env->int_r_coeff = dict_get(kwargs, "int_r_coeff");
+    env->target_loss_pen_coeff = dict_get(kwargs, "target_loss_pen_coeff");
+    env->agents[0].action_mask = NULL;
+    env->agents[0].policy = 0;
+    DictItem* map_item = dict_find(kwargs, "map_bin");
+    if (map_item && map_item->str && map_item->str[0]) {
+        if (boxoban_set_map_path(map_item->str) != 0) {
+            fprintf(stderr, "Failed to set Boxoban map_bin %s\n", map_item->str);
+            abort();
+        }
+    }
+    init(env);
+}
+

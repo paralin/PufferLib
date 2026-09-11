@@ -65,6 +65,23 @@ typedef struct {
 
 // math
 
+// Portable elementwise ops — clang has __builtin_elementwise_*, nvcc/gcc as host do not.
+static inline vf v_max(vf a, vf b) {
+    vf out;
+    for (int i = 0; i < DRONE_LANES; i++) out[i] = a[i] > b[i] ? a[i] : b[i];
+    return out;
+}
+static inline vf v_min(vf a, vf b) {
+    vf out;
+    for (int i = 0; i < DRONE_LANES; i++) out[i] = a[i] < b[i] ? a[i] : b[i];
+    return out;
+}
+static inline vf v_sqrt(vf a) {
+    vf out;
+    for (int i = 0; i < DRONE_LANES; i++) out[i] = sqrtf(a[i]);
+    return out;
+}
+
 static inline Vec3v vadd3(Vec3v a, Vec3v b) { return (Vec3v){a.x + b.x, a.y + b.y, a.z + b.z}; }
 static inline Vec3v vscalmul3(Vec3v a, float b) { return (Vec3v){a.x * b, a.y * b, a.z * b}; }
 
@@ -86,15 +103,25 @@ static inline Quatv vquat_mul(Quatv q1, Quatv q2) {
 }
 
 static inline void vquat_normalize(Quatv* q) {
-    vf n = __builtin_elementwise_sqrt(q->w * q->w + q->x * q->x + q->y * q->y + q->z * q->z);
-    q->w /= n;
-    q->x /= n;
-    q->y /= n;
-    q->z /= n;
+    vf n2 = q->w * q->w + q->x * q->x + q->y * q->y + q->z * q->z;
+    vf n = v_sqrt(n2);
+    for (int i = 0; i < DRONE_LANES; i++) {
+        if (!(n[i] > 1e-8f)) {
+            q->w[i] = 1.0f;
+            q->x[i] = 0.0f;
+            q->y[i] = 0.0f;
+            q->z[i] = 0.0f;
+        } else {
+            q->w[i] /= n[i];
+            q->x[i] /= n[i];
+            q->y[i] /= n[i];
+            q->z[i] /= n[i];
+        }
+    }
 }
 
 static inline vf vclampf(vf v, vf lo, vf hi) {
-    return __builtin_elementwise_min(__builtin_elementwise_max(v, lo), hi);
+    return v_min(v_max(v, lo), hi);
 }
 
 static inline void vclamp3(Vec3v* v, vf lo, vf hi) {
@@ -104,12 +131,12 @@ static inline void vclamp3(Vec3v* v, vf lo, vf hi) {
 }
 
 static inline vf vrpm_hover(const Paramsv* p) {
-    return __builtin_elementwise_sqrt((p->mass * p->gravity) / (4.0f * p->k_thrust));
+    return v_sqrt((p->mass * p->gravity) / (4.0f * p->k_thrust));
 }
 
 static inline vf vrpm_min_for_centered_hover(const Paramsv* p) {
     vf min_rpm = 2.0f * vrpm_hover(p) - p->max_rpm;
-    return __builtin_elementwise_min(__builtin_elementwise_max(min_rpm, (vf){0}), p->max_rpm);
+    return v_min(v_max(min_rpm, (vf){0}), p->max_rpm);
 }
 
 // dynamics
@@ -121,7 +148,7 @@ static inline void compute_derivatives(Statev* state, const Paramsv* params, con
 
     vf T[4];
     for (int i = 0; i < 4; i++) {
-        vf rpm = __builtin_elementwise_max(state->rpms[i], (vf){0});
+        vf rpm = v_max(state->rpms[i], (vf){0});
         T[i] = params->k_thrust * rpm * rpm;
     }
 

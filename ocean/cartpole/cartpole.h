@@ -5,6 +5,12 @@
 #include <math.h>
 #include <time.h>
 #include "raylib.h"
+typedef float obs_t;
+#include "pufferenv.h"
+
+#define ACT_SIZES {2}
+#define OBS_SIZE 4
+#define NUM_ATNS 1
 
 #define X_THRESHOLD 2.4f
 #define THETA_THRESHOLD_RADIANS (12 * 2 * M_PI / 360)
@@ -28,14 +34,11 @@ typedef struct Client Client;
 struct Client {
 };
 
-typedef struct Cartpole Cartpole;
-struct Cartpole {
-    float* observations;
-    float* actions;
-    float* rewards;
-    float* terminals;
-    unsigned char* truncations;
+struct Env {
     Log log;
+    Agent agents[1];
+    int tag;
+    int boundary_reached;
     int num_agents;
     Client* client;
     float x;
@@ -53,13 +56,10 @@ struct Cartpole {
     float episode_return;
     unsigned int rng;
 };
+typedef Env Cartpole;
 
 void add_log(Cartpole* env) {
-    if (env->episode_return > 0) {
-        env->log.perf = env->episode_return / MAX_STEPS;
-    } else {
-        env->log.perf = 0.0f;
-    }
+    env->log.perf += env->episode_return / MAX_STEPS;
     env->log.episode_length += env->tick;
     env->log.score += env->tick;
     env->log.x_threshold_termination += (env->x < -X_THRESHOLD || env->x > X_THRESHOLD);
@@ -73,22 +73,7 @@ void init(Cartpole* env) {
     memset(&env->log, 0, sizeof(Log));
 }
 
-void allocate(Cartpole* env) {
-    init(env);
-    env->observations = (float*)calloc(4, sizeof(float));
-    env->actions = (float*)calloc(1, sizeof(float));
-    env->rewards = (float*)calloc(1, sizeof(float));
-    env->terminals = (float*)calloc(1, sizeof(float));
-}
-
-void free_allocated(Cartpole* env) {
-    free(env->observations);
-    free(env->actions);
-    free(env->rewards);
-    free(env->terminals);
-}
-
-void c_close(Cartpole* env) {
+void puf_close(Cartpole* env) {
 }
 
 const Color PUFF_RED = (Color){187, 0, 0, 255};
@@ -108,15 +93,31 @@ void close_client(Client* client) {
     free(client);
 }
 
-void c_render(Cartpole* env) {
-    if (IsKeyDown(KEY_ESCAPE))
+// Hold Left Shift + A/D or arrows. CPU eval is forward→step→render.
+static void cartpole_human_controls(Cartpole *env) {
+    if (!IsWindowReady() || !IsKeyDown(KEY_LEFT_SHIFT)) {
+        return;
+    }
+    if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D)) {
+        env->agents[0].actions[0] = 1.0f;
+    } else {
+        env->agents[0].actions[0] = -1.0f;
+    }
+}
+
+void puf_render(Cartpole* env) {
+    if (IsKeyDown(KEY_ESCAPE)) {
         exit(0);
-    if (IsKeyPressed(KEY_TAB))
+    }
+    if (IsKeyPressed(KEY_TAB)) {
         ToggleFullscreen();
+    }
 
     if (env->client == NULL) {
         env->client = make_client(env);
     }
+
+    cartpole_human_controls(env);
 
     BeginDrawing();
     ClearBackground(PUFF_BACKGROUND);
@@ -131,17 +132,20 @@ void c_render(Cartpole* env) {
     DrawText(TextFormat("Steps: %i", env->tick), 10, 10, 20, PUFF_WHITE);
     DrawText(TextFormat("Cart Position: %.2f", env->x), 10, 40, 20, PUFF_WHITE);
     DrawText(TextFormat("Pole Angle: %.2f", env->theta * 180.0f / M_PI), 10, 70, 20, PUFF_WHITE);
+    DrawText("[Shift] A/D or arrows", 10, 100, 16, PUFF_WHITE);
     EndDrawing();
+    puf_web_vsync();
 }
 
 void compute_observations(Cartpole* env) {
-    env->observations[0] = env->x;
-    env->observations[1] = env->x_dot;
-    env->observations[2] = env->theta;
-    env->observations[3] = env->theta_dot;
+    float* obs = env->agents[0].observations;
+    obs[0] = env->x;
+    obs[1] = env->x_dot;
+    obs[2] = env->theta;
+    obs[3] = env->theta_dot;
 }
 
-void c_reset(Cartpole* env) {
+void puf_reset(Cartpole* env) {
     env->episode_return = 0.0f;
     env->x = ((float)rand_r(&env->rng) / (float)RAND_MAX) * 0.08f - 0.04f;
     env->x_dot = ((float)rand_r(&env->rng) / (float)RAND_MAX) * 0.08f - 0.04f;
@@ -152,13 +156,11 @@ void c_reset(Cartpole* env) {
     compute_observations(env);
 }
 
-void c_step(Cartpole* env) {  
-    float a = env->actions[0];
-    if (!isfinite(a)) {
-        a = 0.0f;
-    }
+void puf_step(Cartpole* env) {
+    cartpole_human_controls(env);
+    float a = env->agents[0].actions[0];
     a = fminf(fmaxf(a, -1.0f), 1.0f);
-    env->actions[0] = a;
+    env->agents[0].actions[0] = a;
 
     float force = env->continuous ? a * env->force_mag
         : (a > 0.5f ? env->force_mag: -env->force_mag);
@@ -185,14 +187,40 @@ void c_step(Cartpole* env) {
     bool truncated = env->tick >= MAX_STEPS;
     bool done = terminated || truncated;
 
-    env->rewards[0] = done ? 0.0f : 1.0f;
-    env->episode_return += env->rewards[0];
-    env->terminals[0] = terminated ? 1 : 0;
+    env->agents[0].rewards[0] = done ? 0.0f : 1.0f;
+    env->episode_return += env->agents[0].rewards[0];
+    env->agents[0].terminals[0] = terminated ? 1 : 0;
 
     if (done) {
         add_log(env);
-        c_reset(env);
+        puf_reset(env);
     }
 
     compute_observations(env);
 }
+
+// --- Native trainer (pufferl) API ---
+void puf_log(Log* log, Dict* out) {
+    dict_set(out, "score", log->score);
+    dict_set(out, "perf", log->perf);
+    dict_set(out, "episode_length", log->episode_length);
+    dict_set(out, "x_threshold_termination", log->x_threshold_termination);
+    dict_set(out, "pole_angle_termination", log->pole_angle_termination);
+    dict_set(out, "max_steps_termination", log->max_steps_termination);
+    dict_set(out, "n", log->n);
+}
+
+void puf_init(Env* env, Dict* kwargs) {
+    env->num_agents = 1;
+    env->cart_mass = dict_get(kwargs, "cart_mass");
+    env->pole_mass = dict_get(kwargs, "pole_mass");
+    env->pole_length = dict_get(kwargs, "pole_length");
+    env->gravity = dict_get(kwargs, "gravity");
+    env->force_mag = dict_get(kwargs, "force_mag");
+    env->tau = dict_get(kwargs, "dt");
+    env->continuous = dict_get(kwargs, "continuous");
+    env->agents[0].action_mask = NULL;
+    env->agents[0].policy = 0;
+    init(env);
+}
+

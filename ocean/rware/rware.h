@@ -1,6 +1,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
+typedef float obs_t;
+#include "pufferenv.h"
 #include <assert.h>
 #include <string.h>
 #include <time.h>
@@ -28,6 +30,13 @@
 // observation types
 #define SELF_OBS 3
 #define VISION_OBS 24
+#define ACT_SIZES {5}
+#define OBS_SIZE (SELF_OBS+VISION_OBS)
+#define NUM_ATNS 1
+#define MAX_AGENTS 32
+#define RWARE_FRAMES 12
+
+typedef Env CRware;
 
 // Facing directions
 #define FACING_RIGHT 0
@@ -124,12 +133,11 @@ static const int map_rows[3] = {11, 10, 16};
 static const int map_cols[3] = {10, 20, 20};
 static const int* maps[3] = {tiny_map, small_map, medium_map};
 
-static inline int max(int a, int b) {
+static inline int rware_max(int a, int b) {
     return (a > b) ? a : b;
 }
 	
 typedef struct Client Client;
-typedef struct CRware CRware;
 typedef struct Log Log;
 
 struct Log {
@@ -148,12 +156,9 @@ struct MovementGraph {
     int num_cycles;
 };
 
-struct CRware {
+struct Env {
     Client* client;
-    float* observations;
-    float* actions;
-    float* rewards;
-    float* terminals;
+    Agent agents[MAX_AGENTS];
     Log* agent_logs;
     Log log;
     float* scores;
@@ -163,6 +168,8 @@ struct CRware {
     int map_choice;
     int* warehouse_states;
     int num_agents;
+    int tag;
+    int boundary_reached;
     int num_requested_shelves;
     int* agent_locations;
     int* old_agent_locations;
@@ -178,8 +185,8 @@ struct CRware {
 void add_log(CRware* env, Log* agent_log) {
     env->log.episode_return += agent_log->episode_return;
     env->log.episode_length += agent_log->episode_length;
-    env->log.score += agent_log->score;   
-    env->log.perf += fmaxf(0.0, agent_log->score - 0.01*agent_log->episode_length);
+    env->log.score += agent_log->score;
+    env->log.perf += fmaxf(0.0f, agent_log->score - 0.01f * agent_log->episode_length);
     env->log.n += 1;
 }
 
@@ -243,8 +250,6 @@ int request_new_shelf(CRware* env) {
 }
 
 void generate_map(CRware* env,const int* map) {
-    // seed new random
-    srand(time(NULL));
     int map_size = map_sizes[env->map_choice - 1];
     memcpy(env->warehouse_states, map, map_size * sizeof(int));
 
@@ -294,17 +299,10 @@ void init(CRware* env) {
     }
 }
 
-void allocate(CRware* env) {
-    init(env);
-    env->observations = (float*)calloc(env->num_agents*(SELF_OBS+VISION_OBS), sizeof(float));
-    env->actions = (float*)calloc(env->num_agents, sizeof(float));
-    env->rewards = (float*)calloc(env->num_agents, sizeof(float));
-    env->terminals = (float*)calloc(env->num_agents, sizeof(float));
-}
-
-void c_close(CRware* env) {
+void puf_close(CRware* env) {
     free(env->warehouse_states);
     free(env->agent_locations);
+    free(env->old_agent_locations);
     free(env->agent_directions);
     free(env->agent_states);
     free(env->movement_graph->target_positions);
@@ -315,22 +313,13 @@ void c_close(CRware* env) {
     free(env->scores);
 }
 
-void free_allocated(CRware* env) {
-    free(env->actions);
-    free(env->observations);
-    free(env->terminals);
-    free(env->rewards);
-    c_close(env);
-}
-
 void compute_observations(CRware* env) {
     int surround_indices[8];
     int cols = map_cols[env->map_choice - 1];
     int rows = map_rows[env->map_choice - 1];
-    float (*observations)[SELF_OBS+VISION_OBS] = (float(*)[SELF_OBS+VISION_OBS])env->observations;
     for (int i = 0; i < env->num_agents; i++) {
         // Agent location, direction, state
-        float* obs = &observations[i][0];
+        obs_t* obs = env->agents[i].observations;
         int agent_location = env->agent_locations[i];
         int current_x = agent_location % cols;
         int current_y = agent_location / cols;
@@ -344,19 +333,21 @@ void compute_observations(CRware* env) {
             int new_y = current_y + SURROUNDING_VECTORS[j][1];
             surround_indices[j] = new_x + new_y * cols;
             // other robots location and rotation if on that spot
+            int found_agent = 0;
             for (int k = 0; k < env->num_agents; k++) {
-                if(i==k){
+                if (i == k) {
                     continue;
                 }
-                if(env->agent_locations[k] == surround_indices[j]){
+                if (env->agent_locations[k] == surround_indices[j]) {
                     obs[3 + j*3] = 1;
-                    obs[4 + j*3] = (env->agent_directions[k] + 1) / 4.0;
-                    break;
-                } else {
-                    obs[3 + j*3] = 0;
-                    obs[4 + j*3] = 0;
+                    obs[4 + j*3] = (env->agent_directions[k] + 1) / 4.0f;
+                    found_agent = 1;
                     break;
                 }
+            }
+            if (!found_agent) {
+                obs[3 + j*3] = 0;
+                obs[4 + j*3] = 0;
             }
             // boundary check
             if (new_x < 0 || new_x >= cols || new_y < 0 || new_y >= rows) {
@@ -368,10 +359,7 @@ void compute_observations(CRware* env) {
     }
 }
 
-void c_reset(CRware* env) {
-     
-	env->terminals[0] = 0;
-    // set agents in center
+static void reset_world(CRware* env) {
     env->human_agent_idx = 0;
     if (env->map_choice == 1) {
         generate_map(env, tiny_map);
@@ -380,11 +368,17 @@ void c_reset(CRware* env) {
     } else {
         generate_map(env, medium_map);
     }
-    for(int x = 0;x<env->num_agents; x++){
-	    env->scores[x] = 0.0;
+    for (int x = 0; x < env->num_agents; x++) {
+        env->scores[x] = 0.0f;
+        env->agent_logs[x] = (Log){0};
     }
     compute_observations(env);
-    
+}
+
+void puf_reset(CRware* env) {
+    reset_world(env);
+    memset(env->agents[0].rewards, 0, env->num_agents * sizeof(float));
+    memset(env->agents[0].terminals, 0, env->num_agents * sizeof(float));
 }
 
 int get_direction(CRware* env, int action, int agent_idx) {
@@ -518,7 +512,7 @@ void calculate_weights(CRware* env) {
             int max_child_weight = 0;
             for (int j = 0; j < env->num_agents; j++) {
                 if (graph->target_positions[j] != env->agent_locations[i]) continue;
-                max_child_weight = max(max_child_weight, graph->weights[j]);
+                max_child_weight = rware_max(max_child_weight, graph->weights[j]);
             }
             
             if (max_child_weight == 0 || graph->weights[i] == max_child_weight + 1) {
@@ -584,7 +578,7 @@ void pickup_shelf(CRware* env, int agent_idx) {
     int current_position_state = env->warehouse_states[agent_location];
     int original_map_state = map[agent_location];
     if ((current_position_state == REQUESTED_SHELF) && (agent_state==UNLOADED)) {
-        env->rewards[agent_idx] = 0.5;
+        env->agents[agent_idx].rewards[0] = 0.5;
 	env->agent_logs[agent_idx].episode_return += 0.5;
 	env->agent_states[agent_idx]=HOLDING_REQUESTED_SHELF;
     }
@@ -593,21 +587,19 @@ void pickup_shelf(CRware* env, int agent_idx) {
     && original_map_state != GOAL) {
         env->agent_states[agent_idx]=UNLOADED;
         env->warehouse_states[agent_location] = original_map_state;
-        env->rewards[agent_idx] = 1.0;
+        env->agents[agent_idx].rewards[0] = 1.0;
 
-        env->agent_logs[agent_idx].score = 1.0;
-        env->agent_logs[agent_idx].episode_return += 1.0;
-
-	    env->scores[agent_idx] = 0;
+        env->agent_logs[agent_idx].score = 1.0f;
+        env->agent_logs[agent_idx].episode_return += 1.0f;
+        env->scores[agent_idx] = 0;
         add_log(env, &env->agent_logs[agent_idx]);
         env->agent_logs[agent_idx] = (Log){0};
     }
     // drop shelf at goal
     else if (agent_state == HOLDING_REQUESTED_SHELF && current_position_state == GOAL) {
         env->agent_states[agent_idx]=HOLDING_EMPTY_SHELF;
-        env->rewards[agent_idx] = 0.5;
+        env->agents[agent_idx].rewards[0] = 0.5;
         env->agent_logs[agent_idx].episode_return += 0.5;
-        env->agent_logs[agent_idx].score = 1.0;
         // Try random selection first, then fall back to linear scan to avoid infinite loop
         // when all shelves are currently being carried (warehouse_states == EMPTY).
         int total_shelves;
@@ -654,7 +646,7 @@ void process_cycle_movements(CRware* env, MovementGraph* graph) {
         if (!can_move_cycle) continue;
         for (int i = 0; i < env->num_agents; i++) {
             if (graph->cycle_ids[i] != cycle) continue;
-            if ((int)env->actions[i] != FORWARD) continue;
+            if ((int)env->agents[i].actions[0] != FORWARD) continue;
             move_agent(env, i);
         }
     }
@@ -671,7 +663,7 @@ void process_tree_movements(CRware* env, MovementGraph* graph) {
     for (int weight = max_weight; weight > 0; weight--) {
         for (int i = 0; i < env->num_agents; i++) {
             if (graph->cycle_ids[i] != -1 || graph->weights[i] != weight) continue;
-            if ((int)env->actions[i] != FORWARD) continue;
+            if ((int)env->agents[i].actions[0] != FORWARD) continue;
 
             int new_pos = get_new_position(env, i);
             if (new_pos == -1) continue;
@@ -683,8 +675,9 @@ void process_tree_movements(CRware* env, MovementGraph* graph) {
     }
 }
 
-void c_step(CRware* env) {
-    memset(env->rewards, 0, env->num_agents * sizeof(float));
+void puf_step(CRware* env) {
+    memset(env->agents[0].rewards, 0, env->num_agents * sizeof(float));
+    memset(env->agents[0].terminals, 0, env->num_agents * sizeof(float));
     MovementGraph* graph = env->movement_graph;
 
     // Reset movement graph so stale targets from previous steps don't
@@ -695,7 +688,7 @@ void c_step(CRware* env) {
     for (int i = 0; i < env->num_agents; i++) {
         env->old_agent_locations[i] = env->agent_locations[i];
         env->agent_logs[i].episode_length += 1;
-        int action = (int)env->actions[i];
+        int action = (int)env->agents[i].actions[0];
 
         if (action != NOOP && action != TOGGLE_LOAD) {
             env->agent_directions[i] = get_direction(env, action, i);
@@ -750,15 +743,39 @@ Client* make_client(CRware* env) {
     return client;
 }
 
-void c_render(CRware* env) {
+void puf_render(CRware* env) {
     if (env->client == NULL) {
         env->client = make_client(env);
     }
     Client* client = env->client;
-
-    if (IsKeyDown(KEY_ESCAPE)) {
-        exit(0);
+    if (env->human_agent_idx < 0 || env->human_agent_idx >= env->num_agents) {
+        env->human_agent_idx = 0;
     }
+    for (int frame = 0; frame < RWARE_FRAMES; frame++) {
+        if (IsKeyDown(KEY_ESCAPE)) {
+            exit(0);
+        }
+        if (IsKeyDown(KEY_LEFT_SHIFT)) {
+            int idx = env->human_agent_idx;
+            env->agents[idx].actions[0] = NOOP;
+            if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W)) {
+                env->agents[idx].actions[0] = FORWARD;
+            }
+            if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A)) {
+                env->agents[idx].actions[0] = LEFT;
+            }
+            if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D)) {
+                env->agents[idx].actions[0] = RIGHT;
+            }
+            if (IsKeyDown(KEY_SPACE) || IsKeyDown(KEY_ENTER)) {
+                env->agents[idx].actions[0] = TOGGLE_LOAD;
+            }
+            if (IsKeyPressed(KEY_TAB)) {
+                env->human_agent_idx =
+                    (env->human_agent_idx + 1) % env->num_agents;
+            }
+        }
+        client->tick = frame;
     BeginDrawing();
     ClearBackground(PUFF_BACKGROUND);    
     
@@ -815,8 +832,8 @@ void c_render(CRware* env) {
         int new_x_pos = (new_agent_location % cols) * env->grid_square_size;
         int new_y_pos = (new_agent_location / cols) * env->grid_square_size;
 
-        float interp_old = (1.0f - 1.0f/12.0f*(float)client->tick);
-        float interp_new = 1.0f/12.0f*(float)client->tick;
+        float interp_old = (1.0f - 1.0f/(float)RWARE_FRAMES*(float)client->tick);
+        float interp_new = 1.0f/(float)RWARE_FRAMES*(float)client->tick;
 
         int x_pos = interp_old*(float)old_x_pos + interp_new*(float)new_x_pos;
         int y_pos = interp_old*(float)old_y_pos + interp_new*(float)new_y_pos;
@@ -851,11 +868,39 @@ void c_render(CRware* env) {
         );
     }
 
-    client->tick = (client->tick + 1) % 12;
-
     EndDrawing();
+    puf_web_vsync();
+    }
 }
 void close_client(Client* client) {
     CloseWindow();
     free(client);
 }
+
+void puf_init(Env* env, Dict* kwargs) {
+    env->width = dict_get(kwargs, "width");
+    env->height = dict_get(kwargs, "height");
+    env->map_choice = dict_get(kwargs, "map_choice");
+    env->num_agents = dict_get(kwargs, "num_agents");
+    env->num_requested_shelves = dict_get(kwargs, "num_requested_shelves");
+    env->grid_square_size = dict_get(kwargs, "grid_square_size");
+    env->human_agent_idx = dict_get(kwargs, "human_agent_idx");
+    if (env->num_agents > MAX_AGENTS) {
+        fprintf(stderr, "rware: num_agents too large\n");
+        exit(1);
+    }
+    for (int i = 0; i < env->num_agents; i++) {
+        env->agents[i].policy = 0;
+        env->agents[i].action_mask = NULL;
+    }
+    init(env);
+}
+
+void puf_log(Log* log, Dict* out) {
+    dict_set(out, "perf", log->perf);
+    dict_set(out, "score", log->score);
+    dict_set(out, "episode_return", log->episode_return);
+    dict_set(out, "episode_length", log->episode_length);
+    dict_set(out, "n", log->n);
+}
+

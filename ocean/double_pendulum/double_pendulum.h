@@ -1,49 +1,44 @@
 // Double pendulum swing-up and balance task with discrete cart forces.
 
-#pragma once
-
 #include <math.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include "raylib.h"
+typedef float obs_t;
+#include "pufferenv.h"
 
-#define DP_OBS_SIZE 8
+#define DP_OBS_SIZE 10
 #define DP_ACTIONS 3
-#define DP_MAX_STEPS 600
-#define DP_X_THRESHOLD 5.0f
 #define DP_WIDTH 800
 #define DP_HEIGHT 420
 #define DP_SCALE 65.0f
 
-// DeepMind Control Suite-style dense reward constants.
-#define DP_CENTER_MARGIN  2.0f
-#define DP_ANG_VEL_MARGIN 5.0f
-#define DP_VELOCITY_FLOOR 0.60f
-#define DP_LN_10          2.302585093f
-#define DP_BALANCE_ANGLE_SCALE   0.30f
-#define DP_BALANCE_ANG_VEL_SCALE 1.0f
-#define DP_BALANCE_CART_SCALE    2.0f
+#define ACT_SIZES {DP_ACTIONS}
+#define OBS_SIZE DP_OBS_SIZE
+#define NUM_ATNS 1
 
-typedef struct Log {
+struct Log {
     float perf;
     float score;
     float episode_return;
     float episode_length;
     float x_threshold_termination;
     float max_steps_termination;
+    float invalid_termination;
     float hold_time;
+    float best_height;
+    float upright_frac;
     float n;
-} Log;
+};
 
-typedef struct DoublePendulum {
-    float* observations;
-    float* actions;
-    float* rewards;
-    float* terminals;
+struct Env {
     int num_agents;
     unsigned int rng;
     Log log;
+    Agent agents[1];
+    int tag;
+    int boundary_reached;
 
     float x;
     float x_dot;
@@ -55,6 +50,9 @@ typedef struct DoublePendulum {
     float episode_return;
     int upright_steps;
     int max_upright_steps;
+    int upright_count;
+    float best_height;
+    int physics_failed;
 
     float cart_mass;
     float link1_mass;
@@ -64,9 +62,10 @@ typedef struct DoublePendulum {
     float gravity;
     float force_mag;
     float dt;
-    int substeps;         // physics substeps per control step (RK4)
-    float balance_bonus_weight;  // blend between deepmind term and balance_quality
-} DoublePendulum;
+    float x_threshold;
+    int max_steps;
+};
+typedef Env DoublePendulum;
 
 const Color PUFF_RED = (Color){187, 0, 0, 255};
 const Color PUFF_CYAN = (Color){0, 187, 187, 255};
@@ -85,26 +84,79 @@ static inline float wrap_pi(float x) {
     return x;
 }
 
-void compute_observations(DoublePendulum* env) {
-    env->observations[0] = env->x / DP_X_THRESHOLD;
-    env->observations[1] = env->x_dot / 5.0f;
-    env->observations[2] = sinf(env->theta1);
-    env->observations[3] = cosf(env->theta1);
-    env->observations[4] = env->theta1_dot / 8.0f;
-    env->observations[5] = sinf(env->theta2);
-    env->observations[6] = cosf(env->theta2);
-    env->observations[7] = env->theta2_dot / 8.0f;
+static inline float dp_tip_height(DoublePendulum* env) {
+    float tip_y = env->link1_length * cosf(env->theta1)
+        + env->link2_length * cosf(env->theta2);
+    float max_y = env->link1_length + env->link2_length;
+    if (max_y < 1e-6f) return 0.0f;
+    return 0.5f * (tip_y / max_y + 1.0f);
 }
 
-void add_log(DoublePendulum* env, bool x_done, bool timeout) {
-    float normalized = env->episode_return / (float)DP_MAX_STEPS;
-    env->log.perf += fminf(fmaxf(normalized, 0.0f), 1.0f);
+// Point-mass energy matching the EOM. 0 = hanging rest, 1 = upright rest.
+static inline float dp_energy_norm(DoublePendulum* env) {
+    float m0 = env->cart_mass;
+    float m1 = env->link1_mass;
+    float m2 = env->link2_mass;
+    float l1 = env->link1_length;
+    float l2 = env->link2_length;
+    float t1 = env->theta1;
+    float t2 = env->theta2;
+    float w1 = env->theta1_dot;
+    float w2 = env->theta2_dot;
+    float xd = env->x_dot;
+    float g = env->gravity;
+    float c1 = cosf(t1);
+    float s1 = sinf(t1);
+    float c2 = cosf(t2);
+    float s2 = sinf(t2);
+
+    float x1d = xd + l1 * c1 * w1;
+    float y1d = -l1 * s1 * w1;
+    float x2d = x1d + l2 * c2 * w2;
+    float y2d = y1d - l2 * s2 * w2;
+    float ke = 0.5f * m0 * xd * xd
+        + 0.5f * m1 * (x1d * x1d + y1d * y1d)
+        + 0.5f * m2 * (x2d * x2d + y2d * y2d);
+    float y1 = l1 * c1;
+    float y2 = y1 + l2 * c2;
+    float pe = m1 * g * y1 + m2 * g * y2;
+    float e_hang = -m1 * g * l1 - m2 * g * (l1 + l2);
+    float span = 2.0f * g * (m1 * l1 + m2 * (l1 + l2));
+    if (span < 1e-6f) return 0.0f;
+    return (ke + pe - e_hang) / span;
+}
+
+void compute_observations(DoublePendulum* env) {
+    float* obs = env->agents[0].observations;
+    float xt = env->x_threshold > 1e-6f ? env->x_threshold : 5.0f;
+    float height = dp_tip_height(env);
+    float energy = dp_energy_norm(env);
+    obs[0] = env->x / xt;
+    obs[1] = env->x_dot / 10.0f;
+    obs[2] = sinf(env->theta1);
+    obs[3] = cosf(env->theta1);
+    obs[4] = env->theta1_dot / 15.0f;
+    obs[5] = sinf(env->theta2);
+    obs[6] = cosf(env->theta2);
+    obs[7] = env->theta2_dot / 15.0f;
+    obs[8] = height;
+    obs[9] = energy * 0.5f;
+}
+
+void add_log(DoublePendulum* env, bool x_done, bool timeout, bool invalid) {
+    float best = fminf(fmaxf(env->best_height, 0.0f), 1.0f);
+    float frac = env->tick > 0 ? (float)env->upright_count / (float)env->tick : 0.0f;
+    // perf: peak tip height this episode (0 hanging, 1 fully upright).
+    env->log.perf += best;
     env->log.score += env->episode_return;
     env->log.episode_return += env->episode_return;
     env->log.episode_length += (float)env->tick;
     env->log.x_threshold_termination += x_done ? 1.0f : 0.0f;
     env->log.max_steps_termination += timeout ? 1.0f : 0.0f;
+    env->log.invalid_termination += invalid ? 1.0f : 0.0f;
     env->log.hold_time += (float)env->max_upright_steps;
+    env->log.best_height += best;
+    env->log.upright_frac += frac;
     env->log.n += 1.0f;
 }
 
@@ -112,7 +164,7 @@ void init(DoublePendulum* env) {
     env->num_agents = 1;
 }
 
-void c_reset(DoublePendulum* env) {
+void puf_reset(DoublePendulum* env) {
     env->x = dp_randf(env, -0.04f, 0.04f);
     env->x_dot = dp_randf(env, -0.04f, 0.04f);
     env->theta1 = M_PI + dp_randf(env, -0.08f, 0.08f);
@@ -123,10 +175,13 @@ void c_reset(DoublePendulum* env) {
     env->episode_return = 0.0f;
     env->upright_steps = 0;
     env->max_upright_steps = 0;
+    env->upright_count = 0;
+    env->best_height = 0.0f;
+    env->physics_failed = 0;
     compute_observations(env);
 }
 
-static void solve_3x3(float A[3][3], float b[3], float x[3]) {
+static int solve_3x3(float A[3][3], float b[3], float x[3]) {
     for (int i = 0; i < 3; i++) {
         int pivot = i;
         float best = fabsf(A[i][i]);
@@ -136,6 +191,10 @@ static void solve_3x3(float A[3][3], float b[3], float x[3]) {
                 best = v;
                 pivot = r;
             }
+        }
+        if (best < 1e-8f || !isfinite(best)) {
+            x[0] = x[1] = x[2] = 0.0f;
+            return 0;
         }
         if (pivot != i) {
             for (int c = i; c < 3; c++) {
@@ -149,6 +208,10 @@ static void solve_3x3(float A[3][3], float b[3], float x[3]) {
         }
 
         float inv = 1.0f / A[i][i];
+        if (!isfinite(inv)) {
+            x[0] = x[1] = x[2] = 0.0f;
+            return 0;
+        }
         for (int c = i; c < 3; c++) A[i][c] *= inv;
         b[i] *= inv;
         for (int r = 0; r < 3; r++) {
@@ -161,22 +224,23 @@ static void solve_3x3(float A[3][3], float b[3], float x[3]) {
     x[0] = b[0];
     x[1] = b[1];
     x[2] = b[2];
+    if (!isfinite(x[0]) || !isfinite(x[1]) || !isfinite(x[2])) {
+        x[0] = x[1] = x[2] = 0.0f;
+        return 0;
+    }
+    return 1;
 }
 
-// Acceleration is a pure function of the angles, angular velocities and force
-// (it does not depend on cart position/velocity), so RK4 can evaluate it at
-// trial states.  qdd = [xdd, th1dd, th2dd].
-static void dp_accel(DoublePendulum* env, const float th[2], const float w[2],
-                     float force, float qdd[3]) {
+void integrate_physics(DoublePendulum* env, float force) {
     float m0 = env->cart_mass;
     float m1 = env->link1_mass;
     float m2 = env->link2_mass;
     float l1 = env->link1_length;
     float l2 = env->link2_length;
-    float t1 = th[0];
-    float t2 = th[1];
-    float w1 = w[0];
-    float w2 = w[1];
+    float t1 = env->theta1;
+    float t2 = env->theta2;
+    float w1 = env->theta1_dot;
+    float w2 = env->theta2_dot;
     float c1 = cosf(t1);
     float c2 = cosf(t2);
     float s1 = sinf(t1);
@@ -189,138 +253,127 @@ static void dp_accel(DoublePendulum* env, const float th[2], const float w[2],
         {(m1 + m2) * l1 * c1, (m1 + m2) * l1 * l1, m2 * l1 * l2 * c12},
         {m2 * l2 * c2, m2 * l1 * l2 * c12, m2 * l2 * l2},
     };
+    A[0][0] += 1e-8f;
+    A[1][1] += 1e-8f;
+    A[2][2] += 1e-8f;
     float b[3] = {
         force + (m1 + m2) * l1 * s1 * w1 * w1 + m2 * l2 * s2 * w2 * w2,
         (m1 + m2) * env->gravity * l1 * s1 - m2 * l1 * l2 * s12 * w2 * w2,
         m2 * env->gravity * l2 * s2 + m2 * l1 * l2 * s12 * w1 * w1,
     };
-    solve_3x3(A, b, qdd);
-}
-
-// q = [x, theta1, theta2], v = [x_dot, theta1_dot, theta2_dot].
-static void dp_state_deriv(DoublePendulum* env, const float q[3], const float v[3],
-                           float force, float dq[3], float dv[3]) {
-    for (int i = 0; i < 3; i++) dq[i] = v[i];
-    float th[2] = {q[1], q[2]};
-    float w[2] = {v[1], v[2]};
-    dp_accel(env, th, w, force, dv);
-}
-
-static void dp_rk4_step(DoublePendulum* env, float force, float h,
-                        float q[3], float v[3]) {
-    float k1q[3], k1v[3], k2q[3], k2v[3], k3q[3], k3v[3], k4q[3], k4v[3];
-    float tq[3], tv[3];
-    dp_state_deriv(env, q, v, force, k1q, k1v);
-    for (int i = 0; i < 3; i++) { tq[i] = q[i] + 0.5f*h*k1q[i]; tv[i] = v[i] + 0.5f*h*k1v[i]; }
-    dp_state_deriv(env, tq, tv, force, k2q, k2v);
-    for (int i = 0; i < 3; i++) { tq[i] = q[i] + 0.5f*h*k2q[i]; tv[i] = v[i] + 0.5f*h*k2v[i]; }
-    dp_state_deriv(env, tq, tv, force, k3q, k3v);
-    for (int i = 0; i < 3; i++) { tq[i] = q[i] + h*k3q[i]; tv[i] = v[i] + h*k3v[i]; }
-    dp_state_deriv(env, tq, tv, force, k4q, k4v);
+    float qdd[3];
+    if (!solve_3x3(A, b, qdd)) {
+        env->physics_failed = 1;
+        return;
+    }
     for (int i = 0; i < 3; i++) {
-        q[i] += (h/6.0f) * (k1q[i] + 2.0f*k2q[i] + 2.0f*k3q[i] + k4q[i]);
-        v[i] += (h/6.0f) * (k1v[i] + 2.0f*k2v[i] + 2.0f*k3v[i] + k4v[i]);
+        qdd[i] = fminf(fmaxf(qdd[i], -1.0e5f), 1.0e5f);
     }
+
+    env->x_dot += env->dt * qdd[0];
+    env->theta1_dot += env->dt * qdd[1];
+    env->theta2_dot += env->dt * qdd[2];
+    env->x_dot = fminf(fmaxf(env->x_dot, -20.0f), 20.0f);
+    env->theta1_dot = fminf(fmaxf(env->theta1_dot, -30.0f), 30.0f);
+    env->theta2_dot = fminf(fmaxf(env->theta2_dot, -30.0f), 30.0f);
+    env->x += env->dt * env->x_dot;
+    env->theta1 = wrap_pi(env->theta1 + env->dt * env->theta1_dot);
+    env->theta2 = wrap_pi(env->theta2 + env->dt * env->theta2_dot);
 }
 
-void integrate_physics(DoublePendulum* env, float force) {
-    float q[3] = {env->x, env->theta1, env->theta2};
-    float v[3] = {env->x_dot, env->theta1_dot, env->theta2_dot};
-    int substeps = env->substeps > 0 ? env->substeps : 1;
-    float h = env->dt / (float)substeps;
-    for (int s = 0; s < substeps; s++) {
-        dp_rk4_step(env, force, h, q, v);
-        v[0] = fminf(fmaxf(v[0], -20.0f), 20.0f);
-        v[1] = fminf(fmaxf(v[1], -30.0f), 30.0f);
-        v[2] = fminf(fmaxf(v[2], -30.0f), 30.0f);
-    }
-    env->x = q[0];
-    env->x_dot = v[0];
-    env->theta1 = wrap_pi(q[1]);
-    env->theta1_dot = v[1];
-    env->theta2 = wrap_pi(q[2]);
-    env->theta2_dot = v[2];
-}
+// Non-farmable swing-up: pay only for a new episode-best tip height.
+float height_record_reward(DoublePendulum* env) {
+    float height = dp_tip_height(env);
+    if (!isfinite(height)) height = 0.0f;
+    height = fminf(fmaxf(height, 0.0f), 1.0f);
 
-float upright_reward(DoublePendulum* env, float force) {
-    float tip_y = env->link1_length * cosf(env->theta1)
-        + env->link2_length * cosf(env->theta2);
-    float max_y = env->link1_length + env->link2_length;
-    float height = 0.5f * (tip_y / max_y + 1.0f);
-
-    bool stable = height > 0.9f
+    bool near_top = height > 0.9f;
+    bool stable = near_top
         && fabsf(env->theta1_dot) < 1.5f
         && fabsf(env->theta2_dot) < 1.5f
         && fabsf(env->x_dot) < 1.0f;
+    if (near_top) env->upright_count += 1;
     if (stable) env->upright_steps += 1;
     else env->upright_steps = 0;
     if (env->upright_steps > env->max_upright_steps) {
         env->max_upright_steps = env->upright_steps;
     }
 
-    // Reward: (1-w) * [h * centered * small_control * small_velocity] + w * balance_quality
-    float h = fminf(fmaxf(height, 0.0f), 1.0f);
-    float sw1 = env->theta1_dot / DP_ANG_VEL_MARGIN;
-    float sw2 = env->theta2_dot / DP_ANG_VEL_MARGIN;
-    float min_vel_tol = fminf(expf(-DP_LN_10 * sw1 * sw1),
-                              expf(-DP_LN_10 * sw2 * sw2));
-    float small_velocity = DP_VELOCITY_FLOOR
-        + (1.0f - DP_VELOCITY_FLOOR) * min_vel_tol;
-    float scaled_x = env->x / DP_CENTER_MARGIN;
-    float centered = 0.5f * (1.0f + expf(-DP_LN_10 * scaled_x * scaled_x));
-    float a = env->force_mag > 0.0f ? force / env->force_mag : 0.0f;
-    float small_control = 0.2f * (4.0f + fmaxf(0.0f, 1.0f - a * a));
-    float deepmind = h * centered * small_control * small_velocity;
-    float angle_mse = 0.5f * (env->theta1 * env->theta1
-        + env->theta2 * env->theta2);
-    float ang_vel_mse = 0.5f * (env->theta1_dot * env->theta1_dot
-        + env->theta2_dot * env->theta2_dot);
-    float balance_x = env->x / DP_BALANCE_CART_SCALE;
-    float balance_quality = expf(
-        -angle_mse / (DP_BALANCE_ANGLE_SCALE * DP_BALANCE_ANGLE_SCALE)
-        -ang_vel_mse / (DP_BALANCE_ANG_VEL_SCALE * DP_BALANCE_ANG_VEL_SCALE)
-        -balance_x * balance_x);
-    float w = env->balance_bonus_weight;
-    return (1.0f - w) * deepmind + w * balance_quality;
+    float reward = fmaxf(0.0f, height - env->best_height);
+    if (height > env->best_height && height > 0.9f) {
+        reward += 0.05f * (height - 0.9f) / 0.1f;
+    }
+    if (stable) {
+        reward += 0.1f;
+    }
+    env->best_height = fmaxf(env->best_height, height);
+    return reward;
 }
 
-void c_step(DoublePendulum* env) {
-    float a = env->actions[0];
-    if (!isfinite(a)) a = 1.0f;
+// Hold Left Shift + A/D or arrows.
+static void double_pendulum_human_controls(DoublePendulum *env) {
+    if (!IsWindowReady() || !IsKeyDown(KEY_LEFT_SHIFT)) {
+        return;
+    }
+    if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A)) {
+        env->agents[0].actions[0] = 0;
+    } else if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D)) {
+        env->agents[0].actions[0] = 2;
+    } else {
+        env->agents[0].actions[0] = 1;
+    }
+}
+
+void puf_step(DoublePendulum* env) {
+    double_pendulum_human_controls(env);
+    float a = env->agents[0].actions[0];
     int action = (int)a;
     if ((unsigned)action >= DP_ACTIONS) action = 1;
     float force = 0.0f;
     if (action == 0) force = -env->force_mag;
     else if (action == 2) force = env->force_mag;
 
+    env->physics_failed = 0;
     integrate_physics(env, force);
     env->tick += 1;
 
-    bool invalid = !isfinite(env->x) || !isfinite(env->x_dot)
+    bool invalid = env->physics_failed
+        || !isfinite(env->x) || !isfinite(env->x_dot)
         || !isfinite(env->theta1) || !isfinite(env->theta1_dot)
         || !isfinite(env->theta2) || !isfinite(env->theta2_dot);
-    bool x_done = env->x < -DP_X_THRESHOLD || env->x > DP_X_THRESHOLD;
-    bool timeout = env->tick >= DP_MAX_STEPS;
+    float xt = env->x_threshold > 1e-6f ? env->x_threshold : 5.0f;
+    bool x_done = env->x < -xt || env->x > xt;
+    int max_steps = env->max_steps > 0 ? env->max_steps : 600;
+    bool timeout = env->tick >= max_steps;
     bool done = invalid || x_done || timeout;
-    env->rewards[0] = upright_reward(env, force);
-    env->episode_return += env->rewards[0];
-    env->terminals[0] = (invalid || x_done) ? 1.0f : 0.0f;
+
+    float reward = 0.0f;
+    if (!invalid) reward = height_record_reward(env);
+    env->agents[0].rewards[0] = reward;
+    env->episode_return += reward;
+    // Timeout, rail, and NaN/singular are all true terminals (no GAE bootstrap).
+    env->agents[0].terminals[0] = done ? 1.0f : 0.0f;
 
     if (done) {
-        add_log(env, invalid || x_done, timeout);
-        c_reset(env);
+        add_log(env, x_done && !invalid, timeout && !invalid && !x_done, invalid);
+        puf_reset(env);
         return;
     }
     compute_observations(env);
 }
 
-void c_render(DoublePendulum* env) {
+void puf_render(DoublePendulum* env) {
     if (!IsWindowReady()) {
         InitWindow(DP_WIDTH, DP_HEIGHT, "PufferLib Double Pendulum");
-        SetTargetFPS(30);
+        SetTargetFPS(60);
     }
-    if (IsKeyDown(KEY_ESCAPE)) exit(0);
-    if (IsKeyPressed(KEY_TAB)) ToggleFullscreen();
+    if (IsKeyDown(KEY_ESCAPE)) {
+        exit(0);
+    }
+    if (IsKeyPressed(KEY_TAB)) {
+        ToggleFullscreen();
+    }
+    double_pendulum_human_controls(env);
     if (!isfinite(env->x) || !isfinite(env->theta1) || !isfinite(env->theta2)) return;
 
     float rail_y = DP_HEIGHT * 0.72f;
@@ -342,17 +395,53 @@ void c_render(DoublePendulum* env) {
     DrawCircleV(p0, 8.0f, PUFF_WHITE);
     DrawCircleV(p1, 8.0f, PUFF_WHITE);
     DrawCircleV(p2, 10.0f, PUFF_WHITE);
-    DrawText(TextFormat("steps %d  return %.1f  hold %d/%d",
-        env->tick, env->episode_return, env->upright_steps, env->max_upright_steps),
+    DrawText(TextFormat("steps %d  return %.2f  best %.2f  hold %d",
+        env->tick, env->episode_return, env->best_height, env->max_upright_steps),
         20, 20, 20, PUFF_WHITE);
     DrawText(TextFormat("x %.2f  theta1 %.1f  theta2 %.1f",
         env->x, env->theta1 * 180.0f / M_PI, env->theta2 * 180.0f / M_PI),
         20, 48, 20, PUFF_WHITE);
     EndDrawing();
+    puf_web_vsync();
 }
 
-void c_close(DoublePendulum* env) {
+void puf_close(DoublePendulum* env) {
     if (IsWindowReady()) {
         CloseWindow();
     }
+}
+
+// --- Native trainer (pufferl) API ---
+void puf_log(Log* log, Dict* out) {
+    dict_set(out, "score", log->score);
+    dict_set(out, "perf", log->perf);
+    dict_set(out, "episode_return", log->episode_return);
+    dict_set(out, "episode_length", log->episode_length);
+    dict_set(out, "x_threshold_termination", log->x_threshold_termination);
+    dict_set(out, "max_steps_termination", log->max_steps_termination);
+    dict_set(out, "invalid_termination", log->invalid_termination);
+    dict_set(out, "hold_time", log->hold_time);
+    dict_set(out, "best_height", log->best_height);
+    dict_set(out, "upright_frac", log->upright_frac);
+    dict_set(out, "n", log->n);
+}
+
+void puf_init(Env* env, Dict* kwargs) {
+    env->num_agents = 1;
+    env->cart_mass = dict_get(kwargs, "cart_mass");
+    env->link1_mass = dict_get(kwargs, "link1_mass");
+    env->link2_mass = dict_get(kwargs, "link2_mass");
+    env->link1_length = dict_get(kwargs, "link1_length");
+    env->link2_length = dict_get(kwargs, "link2_length");
+    env->gravity = dict_get(kwargs, "gravity");
+    env->force_mag = dict_get(kwargs, "force_mag");
+    env->dt = dict_get(kwargs, "dt");
+    env->x_threshold = dict_get(kwargs, "x_threshold");
+    env->max_steps = dict_get(kwargs, "max_steps");
+    if (env->dt <= 0.0f) env->dt = 0.02f;
+    if (env->x_threshold <= 0.0f) env->x_threshold = 5.0f;
+    if (env->max_steps <= 0) env->max_steps = 1200;
+    env->agents[0].action_mask = NULL;
+    env->agents[0].policy = 0;
+    init(env);
 }

@@ -5,10 +5,21 @@
 #include <assert.h>
 #include <string.h>
 #include "raylib.h"
+// CUDA defines float3/float16; rename raymath's versions (unused here) to avoid conflict.
+#ifdef __CUDACC__
+#define float3 RayMathFloat3
+#define float16 RayMathFloat16
+#endif
 #include "raymath.h"
+#ifdef __CUDACC__
+#undef float3
+#undef float16
+#endif
 #include "rlgl.h"
 #include <time.h>
 #include <unistd.h>
+typedef unsigned char obs_t;
+#include "pufferenv.h"
 
 #if defined(PLATFORM_DESKTOP)
     #define GLSL_VERSION            330
@@ -33,6 +44,13 @@
 // observation space
 #define PLAYER_OBS 3
 #define OBS_VISION 225
+#define ACT_SIZES {6}
+#define OBS_SIZE 228
+#define NUM_ATNS 1
+// 4.0 demo: step on tick%6 at 60 FPS, and only when !isMoving.
+#define PUF_STEPS_PER_SEC 10
+#define MY_VEC_INIT
+#define MY_VEC_CLOSE
 // PLG VS ENV
 #define PLG_MODE 0
 #define RL_MODE 1
@@ -99,7 +117,7 @@ struct Level {
 };
 
 void init_level(Level* lvl){
-	lvl->map = calloc(BLOCK_BYTES, sizeof(unsigned char));
+	lvl->map = (unsigned char*)calloc(BLOCK_BYTES, sizeof(unsigned char));
     lvl->rows = 10;
     lvl->cols = 10;
     lvl->size = 100;
@@ -129,7 +147,7 @@ struct PuzzleState {
 };
 
 void init_puzzle_state(PuzzleState* ps){
-	ps->blocks = calloc(BLOCK_BYTES, sizeof(unsigned char));
+	ps->blocks = (unsigned char*)calloc(BLOCK_BYTES, sizeof(unsigned char));
 }
 
 void free_puzzle_state(PuzzleState* ps){
@@ -137,7 +155,6 @@ void free_puzzle_state(PuzzleState* ps){
 	free(ps);
 }
 
-typedef struct Log Log;
 struct Log {
     float perf;
     float score;
@@ -147,16 +164,15 @@ struct Log {
 };
 
 typedef struct Client Client;
-typedef struct CTowerClimb CTowerClimb;
+typedef struct Env TowerClimb;
 
 void trigger_banner(Client* client, int type);
-struct CTowerClimb {
+void close_client(Client* client);
+struct Env {
     Client* client;
-    unsigned char* observations;
-    float* actions;
-    float* rewards;
-    float* terminals;
-    unsigned char* truncations;
+    Agent agents[1];
+    int tag;
+    int boundary_reached;
     int num_agents;
     Log log;
     Log buffer;
@@ -183,9 +199,12 @@ struct CTowerClimb {
     int visitedCount;
     int visitedIndex;
     unsigned int rng;
+    int owns_levels;
+    int queued_banner;
+    int anim_busy;
 };
 
-void add_log(CTowerClimb* env) {
+void add_log(TowerClimb* env) {
     env->log.perf += env->buffer.perf;
     env->log.score += env->buffer.score;
     env->log.episode_return += env->buffer.episode_return;
@@ -202,14 +221,14 @@ void levelToPuzzleState(Level* level, PuzzleState* state) {
     state->block_grabbed = -1;    
 }
 
-void init(CTowerClimb* env) {
-	env->level = calloc(1, sizeof(Level));
-    env->state = calloc(1, sizeof(PuzzleState));	
+void init(TowerClimb* env) {
+	env->level = (Level*)calloc(1, sizeof(Level));
+    env->state = (PuzzleState*)calloc(1, sizeof(PuzzleState));	
     init_level(env->level);
     init_puzzle_state(env->state);
     env->rows_cleared = 0;
     
-    // Initialize with minimal map storage to avoid fallback in c_reset
+    // Initialize with minimal map storage to avoid fallback in puf_reset
     // env->num_maps = 0;
     // env->all_levels = NULL;
     // env->all_puzzles = NULL;
@@ -218,7 +237,7 @@ void init(CTowerClimb* env) {
     // env->bannerTriggered = false;
 }
 
-void setPuzzle(CTowerClimb* env, PuzzleState* src, Level* lvl){
+void setPuzzle(TowerClimb* env, PuzzleState* src, Level* lvl){
 	memcpy(env->state->blocks, src->blocks, BLOCK_BYTES * sizeof(unsigned char));
 	env->state->robot_position = src->robot_position;
 	env->state->robot_orientation = src->robot_orientation;
@@ -233,28 +252,9 @@ void setPuzzle(CTowerClimb* env, PuzzleState* src, Level* lvl){
     env->level->spawn_location = lvl->spawn_location;
 }
 
-CTowerClimb* allocate() {
-    CTowerClimb* env = (CTowerClimb*)calloc(1, sizeof(CTowerClimb));
-    init(env);
-    env->observations = (unsigned char*)calloc(OBS_VISION+PLAYER_OBS, sizeof(unsigned char));
-    env->actions = (float*)calloc(1, sizeof(float));
-    env->rewards = (float*)calloc(1, sizeof(float));
-    env->terminals = (float*)calloc(1, sizeof(float));
-    return env;
-}
-
-void c_close(CTowerClimb* env) {
+void free_tower_resources(TowerClimb* env) {
     free_level(env->level);
     free_puzzle_state(env->state);
-}
-
-void free_allocated(CTowerClimb* env) {
-    free(env->actions);
-    free(env->observations);
-    free(env->terminals);
-    free(env->rewards);
-    c_close(env);
-    free(env);
 }
 
 void calculate_window_bounds(int* bounds, int center_pos, int window_size, int max_size) {
@@ -280,7 +280,8 @@ void calculate_window_bounds(int* bounds, int center_pos, int window_size, int m
     }
 }
 
-void compute_observations(CTowerClimb* env) {
+void compute_observations(TowerClimb* env) {
+    obs_t* obs = env->agents[0].observations;
     int sz = env->level->size;
     int cols = env->level->cols;
     int rows = env->level->rows;
@@ -307,30 +308,31 @@ void compute_observations(CTowerClimb* env) {
                 int board_idx = world_y * sz + world_z * cols + world_x;
                 // Position is in bounds, set observation
                 if (board_idx == env->state->robot_position) {
-                    env->observations[obs_idx] = 3;
+                    obs[obs_idx] = 3;
                     continue;
                 }
                 else if (board_idx == env->level->goal_location){
-                    env->observations[obs_idx] = 2;
+                    obs[obs_idx] = 2;
                     continue;
                 }
                 // Use bitmask directly instead of board_state array
-                env->observations[obs_idx] = TEST_BIT(env->state->blocks, board_idx);
+                obs[obs_idx] = TEST_BIT(env->state->blocks, board_idx);
             }
         }
     }
     // Add player state information at the end
     int state_start = 9 * 5 * 5;
-    env->observations[state_start] = env->state->robot_orientation;
-    env->observations[state_start + 1] = env->state->robot_state;
-    env->observations[state_start + 2] = (env->state->block_grabbed != -1);
+    obs[state_start] = env->state->robot_orientation;
+    obs[state_start + 1] = env->state->robot_state;
+    obs[state_start + 2] = (env->state->block_grabbed != -1);
 }
 
-void c_reset(CTowerClimb* env) {
-    env->terminals[0] = 0.0f;
+void puf_reset(TowerClimb* env) {
+    env->agents[0].terminals[0] = 0.0f;
     env->rows_cleared = 0;
     env->goal_reached = false;
     env->celebrationStarted = false;
+    env->celebrationStartTime = 0.0f;
     env->bannerTriggered = false;
     // Initialize glow tracking
     env->visitedCount = 0;
@@ -356,13 +358,13 @@ void c_reset(CTowerClimb* env) {
     compute_observations(env);
 }
 
-void illegal_move(CTowerClimb* env){
-    env->rewards[0] = env->reward_illegal_move;
+void illegal_move(TowerClimb* env){
+    env->agents[0].rewards[0] = env->reward_illegal_move;
     env->buffer.episode_return += env->reward_illegal_move;
 }
 
-void death(CTowerClimb* env){
-	env->rewards[0] = -1;
+void death(TowerClimb* env){
+	env->agents[0].rewards[0] = -1;
 	env->buffer.episode_return -= 1;
 	env->buffer.perf = 0;
 	add_log(env);
@@ -373,13 +375,13 @@ int isGoal(  PuzzleState* s,  Level* lvl) {
     return 1;
 }
 
-int move(PuzzleState* outState, int action, int mode, CTowerClimb* env, const Level* lvl){
+int move(PuzzleState* outState, int action, int mode, TowerClimb* env, const Level* lvl){
     int new_position = outState->robot_position + BFS_DIRECTION_VECTORS_X[action] + BFS_DIRECTION_VECTORS_Z[action]*lvl->cols;
     outState->robot_position = new_position;
     return 1;
 }
 
-int climb(PuzzleState* outState, int action, int mode, CTowerClimb* env, const Level* lvl){
+int climb(PuzzleState* outState, int action, int mode, TowerClimb* env, const Level* lvl){
     int cell_direct_above = outState->robot_position + lvl->size;
     int cell_next_above = cell_direct_above + BFS_DIRECTION_VECTORS_X[action] + BFS_DIRECTION_VECTORS_Z[action]*lvl->cols;
     int goal = lvl->goal_location;
@@ -393,7 +395,7 @@ int climb(PuzzleState* outState, int action, int mode, CTowerClimb* env, const L
     int floor_cleared = (cell_direct_above / lvl->size) - 2;
     if(mode == RL_MODE && floor_cleared > env->rows_cleared){
         env->rows_cleared = floor_cleared;
-        env->rewards[0] = env->reward_climb_row;
+        env->agents[0].rewards[0] = env->reward_climb_row;
         env->buffer.episode_return += env->reward_climb_row;
         env->buffer.score = floor_cleared;
     }
@@ -402,14 +404,14 @@ int climb(PuzzleState* outState, int action, int mode, CTowerClimb* env, const L
     return 1;
 }
 
-int drop(PuzzleState* outState, int action, int mode, CTowerClimb* env, const Level* lvl){
+int drop(PuzzleState* outState, int action, int mode, TowerClimb* env, const Level* lvl){
     int next_cell = outState->robot_position + BFS_DIRECTION_VECTORS_X[action] + BFS_DIRECTION_VECTORS_Z[action]*lvl->cols;
     int next_below_cell = next_cell - lvl->size;
     int next_double_below_cell = next_cell - 2*lvl->size;
     if (next_below_cell < 0) return 0;
     int step_down = next_double_below_cell >= 0 && TEST_BIT(outState->blocks, next_double_below_cell);
     if(mode == RL_MODE){
-        env->rewards[0] = env->reward_fall_row;
+        env->agents[0].rewards[0] = env->reward_fall_row;
         env->buffer.episode_return += env->reward_fall_row;
     }
     if (step_down){
@@ -554,9 +556,9 @@ int handle_block_falling(PuzzleState* outState, int* affected_blocks, int* block
     return 1;
 }
 
-int push(PuzzleState* outState, int action, const Level* lvl, int mode, CTowerClimb* env, int block_offset){
+int push(PuzzleState* outState, int action, const Level* lvl, int mode, TowerClimb* env, int block_offset){
     int first_block_index = outState->robot_position + BFS_DIRECTION_VECTORS_X[outState->robot_orientation] + BFS_DIRECTION_VECTORS_Z[outState->robot_orientation]*lvl->cols;                          
-    int* blocks_to_move = calloc(lvl->cols, sizeof(int));
+    int* blocks_to_move = (int*)calloc(lvl->cols, sizeof(int));
     for(int i = 0; i < lvl->cols; i++) {
         blocks_to_move[i] = (i == 0) ? first_block_index : -1;
     }
@@ -602,7 +604,7 @@ int push(PuzzleState* outState, int action, const Level* lvl, int mode, CTowerCl
     return result;
 }
 
-int pull(PuzzleState* outState, int action, const Level* lvl, int mode, CTowerClimb* env, int block_offset){
+int pull(PuzzleState* outState, int action, const Level* lvl, int mode, TowerClimb* env, int block_offset){
     int pull_block = outState->robot_position + BFS_DIRECTION_VECTORS_X[outState->robot_orientation] + BFS_DIRECTION_VECTORS_Z[outState->robot_orientation]*lvl->cols;
     int block_in_front = TEST_BIT(outState->blocks, pull_block);
     int block_behind = TEST_BIT(outState->blocks, outState->robot_position + block_offset);
@@ -633,7 +635,7 @@ int pull(PuzzleState* outState, int action, const Level* lvl, int mode, CTowerCl
     return handle_block_falling(outState, affected_blocks, blocks_to_move, 1, lvl);
 }
 
-int shimmy_normal(PuzzleState* outState, int action, const Level* lvl, int local_direction, int mode, CTowerClimb* env){
+int shimmy_normal(PuzzleState* outState, int action, const Level* lvl, int local_direction, int mode, TowerClimb* env){
     int next_cell = outState->robot_position + BFS_DIRECTION_VECTORS_X[local_direction] + BFS_DIRECTION_VECTORS_Z[local_direction]*lvl->cols;
     int above_next_cell = next_cell + lvl->size;
     if (bfs_is_valid_position(above_next_cell, lvl) && !TEST_BIT(outState->blocks, above_next_cell)){
@@ -643,7 +645,7 @@ int shimmy_normal(PuzzleState* outState, int action, const Level* lvl, int local
     return 0;
 }
 
-int wrap_around(PuzzleState* outState, int action, const Level* lvl, int mode, CTowerClimb* env){
+int wrap_around(PuzzleState* outState, int action, const Level* lvl, int mode, TowerClimb* env){
     int action_idx = (action == LEFT) ? 0 : 1;
     int grid_pos = outState->robot_position % lvl->size;
     int x = grid_pos % lvl->cols;
@@ -660,7 +662,7 @@ int wrap_around(PuzzleState* outState, int action, const Level* lvl, int mode, C
     return 1;
 }
 
-int climb_from_hang(PuzzleState* outState, int action, const Level* lvl, int next_cell, int mode, CTowerClimb* env){
+int climb_from_hang(PuzzleState* outState, int action, const Level* lvl, int next_cell, int mode, TowerClimb* env){
     int climb_index = next_cell + lvl->size;
     int direct_above_index = outState->robot_position + lvl->size;
     int can_climb = bfs_is_valid_position(climb_index, lvl) && bfs_is_valid_position(direct_above_index, lvl) 
@@ -673,7 +675,7 @@ int climb_from_hang(PuzzleState* outState, int action, const Level* lvl, int nex
     return 0;
 }
 
-int applyAction(PuzzleState* outState, int action,  Level* lvl, int mode, CTowerClimb* env) {
+int applyAction(PuzzleState* outState, int action,  Level* lvl, int mode, TowerClimb* env) {
     // necessary variables
     int next_dx = BFS_DIRECTION_VECTORS_X[outState->robot_orientation];
     int next_dz = BFS_DIRECTION_VECTORS_Z[outState->robot_orientation];   
@@ -787,7 +789,7 @@ int applyAction(PuzzleState* outState, int action,  Level* lvl, int mode, CTower
             }
         }
         if (mode == RL_MODE && result == 1){
-            env->rewards[0] = env->reward_move_block;
+            env->agents[0].rewards[0] = env->reward_move_block;
             env->buffer.episode_return += env->reward_move_block;
         }
         return result;
@@ -795,18 +797,49 @@ int applyAction(PuzzleState* outState, int action,  Level* lvl, int mode, CTower
     return 0;   
 }
 
-void c_step(CTowerClimb* env) {
+// Hold Left Shift + arrows/space/right-shift.
+static void tower_climb_human_controls(TowerClimb *env) {
+    if (!IsWindowReady() || !IsKeyDown(KEY_LEFT_SHIFT)) {
+        return;
+    }
+    if (IsKeyPressed(KEY_UP)) {
+        env->agents[0].actions[0] = UP;
+    }
+    if (IsKeyPressed(KEY_LEFT)) {
+        env->agents[0].actions[0] = LEFT;
+    }
+    if (IsKeyPressed(KEY_RIGHT)) {
+        env->agents[0].actions[0] = RIGHT;
+    }
+    if (IsKeyPressed(KEY_DOWN)) {
+        env->agents[0].actions[0] = DOWN;
+    }
+    if (IsKeyPressed(KEY_SPACE)) {
+        env->agents[0].actions[0] = GRAB;
+    }
+    if (IsKeyPressed(KEY_RIGHT_SHIFT)) {
+        env->agents[0].actions[0] = DROP;
+    }
+}
+
+void puf_step(TowerClimb* env) {
+    // 4.0 demo: do not step until the current clip finishes.
+    if (env->anim_busy) {
+        return;
+    }
+    int action = (int)env->agents[0].actions[0];
+    env->agents[0].actions[0] = NOOP;
     env->buffer.episode_length += 1.0;
-    env->rewards[0] = 0.0;
+    env->agents[0].rewards[0] = 0.0;
     if(env->buffer.episode_length > 60){
-         env->rewards[0] = 0;
+         env->agents[0].rewards[0] = 0;
          env->buffer.perf = 0;
          add_log(env);
          if (env->client && !env->bannerTriggered) {
-             trigger_banner(env->client, 2); // Timeout = failure
+             env->queued_banner = 2;
              env->bannerTriggered = true;
          }
-         c_reset(env);
+         puf_reset(env);
     }
     
     // Prevent movement if goal is reached (during celebration)
@@ -816,7 +849,7 @@ void c_step(CTowerClimb* env) {
     }
     
     // Create next state
-    int move_result = applyAction(env->state, env->actions[0], env->level, RL_MODE, env);
+    int move_result = applyAction(env->state, action, env->level, RL_MODE, env);
     if (move_result == MOVE_ILLEGAL) {
         illegal_move(env);
         return;
@@ -824,27 +857,27 @@ void c_step(CTowerClimb* env) {
     if (move_result == MOVE_DEATH){
         death(env);
         if (env->client && !env->bannerTriggered) {
-            trigger_banner(env->client, 2); // Death = failure
+            env->queued_banner = 2;
             env->bannerTriggered = true;
         }
-        c_reset(env);
+        puf_reset(env);
     }
     
     // Check for goal state
     if (isGoal(env->state, env->level)) {
         env->goal_reached = true;
-        env->rewards[0] = 1.0;
+        env->agents[0].rewards[0] = 1.0;
         env->buffer.episode_return +=1.0;
         env->buffer.perf = 1.0;
         add_log(env);
         if (env->client) {
             // Start celebration immediately when goal is reached
             env->celebrationStarted = true;
-            env->celebrationStartTime = GetTime();
+            env->celebrationStartTime = 0.0f;
             env->pending_reset = true; // Mark for delayed reset
             // Banner will be triggered after beam effect completes in render function
         } else {
-            c_reset(env); // If no client, reset immediately
+            puf_reset(env); // If no client, reset immediately
         }
     }
     
@@ -853,7 +886,7 @@ void c_step(CTowerClimb* env) {
     // Only track if the position is valid and has cube
     if (standingOnPosition >= 0 && TEST_BIT(env->state->blocks, standingOnPosition)) {
         env->visitedPositions[env->visitedIndex] = standingOnPosition;
-        env->visitedTimes[env->visitedIndex] = GetTime();
+        env->visitedTimes[env->visitedIndex] = 0.0f;
         env->visitedIndex = (env->visitedIndex + 1) % 100;
         if (env->visitedCount < 100) env->visitedCount++;
     }
@@ -1118,7 +1151,7 @@ void cleanupVisited(void) {
 }
 int verify_level(Level* level, int max_moves, int min_moves){
     // converting level to puzzle state
-    PuzzleState* state = calloc(1, sizeof(PuzzleState));
+    PuzzleState* state = (PuzzleState*)calloc(1, sizeof(PuzzleState));
     init_puzzle_state(state);
     levelToPuzzleState(level, state);
     // reset visited hash table
@@ -1183,7 +1216,7 @@ void gen_level(Level* lvl, int goal_level, unsigned int* rng) {
     lvl->spawn_location = spawn_index;
 }
 
-void init_random_level(CTowerClimb* env, int goal_level, int max_moves, int min_moves, int seed) {
+void init_random_level(TowerClimb* env, int goal_level, int max_moves, int min_moves, int seed) {
     reset_level(env->level);
     gen_level(env->level, goal_level, &env->rng);
     // guarantee a map is created
@@ -1265,7 +1298,7 @@ void trigger_banner(Client* client, int type) {
     client->showBanner = true;
 }
 
-Client* make_client(CTowerClimb* env) {
+Client* make_client(TowerClimb* env) {
     Client* client = (Client*)calloc(1, sizeof(Client));
     
     // Calculate screen dimensions based on level size
@@ -1274,15 +1307,8 @@ Client* make_client(CTowerClimb* env) {
     int totalFloors = env->level->total_length / env->level->size;
     float levelHeight = (float)totalFloors;
     
-    // Calculate appropriate window size to fit level better
-    // Use aspect ratio based on level dimensions, with some padding
-    float levelAspectRatio = levelWidth / levelHeight;
-    int targetHeight = 900;
-    int targetWidth = (int)(targetHeight * levelAspectRatio * 1.4f * 0.8f);  // 20% smaller window width
-    
-    // Clamp width to reasonable bounds
-    client->width = fmaxf(640, fminf(targetWidth, 1120));  // Reduced bounds by 20%
-    client->height = targetHeight;
+    client->width = 1008;
+    client->height = 900;
     
     SetConfigFlags(FLAG_MSAA_4X_HINT);  // Enable MSAA
     InitWindow(client->width, client->height, "PufferLib Ray Tower Climb");
@@ -1405,7 +1431,7 @@ Client* make_client(CTowerClimb* env) {
         floor * 1.0f,
         z * 1.0f
     };
-    client->targetPosition = client->visualPosition;  // Initialize target to match
+    client->targetPosition = client->visualPosition;
     
     // Initialize camera rotation controls
     client->lastMousePos = (Vector2){0, 0};
@@ -1421,11 +1447,12 @@ Client* make_client(CTowerClimb* env) {
     // Initialize lighting smoothing
     client->lightingSmoothing = 0.1f;  // Smoothing factor (0.1 = slow, 0.9 = fast)
     client->previousLightIntensity = 1.0f;
+    client->enable_animations = 1;
     
     return client;
 }
 
-void orient_hang_offset(Client* client, CTowerClimb* env, int reverse){
+void orient_hang_offset(Client* client, TowerClimb* env, int reverse){
     client->visualPosition.y -= 0.2f * reverse;
     if (env->state->robot_orientation == 0) { // Facing +x
         client->visualPosition.x += 0.4f * reverse;
@@ -1447,15 +1474,16 @@ typedef struct {
     AnimationState nextState;
 } AnimConfig;
 
+// Positional init (enum order) — designated [ENUM]= form breaks under CUDA C++ host.
 static const AnimConfig ANIM_CONFIGS[] = {
-    [ANIM_IDLE] = {4, 1, -1, 0, ANIM_IDLE},            // Loops from start
-    [ANIM_CLIMBING] = {1, 6, -1, 0, ANIM_IDLE},        // Start from beginning
-    [ANIM_HANGING] = {2, 0, 1, 0, ANIM_HANGING},       // Static frame
-    [ANIM_START_GRABBING] = {3, 6, -2, 0, ANIM_GRABBING}, // Normal grab start
-    [ANIM_GRABBING] = {3, 4, -2, -2, ANIM_GRABBING},   // Start at second-to-last frame
-    [ANIM_RUNNING] = {5, 4, -1, 0, ANIM_IDLE},         // Start from beginning
-    [ANIM_SHIMMY_RIGHT] = {7, 2, 87, 0, ANIM_HANGING}, // Start from beginning
-    [ANIM_SHIMMY_LEFT] = {6, 2, 87, 0, ANIM_HANGING}   // Start from beginning
+    {4, 1, -1, 0, ANIM_IDLE},            // ANIM_IDLE
+    {5, 4, -1, 0, ANIM_IDLE},            // ANIM_RUNNING
+    {1, 6, -1, 0, ANIM_IDLE},            // ANIM_CLIMBING
+    {2, 0, 1, 0, ANIM_HANGING},          // ANIM_HANGING
+    {3, 6, -2, 0, ANIM_GRABBING},        // ANIM_START_GRABBING
+    {3, 4, -2, -2, ANIM_GRABBING},      // ANIM_GRABBING
+    {7, 2, 87, 0, ANIM_HANGING},         // ANIM_SHIMMY_RIGHT
+    {6, 2, 87, 0, ANIM_HANGING},         // ANIM_SHIMMY_LEFT
 };
 
 static void update_animation(Client* client, AnimationState newState) {
@@ -1474,7 +1502,7 @@ static void update_animation(Client* client, AnimationState newState) {
     }
 }
 
-static void update_position(Client* client, CTowerClimb* env) {
+static void update_position(Client* client, TowerClimb* env) {
     int floor = env->state->robot_position / env->level->size;
     int grid_pos = env->state->robot_position % env->level->size;
     int x = grid_pos % env->level->cols;
@@ -1482,32 +1510,32 @@ static void update_position(Client* client, CTowerClimb* env) {
     client->targetPosition = (Vector3){x * 1.0f, floor * 1.0f, z * 1.0f};
 }
 
-static void process_animation_frame(Client* client, CTowerClimb* env) {
+static void process_animation_frame(Client* client, TowerClimb* env) {
     if (!client->enable_animations) return;
     const AnimConfig* config = &ANIM_CONFIGS[client->animState];
     if (!client->isMoving && client->animState != ANIM_IDLE) return;
-    
+
     client->animFrameCounter += config->frameRate;
-    UpdateModelAnimation(client->robot, client->animations[config->animationIndex], 
-                        client->animFrameCounter);
-    // Handle shimmy movement lerping
-    if (client->isMoving && (client->animState == ANIM_SHIMMY_LEFT || 
-                            client->animState == ANIM_SHIMMY_RIGHT)) {
+    UpdateModelAnimation(client->robot, client->animations[config->animationIndex],
+        client->animFrameCounter);
+    if (client->isMoving && (client->animState == ANIM_SHIMMY_LEFT
+            || client->animState == ANIM_SHIMMY_RIGHT)) {
         float progress = 0.065f;
-        // Horizontal movement for UP/DOWN, vertical movement for LEFT/RIGHT
-        bool facingNS = env->state->robot_orientation == UP || env->state->robot_orientation == DOWN;
+        bool facingNS = env->state->robot_orientation == UP
+            || env->state->robot_orientation == DOWN;
         if (facingNS) {
-            client->visualPosition.x = Lerp(client->visualPosition.x, client->targetPosition.x, progress);
+            client->visualPosition.x = Lerp(client->visualPosition.x,
+                client->targetPosition.x, progress);
         } else {
-            client->visualPosition.z = Lerp(client->visualPosition.z, client->targetPosition.z, progress);
+            client->visualPosition.z = Lerp(client->visualPosition.z,
+                client->targetPosition.z, progress);
         }
     }
-    // Check for animation completion
     int maxFrames = config->maxFrames;
     if (maxFrames < 0) {
-        maxFrames = client->animations[config->animationIndex].frameCount + maxFrames;
+        maxFrames = client->animations[config->animationIndex].frameCount
+            + maxFrames;
     }
-    // If we've reached the end of the animation, update the animation state
     if (maxFrames > 0 && client->animFrameCounter >= maxFrames) {
         client->isMoving = false;
         update_animation(client, config->nextState);
@@ -1518,7 +1546,7 @@ static void process_animation_frame(Client* client, CTowerClimb* env) {
     }
 }
 
-static void handle_hanging_movement(Client* client, CTowerClimb* env) {
+static void handle_hanging_movement(Client* client, TowerClimb* env) {
     bool is_wrap_shimmy = fabs(client->targetPosition.x - client->visualPosition.x) > 0.5f && 
                          fabs(client->targetPosition.z - client->visualPosition.z) > 0.5f;
     // First ensure we have the correct hanging offset if we just transitioned to hanging
@@ -1549,7 +1577,7 @@ static void handle_hanging_movement(Client* client, CTowerClimb* env) {
     }
 }
 
-static void update_camera(Client* client, CTowerClimb* env) {
+static void update_camera(Client* client, TowerClimb* env) {
     Vector3 targetCenter;
     
     if (client->followPlayer) {
@@ -1574,8 +1602,7 @@ static void update_camera(Client* client, CTowerClimb* env) {
             desiredTarget.y = maxTargetY;
         }
         
-        // Smooth following with interpolation
-        float followSpeed = 0.02f;  // Very smooth following
+        float followSpeed = 0.02f;
         targetCenter.x = client->camera.target.x + (desiredTarget.x - client->camera.target.x) * followSpeed;
         targetCenter.y = client->camera.target.y + (desiredTarget.y - client->camera.target.y) * followSpeed;
         targetCenter.z = client->camera.target.z + (desiredTarget.z - client->camera.target.z) * followSpeed;
@@ -1614,7 +1641,7 @@ static void draw_background(Client* client) {
     DrawTexturePro(client->background, source, dest, (Vector2){0, 0}, 0.0f, WHITE);
 }
 
-static void draw_level(Client* client, CTowerClimb* env) {
+static void draw_level(Client* client, TowerClimb* env) {
     int cols = env->level->cols;
     int sz = env->level->size;
     float currentTime = GetTime();
@@ -1791,7 +1818,7 @@ static void draw_level(Client* client, CTowerClimb* env) {
     }
 }
 
-static void draw_robot(Client* client, CTowerClimb* env) {
+static void draw_robot(Client* client, TowerClimb* env) {
     Vector3 pos = client->visualPosition;
     pos.y -= 0.5f;
     
@@ -1882,9 +1909,7 @@ static void draw_robot(Client* client, CTowerClimb* env) {
     }
 }
 
-
-
-static void draw_ui(Client* client, CTowerClimb* env) {
+static void draw_ui(Client* client, TowerClimb* env) {
     // Draw timer (time remaining)
     float timeRemaining = 60.0f - env->buffer.episode_length;
     if (timeRemaining < 0) timeRemaining = 0;
@@ -1951,7 +1976,7 @@ static void draw_ui(Client* client, CTowerClimb* env) {
     }
 }
 
-static void render_scene(Client* client, CTowerClimb* env) {
+static void render_scene(Client* client, TowerClimb* env) {
     BeginDrawing();
     ClearBackground(BLACK);
     EndShaderMode();
@@ -1994,13 +2019,54 @@ static void render_scene(Client* client, CTowerClimb* env) {
     EndShaderMode();
     draw_ui(client, env);
     EndDrawing();
+    puf_web_vsync();
 }
 
-void c_render(CTowerClimb* env) {
+static void snap_client_to_robot(TowerClimb* env) {
+    Client* client = env->client;
+    if (!client) return;
+    update_position(client, env);
+    client->visualPosition = client->targetPosition;
+    client->previousRobotPosition = env->state->robot_position;
+    client->isMoving = false;
+    update_animation(client, ANIM_IDLE);
+}
+
+void puf_render(TowerClimb* env) {
     if (env->client == NULL) {
         env->client = make_client(env);
     }
     Client* client = env->client;
+    tower_climb_human_controls(env);
+    if (env->queued_banner) {
+        trigger_banner(client, env->queued_banner);
+        env->queued_banner = 0;
+    }
+    if (env->celebrationStarted && env->celebrationStartTime == 0.0f) {
+        env->celebrationStartTime = GetTime();
+    }
+    for (int i = 0; i < env->visitedCount; i++) {
+        if (env->visitedTimes[i] == 0.0f && env->visitedPositions[i] >= 0) {
+            env->visitedTimes[i] = GetTime();
+        }
+    }
+
+    // Delayed level reset after celebration (old demo() loop).
+    if (env->pending_reset) {
+        bool shouldReset = false;
+        if (env->celebrationStarted) {
+            shouldReset = (GetTime() - env->celebrationStartTime) >= 1.9f;
+        } else {
+            shouldReset = (!client->showBanner || client->bannerType != 1);
+        }
+        if (shouldReset) {
+            env->pending_reset = false;
+            puf_reset(env);
+            snap_client_to_robot(env);
+        }
+    } else if (env->buffer.episode_length < 1.0f) {
+        snap_client_to_robot(env);
+    }
 
     // Check if we should trigger success banner when beam effect starts
     if (env->goal_reached && env->celebrationStarted && !env->bannerTriggered) {
@@ -2107,7 +2173,9 @@ void c_render(CTowerClimb* env) {
     }
     // Handle position changes
     if (env->state->robot_position != client->previousRobotPosition && client->enable_animations) {
-        if (client->isMoving) client->visualPosition = client->targetPosition;
+        if (client->isMoving) {
+            client->visualPosition = client->targetPosition;
+        }
         client->isMoving = true;
         update_position(client, env);
         float verticalDiff = client->targetPosition.y - client->visualPosition.y;
@@ -2130,6 +2198,7 @@ void c_render(CTowerClimb* env) {
         client->visualPosition = client->targetPosition;
     }
     process_animation_frame(client, env);
+    env->anim_busy = client->enable_animations && client->isMoving;
     update_camera(client, env);
     render_scene(client, env);
 }
@@ -2149,7 +2218,7 @@ Level* load_levels_from_file(int* num_maps, const char* path) {
         return NULL;
     }
 
-    Level* levels = calloc(*num_maps, sizeof(Level));
+    Level* levels = (Level*)calloc(*num_maps, sizeof(Level));
     if (levels == NULL) {
         fprintf(stderr, "Failed to allocate memory for levels\n");
         fclose(fp);
@@ -2167,12 +2236,149 @@ Level* load_levels_from_file(int* num_maps, const char* path) {
         fread(&levels[i].spawn_location, sizeof(int), 1, fp);
 
         // Allocate and read the map data
-        levels[i].map = calloc(BLOCK_BYTES, sizeof(unsigned char));
+        levels[i].map = (unsigned char*)calloc(BLOCK_BYTES, sizeof(unsigned char));
         fread(levels[i].map, sizeof(unsigned char), BLOCK_BYTES, fp);
     }
 
     fclose(fp);
     return levels;
+}
+
+// --- Native trainer (pufferl) API ---
+void puf_log(Log* log, Dict* out) {
+    dict_set(out, "perf", log->perf);
+    dict_set(out, "score", log->score);
+    dict_set(out, "episode_return", log->episode_return);
+    dict_set(out, "episode_length", log->episode_length);
+    dict_set(out, "n", log->n);
+}
+
+static void tower_climb_load_shared_maps(Env* env) {
+    const char* path = "resources/tower_climb/maps.bin";
+    int num_maps = 0;
+    Level* levels = load_levels_from_file(&num_maps, path);
+    if (levels == NULL) {
+        env->num_maps = 0;
+        env->all_levels = NULL;
+        env->all_puzzles = NULL;
+        env->owns_levels = 0;
+        return;
+    }
+    PuzzleState* puzzle_states = (PuzzleState*)calloc(num_maps, sizeof(PuzzleState));
+    for (int i = 0; i < num_maps; i++) {
+        init_puzzle_state(&puzzle_states[i]);
+        levelToPuzzleState(&levels[i], &puzzle_states[i]);
+    }
+    env->all_levels = levels;
+    env->all_puzzles = puzzle_states;
+    env->num_maps = num_maps;
+    env->owns_levels = 1;
+}
+
+void puf_init(Env* env, Dict* kwargs) {
+    env->num_agents = 1;
+    env->reward_climb_row = dict_get(kwargs, "reward_climb_row");
+    env->reward_fall_row = dict_get(kwargs, "reward_fall_row");
+    env->reward_illegal_move = dict_get(kwargs, "reward_illegal_move");
+    env->reward_move_block = dict_get(kwargs, "reward_move_block");
+    env->agents[0].action_mask = NULL;
+    env->agents[0].policy = 0;
+    init(env);
+    tower_climb_load_shared_maps(env);
+}
+
+void puf_close(Env* env) {
+    if (env->owns_levels && env->all_levels != NULL) {
+        for (int i = 0; i < env->num_maps; i++) {
+            free(env->all_levels[i].map);
+            free(env->all_puzzles[i].blocks);
+        }
+        free(env->all_levels);
+        free(env->all_puzzles);
+    }
+    if (env->client != NULL) {
+        close_client(env->client);
+    }
+    free_tower_resources(env);
+}
+
+Env* my_vec_init(int* num_envs_out, int* env_starts, int* env_counts,
+                 Dict* vec_kwargs, Dict* env_kwargs) {
+    int num_envs = dict_get(vec_kwargs, "total_agents");
+    int num_buffers = dict_get(vec_kwargs, "num_buffers");
+
+    float reward_climb_row = dict_get(env_kwargs, "reward_climb_row");
+    float reward_fall_row = dict_get(env_kwargs, "reward_fall_row");
+    float reward_illegal_move = dict_get(env_kwargs, "reward_illegal_move");
+    float reward_move_block = dict_get(env_kwargs, "reward_move_block");
+
+    const char* path = "resources/tower_climb/maps.bin";
+    int num_maps = 0;
+
+    Level* levels = load_levels_from_file(&num_maps, path);
+    if (levels == NULL) {
+        fprintf(stderr, "tower_climb: failed to load %s (need resources/tower_climb/maps.bin)\n", path);
+        exit(1);
+    }
+
+    PuzzleState* puzzle_states = (PuzzleState*)calloc(num_maps, sizeof(PuzzleState));
+    for (int i = 0; i < num_maps; i++) {
+        init_puzzle_state(&puzzle_states[i]);
+        levelToPuzzleState(&levels[i], &puzzle_states[i]);
+    }
+
+    Env* envs = (Env*)calloc(num_envs, sizeof(Env));
+
+    for (int i = 0; i < num_envs; i++) {
+        Env* env = &envs[i];
+        env->rng = i;
+        env->num_agents = 1;
+        env->reward_climb_row = reward_climb_row;
+        env->reward_fall_row = reward_fall_row;
+        env->reward_illegal_move = reward_illegal_move;
+        env->reward_move_block = reward_move_block;
+        env->all_levels = levels;
+        env->all_puzzles = puzzle_states;
+        env->num_maps = num_maps;
+        env->owns_levels = 0;
+        env->agents[0].action_mask = NULL;
+        env->agents[0].policy = 0;
+        init(env);
+    }
+
+    int agents_per_buf = num_envs / num_buffers;
+    int buf = 0;
+    int buf_agents = 0;
+    env_starts[0] = 0;
+    env_counts[0] = 0;
+    for (int i = 0; i < num_envs; i++) {
+        buf_agents += envs[i].num_agents;
+        env_counts[buf]++;
+        if (buf_agents >= agents_per_buf && buf < num_buffers - 1) {
+            buf++;
+            env_starts[buf] = i + 1;
+            env_counts[buf] = 0;
+            buf_agents = 0;
+        }
+    }
+
+    *num_envs_out = num_envs;
+    return envs;
+}
+
+void my_vec_close(Env* envs) {
+    if (envs == NULL || envs[0].all_levels == NULL) {
+        return;
+    }
+    Level* levels = envs[0].all_levels;
+    PuzzleState* puzzles = envs[0].all_puzzles;
+    int num_maps = envs[0].num_maps;
+    for (int i = 0; i < num_maps; i++) {
+        free(levels[i].map);
+        free(puzzles[i].blocks);
+    }
+    free(levels);
+    free(puzzles);
 }
 
 void close_client(Client* client) {

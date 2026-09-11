@@ -4,6 +4,13 @@
 #include <math.h>
 #include <lammps/library.h>
 #include "raylib.h"
+typedef float obs_t;
+#include "pufferenv.h"
+
+#define MAX_AGENTS 256
+#define ACT_SIZES {1, 1, 1}
+#define NUM_ATNS 3
+#define OBS_SIZE 3
 
 #define WIDTH 1080
 #define HEIGHT 720
@@ -47,10 +54,10 @@ static inline void clamp3(Vec3 *vec, float min, float max) {
 
 
 // Only use floats!
-typedef struct {
+struct Log {
     float score;
     float n; // Required as the last field 
-} Log;
+};
 
 typedef struct {
     Camera3D camera;
@@ -64,18 +71,39 @@ typedef struct {
     Vector2 last_mouse_pos;
 } Client;
 
-typedef struct {
-    Log log;                     // Required field
-    float* observations;         // Required field. Ensure type matches in .py and .c
-    float* actions;              // Required field. Ensure type matches in .py and .c
-    float* rewards;              // Required field
-    unsigned char* terminals;    // Required field
+struct Env {
+    Log log;
+    Agent agents[MAX_AGENTS];
+    int tag;
+    int boundary_reached;
     int num_agents;
     Vec3 goal;
     int tick;
     Client* client;
     void* handle;
-} Matsci;
+};
+typedef Env Matsci;
+
+void init(Matsci* env);
+
+void puf_init(Env* env, Dict* kwargs) {
+    env->num_agents = dict_get(kwargs, "num_agents");
+    if (env->num_agents > MAX_AGENTS) {
+        fprintf(stderr, "matsci: num_agents %d > MAX_AGENTS %d\n",
+                env->num_agents, MAX_AGENTS);
+        exit(1);
+    }
+    for (int i = 0; i < env->num_agents; i++) {
+        env->agents[i].policy = 0;
+        env->agents[i].action_mask = NULL;
+    }
+    init(env);
+}
+
+void puf_log(Log* log, Dict* out) {
+    dict_set(out, "score", log->score);
+    dict_set(out, "n", log->n);
+}
 
 void init(Matsci* env) {
   void *handle;
@@ -118,9 +146,10 @@ void init(Matsci* env) {
 void compute_observations(Matsci* env) {
     double** x = (double **) lammps_extract_atom(env->handle, "x");
     for (int i=0; i<env->num_agents; i++) {
-        env->observations[3*i] = x[i][0] - env->goal.x;
-        env->observations[3*i + 1] = x[i][1] - env->goal.y;
-        env->observations[3*i + 2] = x[i][2] - env->goal.z;
+        obs_t* obs = env->agents[i].observations;
+        obs[0] = x[i][0] - env->goal.x;
+        obs[1] = x[i][1] - env->goal.y;
+        obs[2] = x[i][2] - env->goal.z;
     }
 }
 
@@ -130,7 +159,7 @@ void reset_atom(Matsci* env, double** x, int i) {
     x[i][2] = rndf(-10.0f, 10.0f);
 }
 
-void c_reset(Matsci* env) {
+void puf_reset(Matsci* env) {
     void* handle = env->handle;
     double** x = (double **) lammps_extract_atom(handle, "x");
     for (int i=0; i<env->num_agents; i++) {
@@ -142,15 +171,15 @@ void c_reset(Matsci* env) {
     env->tick = 0;
 }
 
-void c_step(Matsci* env) {
+void puf_step(Matsci* env) {
     void* handle = env->handle;
     env->tick++;
 
     if (env->tick >= 1024) {
-        c_reset(env);
+        puf_reset(env);
         for (int i=0; i<env->num_agents; i++) {
-            env->rewards[i] = -1;
-            env->terminals[i] = 1;
+            env->agents[i].rewards[0] = -1;
+            env->agents[i].terminals[0] = 1;
             env->log.n += 1;
 	}
 	return;
@@ -158,12 +187,12 @@ void c_step(Matsci* env) {
 
     double **v = (double **) lammps_extract_atom(handle, "v");
     for (int i=0; i<env->num_agents; i++) {
-	env->rewards[i] = 0;
-	env->terminals[i] = 0;
+	env->agents[i].rewards[0] = 0;
+	env->agents[i].terminals[0] = 0;
 
-        v[i][0] = env->actions[3*i];
-        v[i][1] = env->actions[3*i + 1];
-        v[i][2] = env->actions[3*i + 2];
+        v[i][0] = env->agents[i].actions[0];
+        v[i][1] = env->agents[i].actions[1];
+        v[i][2] = env->agents[i].actions[2];
     }
 
     lammps_command(handle, "run 1");
@@ -175,15 +204,15 @@ void c_step(Matsci* env) {
 
         if (dist > 20.0f) {
             reset_atom(env, x, i);
-            env->rewards[i] = -1;
-            env->terminals[i] = 1;
+            env->agents[i].rewards[0] = -1;
+            env->agents[i].terminals[0] = 1;
             env->log.n += 1;
 	}
 
         if (dist < 1.0f) {
            reset_atom(env, x, i);
-           env->rewards[i] = 1;
-           env->terminals[i] = 1;
+           env->agents[i].rewards[0] = 1;
+           env->agents[i].terminals[0] = 1;
            env->log.score += 1;
            env->log.n += 1;
 	}
@@ -242,7 +271,7 @@ void handle_camera_controls(Client *client) {
     }
 }
 
-void c_close(Matsci* env) {
+void puf_close(Matsci* env) {
     /*
     if (IsWindowReady()) {
         CloseWindow();
@@ -250,7 +279,7 @@ void c_close(Matsci* env) {
     */
 }
 
-void c_render(Matsci* env) {
+void puf_render(Matsci* env) {
     if (!IsWindowReady()) {
         Client *client = (Client *)calloc(1, sizeof(Client));
 
@@ -279,13 +308,13 @@ void c_render(Matsci* env) {
     }
 
     if (WindowShouldClose()) {
-        c_close(env);
+        puf_close(env);
         exit(0);
     }
 
     if (IsKeyDown(KEY_ESCAPE)) {
 
-        c_close(env);
+        puf_close(env);
         exit(0);
     }
 
@@ -310,6 +339,7 @@ void c_render(Matsci* env) {
     DrawText("Mouse wheel: Zoom in/out", 10, 30, 16, PUFF_WHITE);
 
     EndDrawing();
+    puf_web_vsync();
 }
 
 

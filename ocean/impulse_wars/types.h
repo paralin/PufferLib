@@ -5,14 +5,17 @@
 #include "id_pool.h"
 #include "raylib.h"
 #include "rlights.h"
+#ifndef IMPULSE_WARS_OBS_T
+#define IMPULSE_WARS_OBS_T
+typedef uint8_t obs_t;
+#endif
+#include "pufferenv.h"
 
 #include "include/cc_array.h"
 
-#include "settings.h"
-
 #define _MAX_DRONES 4
 
-const uint8_t NUM_WALL_TYPES = 3;
+static const uint8_t NUM_WALL_TYPES = 3;
 
 #define MAX_TRAIL_POINTS 20
 #define MAX_DRONE_TRAIL_POINTS 20
@@ -55,7 +58,7 @@ typedef struct entity {
 } entity;
 
 #define _NUM_WEAPONS 10
-const uint8_t NUM_WEAPONS = _NUM_WEAPONS;
+static const uint8_t NUM_WEAPONS = _NUM_WEAPONS;
 
 enum weaponType {
     STANDARD_WEAPON,
@@ -334,13 +337,13 @@ typedef struct droneStats {
     float totalShotDistances;
 } droneStats;
 
-typedef struct Log {
+struct Log {
     float length;
     float ties;
     droneStats stats[_MAX_DRONES];
 
     float n;
-} Log;
+};
 
 typedef struct gameCamera {
     Camera3D camera3D;
@@ -411,7 +414,13 @@ typedef struct debugPoint {
     Color color;
 } debugPoint;
 
-typedef struct iwEnv {
+struct Env {
+    Agent agents[_MAX_DRONES];
+    int num_agents;
+    int tag;
+    int boundary_reached;
+    unsigned int rng;
+
     uint8_t numDrones;
     uint8_t numAgents;
     uint8_t numTeams;
@@ -493,6 +502,7 @@ typedef struct iwEnv {
     float renderScale;
     CC_Array *explosions;
     CC_Array *debugPoints;
-} iwEnv;
+};
+typedef struct Env iwEnv;
 
 #endif

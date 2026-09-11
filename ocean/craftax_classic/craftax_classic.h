@@ -1,7 +1,7 @@
 // Craftax-Classic environment for PufferLib Ocean.
 //
 // Single-header per-env implementation. PufferLib's vec layer owns the
-// observation/action/reward/terminal buffers and parallelizes c_step
+// observation/action/reward/terminal buffers and parallelizes puf_step
 // across env instances via OpenMP; this file never allocates its own
 // threads or batches.
 //
@@ -22,20 +22,32 @@
 // Action: 1 discrete in 0..16 (NOOP, 4 moves, DO, SLEEP,
 //         4 place, 3 make-pick, 3 make-sword).
 
-#pragma once
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdalign.h>
 #include <math.h>
+#if defined(__AVX512F__) || defined(__AVX2__)
 #include <immintrin.h>
+#endif
 #include "raylib.h"
+
+typedef float obs_t;
+#include "pufferenv.h"
+
+#define ACT_SIZES {17}
+#define OBS_SIZE 1345
+#define NUM_ATNS 1
 
 // ============================================================
 // Constants
 // ============================================================
 #define MAP_SIZE 64
-#define MAP_PACKED_ROW 32
+// 17 block types (0..16, including RIPE_PLANT). A nibble only holds 0..15, so
+// 2-blocks-per-byte packing turned every ripe plant into BLK_INVALID and
+// made ACH_EAT_PLANT unreachable.
+#define MAP_PACKED_ROW MAP_SIZE
 #define MAP_PACKED_SIZE (MAP_SIZE * MAP_PACKED_ROW)
 
 #define MAX_ZOMBIES 3
@@ -132,14 +144,14 @@ static inline int      cr_ri(uint64_t* s, int n) { return (int)(cr_pcg(s) % (uin
 // ============================================================
 // PufferLib-required structs
 // ============================================================
-typedef struct Log {
+struct Log {
     float perf;                         // 0-1 normalized progress (achievements / 22)
     float score;                        // sum of episode returns seen so far
     float episode_return;               // last episode return
     float episode_length;               // last episode length
     float achievements[NUM_ACHIEVEMENTS];
     float n;                            // required counter (last field)
-} Log;
+};
 
 typedef struct Client {
     int dummy;                          // handled by raylib globally; no per-env handle needed
@@ -148,21 +160,19 @@ typedef struct Client {
 // ============================================================
 // Env struct
 // ============================================================
-typedef struct CraftaxClassic {
+struct Env {
     Client* client;
     Log log;
-
-    float* observations;                // (OBS_DIM,) fp32, PufferLib-owned
-    float* actions;                     // (1,) fp32
-    float* rewards;                     // (1,)
-    float* terminals;                   // (1,)
+    Agent agents[1];
+    int tag;
+    int boundary_reached;
 
     int num_agents;                     // = 1
 
     unsigned int rng;                   // populated by default my_vec_init (env index)
     uint64_t pcg;                       // actual RNG state (seeded from rng in my_init)
 
-    // Packed map (2 blocks/byte)
+    // One block per byte (BLK_RIPE_PLANT = 16 does not fit in a nibble).
     uint8_t map_packed[MAP_PACKED_SIZE];
 
     // Per-type occupancy bitmaps: bit c of bits[r] = "mob-type at (r,c)"
@@ -217,21 +227,17 @@ typedef struct CraftaxClassic {
     // Scratch for per-step reward computation
     int8_t old_health;
     bool   old_achievements[NUM_ACHIEVEMENTS];
-} CraftaxClassic;
+};
+typedef Env CraftaxClassic;
 
 // ============================================================
 // Map accessors + small helpers
 // ============================================================
 static inline int8_t map_get(const CraftaxClassic* s, int r, int c) {
-    int idx = r * MAP_PACKED_ROW + (c >> 1);
-    uint8_t b = s->map_packed[idx];
-    return (c & 1) ? (int8_t)(b >> 4) : (int8_t)(b & 0x0F);
+    return (int8_t)s->map_packed[r * MAP_PACKED_ROW + c];
 }
 static inline void map_set(CraftaxClassic* s, int r, int c, int8_t v) {
-    int idx = r * MAP_PACKED_ROW + (c >> 1);
-    uint8_t b = s->map_packed[idx];
-    if (c & 1) s->map_packed[idx] = (b & 0x0F) | ((v & 0x0F) << 4);
-    else       s->map_packed[idx] = (b & 0xF0) | (v & 0x0F);
+    s->map_packed[r * MAP_PACKED_ROW + c] = (uint8_t)v;
 }
 static inline bool in_bounds(int r, int c) { return (unsigned)r < MAP_SIZE && (unsigned)c < MAP_SIZE; }
 static inline bool is_solid(int8_t b) {
@@ -284,13 +290,12 @@ static inline int get_damage(const CraftaxClassic* s) {
 // ============================================================
 static inline float perlin_interp(float t) { return t*t*t*(t*(t*6.0f-15.0f)+10.0f); }
 
-#if defined(__clang__) || defined(__GNUC__)
+#if defined(__AVX512F__) && (defined(__clang__) || defined(__GNUC__))
 __attribute__((target("avx512f,avx512bw,avx512dq,avx512vl")))
 #endif
 static void generate_world(CraftaxClassic* s) {
     // Reset maps and bitmaps
-    for (int i = 0; i < MAP_PACKED_SIZE; i++)
-        s->map_packed[i] = (uint8_t)(BLK_GRASS | (BLK_GRASS << 4));
+    memset(s->map_packed, BLK_GRASS, sizeof(s->map_packed));
     memset(s->mob_bits,    0, sizeof(s->mob_bits));
     memset(s->zombie_bits, 0, sizeof(s->zombie_bits));
     memset(s->cow_bits,    0, sizeof(s->cow_bits));
@@ -301,8 +306,8 @@ static void generate_world(CraftaxClassic* s) {
     // Padded by +16 floats so AVX-512 permute-load at the last grid row doesn't
     // read out of bounds.
     enum { GRID = 10, GRID_PAD = GRID * GRID + 16 };
-    _Alignas(64) float cos_a[4][GRID_PAD];
-    _Alignas(64) float sin_a[4][GRID_PAD];
+    alignas(64) float cos_a[4][GRID_PAD];
+    alignas(64) float sin_a[4][GRID_PAD];
     for (int layer = 0; layer < 4; layer++) {
         for (int i = 0; i < GRID * GRID; i++) {
             float a = cr_rf(&s->pcg) * 2.0f * 3.14159265f;
@@ -316,7 +321,8 @@ static void generate_world(CraftaxClassic* s) {
     float inv_scale = 1.0f / scale;
     int center = MAP_SIZE / 2;
 
-    _Alignas(64) float noise[4][MAP_SIZE][MAP_SIZE];
+    alignas(64) float noise[4][MAP_SIZE][MAP_SIZE];
+#if defined(__AVX512F__)
     {
         const __m512 c_lane = _mm512_setr_ps(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
         const __m512 one    = _mm512_set1_ps(1.0f);
@@ -382,6 +388,43 @@ static void generate_world(CraftaxClassic* s) {
             }
         }
     }
+#else
+    // Scalar fallback: native nvcc host compile does not define __AVX512F__,
+    // and emscripten/web has no AVX-512. 64x64 x 4 layers is cheap either way.
+    for (int r = 0; r < MAP_SIZE; r++) {
+        float nr = (float)r * inv_scale;
+        int x0 = (int)nr;
+        float fx = nr - x0;
+        float fx1 = fx - 1.0f;
+        float u = perlin_interp(fx);
+        int row0 = x0 * GRID, row1 = row0 + GRID;
+        for (int c = 0; c < MAP_SIZE; c++) {
+            float nc = (float)c * inv_scale;
+            int y0 = (int)nc;
+            float fy = nc - (float)y0;
+            float fy1 = fy - 1.0f;
+            float v = perlin_interp(fy);
+            int y1 = y0 + 1;
+            for (int k = 0; k < 4; k++) {
+                float c00 = cos_a[k][row0 + y0];
+                float c10 = cos_a[k][row1 + y0];
+                float c01 = cos_a[k][row0 + y1];
+                float c11 = cos_a[k][row1 + y1];
+                float s00 = sin_a[k][row0 + y0];
+                float s10 = sin_a[k][row1 + y0];
+                float s01 = sin_a[k][row0 + y1];
+                float s11 = sin_a[k][row1 + y1];
+                float n00 = c00 * fx  + s00 * fy;
+                float n10 = c10 * fx1 + s10 * fy;
+                float n01 = c01 * fx  + s01 * fy1;
+                float n11 = c11 * fx1 + s11 * fy1;
+                float nx0 = n00 + u * (n10 - n00);
+                float nx1 = n01 + u * (n11 - n01);
+                noise[k][r][c] = (nx0 + v * (nx1 - nx0) + 1.0f) * 0.5f;
+            }
+        }
+    }
+#endif
 
     // Tile-logic sweep -- reads precomputed noise, writes blocks
     for (int r = 0; r < MAP_SIZE; r++) {
@@ -830,10 +873,10 @@ static void update_intrinsics(CraftaxClassic* s, int action) {
 }
 
 // ============================================================
-// Observation builder (writes OBS_DIM floats into env->observations)
+// Observation builder (writes OBS_DIM floats into (env->agents[0].observations))
 // ============================================================
 static void compute_observations(CraftaxClassic* s) {
-    float* obs = s->observations;
+    float* obs = s->agents[0].observations;
     int pr = s->player_r, pc = s->player_c;
     int idx = 0;
     for (int dr = -3; dr <= 3; dr++) {
@@ -890,7 +933,7 @@ static void add_log(CraftaxClassic* env) {
 }
 
 // ============================================================
-// Public API: c_init / c_reset / c_step / c_close / c_render
+// Public API: c_init / puf_reset / puf_step / puf_close / puf_render
 // ============================================================
 static void c_init(CraftaxClassic* env) {
     env->num_agents = 1;
@@ -904,18 +947,18 @@ static void c_init(CraftaxClassic* env) {
     memset(&env->log, 0, sizeof(env->log));
 }
 
-static void c_reset(CraftaxClassic* env) {
+void puf_reset(CraftaxClassic* env) {
     env->episode_return_accum = 0.0f;
     env->episode_length_accum = 0;
     generate_world(env);
     compute_observations(env);
 }
 
-static void c_step(CraftaxClassic* env) {
-    env->rewards[0] = 0.0f;
-    env->terminals[0] = 0.0f;
+void puf_step(CraftaxClassic* env) {
+    env->agents[0].rewards[0] = 0.0f;
+    env->agents[0].terminals[0] = 0.0f;
 
-    int action = (int)env->actions[0];
+    int action = (int)env->agents[0].actions[0];
     if (action < 0) action = 0;
     if (action >= NUM_ACTIONS) action = NUM_ACTIONS - 1;
 
@@ -947,7 +990,7 @@ static void c_step(CraftaxClassic* env) {
         ach_r += (float)(env->achievements[i] && !env->old_achievements[i]);
     float hp_r = (float)(env->health - env->old_health) * 0.1f;
     float r = ach_r + hp_r;
-    env->rewards[0] = r;
+    env->agents[0].rewards[0] = r;
     env->episode_return_accum += r;
     env->episode_length_accum += 1;
 
@@ -957,22 +1000,21 @@ static void c_step(CraftaxClassic* env) {
         && map_get(env, env->player_r, env->player_c) == BLK_LAVA) done = true;
 
     if (done) {
-        env->terminals[0] = 1.0f;
+        env->agents[0].terminals[0] = 1.0f;
         add_log(env);
-        c_reset(env);   // auto-reset (observation written inside)
+        puf_reset(env);   // auto-reset (observation written inside)
     } else {
         compute_observations(env);
     }
 }
 
-static void c_close(CraftaxClassic* env) {
-    (void)env;
+void puf_close(CraftaxClassic* env) {
 }
 
 // ============================================================
-// Tile-based renderer sharing the full-Craftax textures.bin
+// Tile-based renderer sharing resources/craftax/textures.png
 // ============================================================
-// Shared layout (see ocean/craftax/pack_textures.py):
+// Sprite sheet: 16x16 RGBA tiles, 16 columns.
 //   [0..36]  block textures (first 17 used by classic, indexed by BLK_*)
 //   [37..41] player: down, up, left, right, sleep
 //   [42..46] items (unused by classic)
@@ -980,8 +1022,8 @@ static void c_close(CraftaxClassic* env) {
 //   [50..53] arrows: down, up, left, right
 
 #include <stdio.h>
-
 #define CC_TEX_TILE_PX 16
+#define CC_TEX_SHEET_COLS 16
 #define CC_TEX_SCALE 4
 #define CC_TEX_DRAW_PX (CC_TEX_TILE_PX * CC_TEX_SCALE)
 #define CC_TEX_NUM (37 + 5 + 5 + 3 + 4)
@@ -1002,44 +1044,27 @@ static void c_close(CraftaxClassic* env) {
 #define CC_RENDER_ROWS 16
 #define CC_RENDER_COLS 16
 
-static Texture2D cc_textures[CC_TEX_NUM];
+static Texture2D cc_textures;
 static bool cc_textures_loaded = false;
 
 static void cc_load_textures(void) {
     if (cc_textures_loaded) return;
     const char* candidates[] = {
-        "resources/craftax/textures.bin",
-        "../resources/craftax/textures.bin",
-        "../../resources/craftax/textures.bin",
+        "resources/craftax/textures.png",
+        "../resources/craftax/textures.png",
+        "../../resources/craftax/textures.png",
     };
-    FILE* f = NULL;
     for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
-        f = fopen(candidates[i], "rb");
-        if (f) break;
+        if (FileExists(candidates[i])) {
+            cc_textures = LoadTexture(candidates[i]);
+            break;
+        }
     }
-    if (!f) {
-        fprintf(stderr, "craftax_classic: textures.bin not found in resources/craftax -- run ocean/craftax/pack_textures.py\n");
+    if (cc_textures.id == 0) {
+        fprintf(stderr, "craftax_classic: textures.png not found in resources/craftax\n");
         exit(1);
     }
-    const size_t tile_bytes = CC_TEX_TILE_PX * CC_TEX_TILE_PX * 4;
-    uint8_t* buf = (uint8_t*)malloc(tile_bytes);
-    for (int i = 0; i < CC_TEX_NUM; i++) {
-        if (fread(buf, 1, tile_bytes, f) != tile_bytes) {
-            fprintf(stderr, "craftax_classic: short read on textures.bin at tile %d\n", i);
-            exit(1);
-        }
-        Image img = {
-            .data = buf,
-            .width = CC_TEX_TILE_PX,
-            .height = CC_TEX_TILE_PX,
-            .mipmaps = 1,
-            .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
-        };
-        cc_textures[i] = LoadTextureFromImage(img);
-        SetTextureFilter(cc_textures[i], TEXTURE_FILTER_POINT);
-    }
-    free(buf);
-    fclose(f);
+    SetTextureFilter(cc_textures, TEXTURE_FILTER_POINT);
     cc_textures_loaded = true;
 }
 
@@ -1063,12 +1088,17 @@ static int cc_arrow_tex_id(int8_t dr, int8_t dc) {
 
 static void cc_draw_tile(int tex_id, int dst_x, int dst_y) {
     if (tex_id < 0 || tex_id >= CC_TEX_NUM) return;
-    Rectangle src = {0, 0, CC_TEX_TILE_PX, CC_TEX_TILE_PX};
+    Rectangle src = {
+        (float)((tex_id % CC_TEX_SHEET_COLS) * CC_TEX_TILE_PX),
+        (float)((tex_id / CC_TEX_SHEET_COLS) * CC_TEX_TILE_PX),
+        (float)CC_TEX_TILE_PX,
+        (float)CC_TEX_TILE_PX,
+    };
     Rectangle dst = {(float)dst_x, (float)dst_y, CC_TEX_DRAW_PX, CC_TEX_DRAW_PX};
-    DrawTexturePro(cc_textures[tex_id], src, dst, (Vector2){0, 0}, 0.0f, WHITE);
+    DrawTexturePro(cc_textures, src, dst, (Vector2){0, 0}, 0.0f, WHITE);
 }
 
-static void c_render(CraftaxClassic* env) {
+void puf_render(CraftaxClassic* env) {
     const int view_w = CC_RENDER_COLS * CC_TEX_DRAW_PX;
     const int view_h = CC_RENDER_ROWS * CC_TEX_DRAW_PX;
     const int hud_h = 60;
@@ -1160,4 +1190,33 @@ static void c_render(CraftaxClassic* env) {
              env->inv[6], env->inv[7], env->inv[8], env->inv[9], env->inv[10], env->inv[11]),
              4, hud_y + 40, 12, (Color){180, 180, 180, 255});
     EndDrawing();
+    puf_web_vsync();
 }
+
+// --- Native trainer (pufferl) API ---
+void puf_log(Log* log, Dict* out) {
+    dict_set(out, "perf", log->perf);
+    dict_set(out, "score", log->score);
+    dict_set(out, "episode_return", log->episode_return);
+    dict_set(out, "episode_length", log->episode_length);
+    static const char* ACH_NAMES[NUM_ACHIEVEMENTS] = {
+        "collect_wood",   "place_table",    "eat_cow",       "collect_sapling",
+        "collect_drink",  "make_wood_pick", "make_wood_sword","place_plant",
+        "defeat_zombie",  "collect_stone",  "place_stone",   "eat_plant",
+        "defeat_skeleton","make_stone_pick","make_stone_sword","wake_up",
+        "place_furnace",  "collect_coal",   "collect_iron",  "collect_diamond",
+        "make_iron_pick", "make_iron_sword",
+    };
+    for (int i = 0; i < NUM_ACHIEVEMENTS; i++) {
+        dict_set(out, ACH_NAMES[i], log->achievements[i]);
+    }
+    dict_set(out, "n", log->n);
+}
+
+void puf_init(Env* env, Dict* kwargs) {
+    env->num_agents = 1;
+    env->agents[0].action_mask = NULL;
+    env->agents[0].policy = 0;
+    c_init(env);
+}
+

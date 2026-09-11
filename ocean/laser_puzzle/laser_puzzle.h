@@ -3,9 +3,12 @@
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
+#include <assert.h>
 
 #include "raylib.h"
 #include "level_generation/puzzle_types.h"
+typedef unsigned char obs_t;
+#include "pufferenv.h"
 
 #define BOARD_IDX(cols, r, c) ((r) * (cols) + (c))
 #define LASER_PUZZLE_LEVELS_PATH "resources/laser_puzzle/laser_puzzle_levels.bin"
@@ -25,18 +28,23 @@
 #define INNER_COLS (INIT_COLS - 2)
 #define NUM_ACTIONS (ACTIONS_PER_CELL * INNER_ROWS * INNER_COLS)
 
+#define ACT_SIZES {NUM_ACTIONS}
+#define OBS_SIZE (INIT_ROWS * INIT_COLS)
+#define NUM_ATNS 1
+#define PUF_STEPS_PER_SEC 3
+
 static const int CELL_SIZE = 80;
 static const Color LASER_COLORS[] = {SKYBLUE, RED, GREEN, YELLOW, BLUE, ORANGE, PURPLE, MAGENTA};
 
 // Required struct. Only use floats!
-typedef struct {
+struct Log {
     float perf; // Recommended 0-1 normalized single real number perf metric
     float score; // Recommended unnormalized single real number perf metric
     float episode_return; // Recommended metric: sum of agent rewards over episode
     float episode_length; // Recommended metric: number of steps of agent episode
     // Any extra fields you add here may be exported in binding.c
     float n; // Required as the last field
-} Log;
+};
 
 typedef struct {
     Texture2D sprites;
@@ -51,14 +59,12 @@ typedef struct {
     Cell puzzle[INIT_ROWS][INIT_COLS];
 } LaserPuzzleLevel;
 
-typedef struct {
+struct Env {
     Log log;  // only stores results for completed episodes
+    Agent agents[1];
+    int tag;
+    int boundary_reached;
     Client* client;
-
-    unsigned char* observations;
-    float* actions;
-    float* rewards;
-    float* terminals;
 
     // vecenv uses num_agents and rng; owns_buffers prevents freeing vecenv-owned buffers.
     int num_agents;
@@ -81,16 +87,18 @@ typedef struct {
     int optimal_mirrors;
     int num_levels;
     LaserPuzzleLevel* levels;
-    int pending_reset;
-} LaserPuzzle;
+};
+typedef Env LaserPuzzle;
 
 void load_laser_puzzle_levels(LaserPuzzle* env, const char* path) {
     FILE* file = fopen(path, "rb");
+    assert(file);
 
     uint32_t header[3] = {0};
-    fread(header, sizeof(uint32_t), 3, file);
+    assert(fread(header, sizeof(uint32_t), 3, file) == 3);
 
     int level_count = (int)header[2];
+    assert(level_count > 0);
     LaserPuzzleLevel* levels = (LaserPuzzleLevel*)calloc((size_t)level_count, sizeof(LaserPuzzleLevel));
 
     for (int i = 0; i < level_count; i++) {
@@ -114,54 +122,10 @@ void load_laser_puzzle_levels(LaserPuzzle* env, const char* path) {
     env->num_levels = level_count;
 }
 
-
-// This allocate function only runs in the standalone demo since puffer vecenv already allocates memory.
-void allocate(LaserPuzzle* env) {
-    env->ROWS = INIT_ROWS;
-    env->COLS = INIT_COLS;
-    env->max_steps = NUM_ACTIONS;
-    env->num_agents = 1;
-    env->rng = 0;
-
-    env->board = (Cell*)calloc(env->ROWS * env->COLS, sizeof(Cell));
-    load_laser_puzzle_levels(env, LASER_PUZZLE_LEVELS_PATH);
-    if (env->observations == NULL) {
-        env->observations = (unsigned char*)calloc(env->ROWS * env->COLS, sizeof(unsigned char));
-        env->actions = (float*)calloc(1, sizeof(float));
-        env->rewards = (float*)calloc(1, sizeof(float));
-        env->terminals = (float*)calloc(1, sizeof(float));
-        env->owns_buffers = 1;
-    }
-}
-
-// Called from c_close in both standalone and vecenv modes.
-void deallocate(LaserPuzzle* env) {
-    free(env->board);
-    free(env->levels);
-
-    // check if we are in the standalone demo or puffer owns the buffers
-    if (env->owns_buffers) {
-        free(env->observations);
-        free(env->actions);
-        free(env->rewards);
-        free(env->terminals);
-    }
-
-    env->board = NULL;
-    env->levels = NULL;
-    env->observations = NULL;
-    env->actions = NULL;
-    env->rewards = NULL;
-    env->terminals = NULL;
-    env->num_levels = 0;
-
-    env->owns_buffers = 0;
-}
-
 Client* make_client() {
     Client* client = (Client*)calloc(1, sizeof(Client));
     InitWindow(800, 700, "laser puzzle");
-    SetTargetFPS(2);
+    SetTargetFPS(60);
 
     client->sprites = LoadTexture("resources/shared/puffers.png");
     client->font = LoadFontEx("resources/shared/JetBrainsMono-SemiBold.ttf", 32, NULL, 0);
@@ -180,14 +144,12 @@ void close_client(Client* client) {
     free(client);
 }
 
-// free alocated memory, unload raylib resources
-void c_close(LaserPuzzle* env) {
+void puf_close(LaserPuzzle* env) {
     if (env->client != NULL) {
         close_client(env->client);
-        env->client = NULL;
     }
-
-    deallocate(env);
+    free(env->board);
+    free(env->levels);
 }
 
 void add_log(LaserPuzzle* env) {
@@ -211,7 +173,7 @@ void add_log(LaserPuzzle* env) {
 }
 
 void apply_action(LaserPuzzle* env) {
-    int action = (int)env->actions[0];
+    int action = (int)env->agents[0].actions[0];
 
     int cell_idx = action / ACTIONS_PER_CELL;      // 0..15 (for a 6x6 grid)
     int mirror_action = action % ACTIONS_PER_CELL; // 0..2
@@ -224,8 +186,8 @@ void apply_action(LaserPuzzle* env) {
     cell->mirror = (MirrorState)mirror_action;
 }
 
-
 void compute_observations(LaserPuzzle* env) {
+    obs_t* obs_buf = env->agents[0].observations;
     for (int r = 0; r < env->ROWS; r++) {
         for (int c = 0; c < env->COLS; c++) {
             Cell cell = env->board[BOARD_IDX(env->COLS, r, c)];
@@ -241,19 +203,18 @@ void compute_observations(LaserPuzzle* env) {
                 obs = OBS_MIRROR_LEFT;
             }
 
-            env->observations[BOARD_IDX(env->COLS, r, c)] = obs;
+            obs_buf[BOARD_IDX(env->COLS, r, c)] = obs;
         }
     }
 }
 
-// reset the env state (ignore rewards, terminals --> handled by c_step)
-void c_reset(LaserPuzzle* env) {
+// reset the env state (ignore rewards, terminals --> handled by puf_step)
+void puf_reset(LaserPuzzle* env) {
     env->sinks_found = 0;
     env->mirrors_placed = 0;
     env->moves_made = 0;
     env->episode_length = 0;
     env->episode_return = 0.0f;
-    env->pending_reset = 0;
 
     memset(env->sink_hit_before, 0, sizeof(env->sink_hit_before));
 
@@ -267,11 +228,34 @@ void c_reset(LaserPuzzle* env) {
     compute_observations(env);
 }
 
+// Hold Left Shift + click a cell to cycle its mirror.
+static int laser_puzzle_human_controls(LaserPuzzle *env) {
+    if (!IsWindowReady() || !IsKeyDown(KEY_LEFT_SHIFT)) {
+        return 0;
+    }
+    if (!IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+        return -1;
+    }
+    int gridWidth = env->COLS * CELL_SIZE;
+    int gridHeight = env->ROWS * CELL_SIZE;
+    int offsetX = (GetScreenWidth() - gridWidth) / 2;
+    int offsetY = (GetScreenHeight() - gridHeight) / 2;
+    Vector2 mouse = GetMousePosition();
+    int c = ((int)mouse.x - offsetX) / CELL_SIZE;
+    int r = ((int)mouse.y - offsetY) / CELL_SIZE;
+    if (r >= 1 && r < env->ROWS - 1 && c >= 1 && c < env->COLS - 1) {
+        Cell* cell = &env->board[BOARD_IDX(env->COLS, r, c)];
+        int mirror_action = (cell->mirror + 1) % ACTIONS_PER_CELL;
+        int cell_idx = (r - 1) * INNER_COLS + (c - 1);
+        env->agents[0].actions[0] = (float)(cell_idx * ACTIONS_PER_CELL + mirror_action);
+        return 1;
+    }
+    return -1;
+}
+
 // advance state
-void c_step(LaserPuzzle* env) {
-    if (env->client && env->pending_reset) {
-        // When we have a client, since we deferred reset to display the terminal state, reset now. This also menas we are skipping an action given by puffernet. Not really an issue since this block only runs with puffer eval and standalone demo, not in training
-        c_reset(env);
+void puf_step(LaserPuzzle* env) {
+    if (laser_puzzle_human_controls(env) < 0) {
         return;
     }
 
@@ -337,30 +321,25 @@ void c_step(LaserPuzzle* env) {
     // handle the rewards, episode_length, terminal, episode_return
     // rewards: +1 for ending the episode optimally (minimal mirrors), +0.6 for ending the episode suboptimally, -0.01 per move, +0.3 for first time laser hit
     env->episode_length++;
-    env->rewards[0] = 0.3f * (float)new_sinks_hit;
-    env->terminals[0] = 0.0f;
+    env->agents[0].rewards[0] = 0.3f * (float)new_sinks_hit;
+    env->agents[0].terminals[0] = 0.0f;
 
     if (env->sinks_found == env->total_sinks) {
-        env->terminals[0] = 1.0f;
+        env->agents[0].terminals[0] = 1.0f;
         if (env->mirrors_placed == env->optimal_mirrors) {
-            env->rewards[0] += 1.0f;
+            env->agents[0].rewards[0] += 1.0f;
         } else {
-            env->rewards[0] += 0.6f;
+            env->agents[0].rewards[0] += 0.6f;
         }
     } else if (env->episode_length >= env->max_steps) {
-        env->terminals[0] = 1.0f;
+        env->agents[0].terminals[0] = 1.0f;
     }
 
-    env->episode_return += env->rewards[0];
+    env->episode_return += env->agents[0].rewards[0];
 
-    if (env->terminals[0]) {
-        // we defer reset so that client can display the terminal state without it being immediately reset
+    if (env->agents[0].terminals[0]) {
         add_log(env);
-        if (env->client) {
-            env->pending_reset = 1;
-        } else {
-            c_reset(env);
-        }
+        puf_reset(env);
     }
 
     compute_observations(env);
@@ -440,7 +419,7 @@ void draw_lasers(LaserPuzzle *env) {
     }
 }
 
-void c_render(LaserPuzzle* env) {
+void puf_render(LaserPuzzle* env) {
     // this client loading here and "escape key to shutdown" is Puffer convention, needs to be like this for
     // puffer eval to work.
     if (env->client == NULL) {
@@ -453,9 +432,11 @@ void c_render(LaserPuzzle* env) {
         exit(0);
     }
 
+    laser_puzzle_human_controls(env);
+
     BeginDrawing();
 
-    ClearBackground((Color){10, 12, 24, 255});
+    ClearBackground((Color){6, 24, 24, 255});
 
     // draw the centered grid
     int gridWidth = env->COLS * CELL_SIZE;
@@ -463,57 +444,78 @@ void c_render(LaserPuzzle* env) {
     int offsetX = (GetScreenWidth() - gridWidth) / 2;
     int offsetY = (GetScreenHeight() - gridHeight) / 2;
 
-    for (int r = 0; r < env->ROWS; r++) {
-        for (int c = 0; c < env->COLS; c++) {
+    // Fixed layers (back → front). Do not mix types in one grid walk or
+    // later cells paint over earlier ones.
+    for (int r = 1; r < env->ROWS - 1; r++) {
+        for (int c = 1; c < env->COLS - 1; c++) {
             int x = offsetX + c * CELL_SIZE;
             int y = offsetY + r * CELL_SIZE;
+            DrawLineEx((Vector2){x + 20, y + 20}, (Vector2){x + CELL_SIZE - 20, y + CELL_SIZE - 20}, 2, Fade(LIGHTGRAY, 0.55f));
+            DrawLineEx((Vector2){x + CELL_SIZE - 20, y + 20}, (Vector2){x + 20, y + CELL_SIZE - 20}, 2, Fade(LIGHTGRAY, 0.55f));
+        }
+    }
 
-            // draw the grey "X" for the mirrors (exclude border cells)
-            if (r > 0 && r < env->ROWS - 1 && c > 0 && c < env->COLS - 1) {
-                DrawLineEx((Vector2){x + 20, y + 20}, (Vector2){x + CELL_SIZE - 20, y + CELL_SIZE - 20}, 2, Fade(GRAY, 0.25f));
-                DrawLineEx((Vector2){x + CELL_SIZE - 20, y + 20}, (Vector2){x + 20, y + CELL_SIZE - 20}, 2, Fade(GRAY, 0.25f));
-            }
+    draw_lasers(env);
 
+    for (int r = 0; r < env->ROWS; r++) {
+        for (int c = 0; c < env->COLS; c++) {
             Cell cell = env->board[BOARD_IDX(env->COLS, r, c)];
-
+            if (cell.mirror == MIRROR_NONE) {
+                continue;
+            }
+            int x = offsetX + c * CELL_SIZE;
+            int y = offsetY + r * CELL_SIZE;
             if (cell.mirror == MIRROR_LEFT) {
                 DrawLineEx((Vector2){x + 10, y + 10}, (Vector2){x + CELL_SIZE - 10, y + CELL_SIZE - 10}, 12, Fade(VIOLET, 0.55f));
                 DrawLineEx((Vector2){x + 10, y + 10}, (Vector2){x + CELL_SIZE - 10, y + CELL_SIZE - 10}, 8, Fade(SKYBLUE, 0.9f));
                 DrawLineEx((Vector2){x + 10, y + 10}, (Vector2){x + CELL_SIZE - 10, y + CELL_SIZE - 10}, 4, BLACK);
-            } else if (cell.mirror == MIRROR_RIGHT) {
+            } else {
                 DrawLineEx((Vector2){x + CELL_SIZE - 10, y + 10}, (Vector2){x + 10, y + CELL_SIZE - 10}, 12, Fade(VIOLET, 0.55f));
                 DrawLineEx((Vector2){x + CELL_SIZE - 10, y + 10}, (Vector2){x + 10, y + CELL_SIZE - 10}, 8, Fade(SKYBLUE, 0.9f));
                 DrawLineEx((Vector2){x + CELL_SIZE - 10, y + 10}, (Vector2){x + 10, y + CELL_SIZE - 10}, 4, BLACK);
-            } else if (cell.type == LASER) {
-                int spriteIndex = cell.id % 8;
-                Rectangle source = {spriteIndex * 64.0f, 392.0f, 64.0f, 46.0f};
-                Rectangle dest = {x + CELL_SIZE / 2.0f, y + CELL_SIZE / 2.0f, 64.0f, 46.0f};
-
-                // need to make sure pufferfish are facing the right direction
-                Vector2 origin = {32.0f, 23.0f};
-                float rotation = 0.0f;
-
-                if (r == 0) {
-                    rotation = 90.0f;
-                } else if (r == env->ROWS - 1) {
-                    rotation = -90.0f;
-                } else if (c == env->COLS - 1) {
-                    rotation = 180.0f;
-                    source.height = -source.height;
-                }
-
-                DrawTexturePro(client->sprites, source, dest, origin, rotation, WHITE);
-            } else if (cell.type == SENSOR) {
-                int spriteIndex = cell.id % 8;
-                Rectangle source = {spriteIndex * 64.0f, 529.0f, 64.0f, 30.0f};
-                Rectangle dest = {x + 12.0f, y + 24.0f, 56.0f, 26.0f};
-                DrawTexturePro(client->sprites, source, dest, (Vector2){0}, 0.0f, WHITE);
             }
         }
     }
 
-    // draw the lasers
-    draw_lasers(env);
+    for (int r = 0; r < env->ROWS; r++) {
+        for (int c = 0; c < env->COLS; c++) {
+            Cell cell = env->board[BOARD_IDX(env->COLS, r, c)];
+            if (cell.type != SENSOR) {
+                continue;
+            }
+            int x = offsetX + c * CELL_SIZE;
+            int y = offsetY + r * CELL_SIZE;
+            int spriteIndex = cell.id % 8;
+            Rectangle source = {spriteIndex * 64.0f, 529.0f, 64.0f, 30.0f};
+            Rectangle dest = {x + 12.0f, y + 24.0f, 56.0f, 26.0f};
+            DrawTexturePro(client->sprites, source, dest, (Vector2){0}, 0.0f, WHITE);
+        }
+    }
+
+    for (int r = 0; r < env->ROWS; r++) {
+        for (int c = 0; c < env->COLS; c++) {
+            Cell cell = env->board[BOARD_IDX(env->COLS, r, c)];
+            if (cell.type != LASER) {
+                continue;
+            }
+            int x = offsetX + c * CELL_SIZE;
+            int y = offsetY + r * CELL_SIZE;
+            int spriteIndex = cell.id % 8;
+            Rectangle source = {spriteIndex * 64.0f, 392.0f, 64.0f, 46.0f};
+            Rectangle dest = {x + CELL_SIZE / 2.0f, y + CELL_SIZE / 2.0f, 64.0f, 46.0f};
+            Vector2 origin = {32.0f, 23.0f};
+            float rotation = 0.0f;
+            if (r == 0) {
+                rotation = 90.0f;
+            } else if (r == env->ROWS - 1) {
+                rotation = -90.0f;
+            } else if (c == env->COLS - 1) {
+                rotation = 180.0f;
+                source.height = -source.height;
+            }
+            DrawTexturePro(client->sprites, source, dest, origin, rotation, WHITE);
+        }
+    }
 
     // draw the sinks found and mirrors used
     const float fontSize = 32.0f;
@@ -540,4 +542,27 @@ void c_render(LaserPuzzle* env) {
     }
 
     EndDrawing();
+    puf_web_vsync();
 }
+
+// --- Native trainer (pufferl) API ---
+void puf_log(Log* log, Dict* out) {
+    dict_set(out, "perf", log->perf);
+    dict_set(out, "score", log->score);
+    dict_set(out, "episode_return", log->episode_return);
+    dict_set(out, "episode_length", log->episode_length);
+    dict_set(out, "n", log->n);
+}
+
+void puf_init(Env* env, Dict* kwargs) {
+    env->num_agents = 1;
+    env->ROWS = INIT_ROWS;
+    env->COLS = INIT_COLS;
+    env->max_steps = NUM_ACTIONS;
+    env->owns_buffers = 0;
+    env->agents[0].action_mask = NULL;
+    env->agents[0].policy = 0;
+    env->board = (Cell*)calloc(env->ROWS * env->COLS, sizeof(Cell));
+    load_laser_puzzle_levels(env, LASER_PUZZLE_LEVELS_PATH);
+}
+

@@ -6,6 +6,17 @@
 #include <string.h>
 #include "raylib.h"
 #include "freeway_levels.h"
+typedef float obs_t;
+#include "pufferenv.h"
+
+#define ACT_SIZES {3}
+// Self (4) + 4 relative lanes * 2 nearest cars * 4 feats.
+// Lanes: prev, curr, next, next+1. Car feats: present, wrap-dx, width, vx.
+#define OBS_LANE_WINDOW 4
+#define OBS_CARS_PER_LANE 2
+#define OBS_CAR_FEATS 4
+#define OBS_SIZE (4 + OBS_LANE_WINDOW * OBS_CARS_PER_LANE * OBS_CAR_FEATS)
+#define NUM_ATNS 1
 
 #define min(a, b) (((a) < (b)) ? (a) : (b))
 #define max(a, b) (((a) > (b)) ? (a) : (b))
@@ -65,15 +76,13 @@ struct FreewayEnemy {
 };
 
 typedef struct Client Client;
-typedef struct Freeway Freeway;
-struct Freeway {
+struct Env {
     Client* client;
     Log log;
-    float* observations;
-    float* actions;
+    Agent agents[1];
+    int tag;
+    int boundary_reached;
     int* human_actions;
-    float* rewards;
-    float* terminals;
     int num_agents;
 
     FreewayPlayer ai_player; // Player-Related
@@ -104,6 +113,7 @@ struct Freeway {
     int enable_human_player;
     unsigned int rng;
 };
+typedef Env Freeway;
 
 void load_level(Freeway* env, int level) {
     FreewayEnemy* enemy;
@@ -159,25 +169,9 @@ void init(Freeway* env) {
     load_level(env, env->level);
 }
 
-void allocate(Freeway* env) {
-    init(env);
-    env->observations = (float*)calloc(4 + NUM_LANES*MAX_ENEMIES_PER_LANE, sizeof(float));
-    env->actions = (float*)calloc(1, sizeof(float));
-    env->rewards = (float*)calloc(1, sizeof(float));
-    env->terminals = (float*)calloc(1, sizeof(float));
-}
-
-void c_close(Freeway* env) {
+void puf_close(Freeway* env) {
     free(env->human_actions);
     free(env->enemies);
-}
-
-void free_allocated(Freeway* env) {
-    free(env->actions);
-    free(env->observations);
-    free(env->terminals);
-    free(env->rewards);
-    c_close(env);
 }
 
 void add_log(Freeway* env) {
@@ -191,24 +185,71 @@ void add_log(Freeway* env) {
 }
 
 void compute_observations(Freeway* env) {
-    env->observations[0] = env->ai_player.player_y / env->height;
-    env->observations[1] = env->ai_player.best_lane_idx /(float) NUM_LANES;
-    env->observations[2] = env->ai_player.score / (float) HUMAN_HIGH_SCORE[env->level];
-    env->observations[3] = (env->ai_player.ticks_stunts_left  > 0);
+    obs_t* obs = env->agents[0].observations;
+    float lane_f = (env->road_start - env->ai_player.player_y) / env->lane_size;
+    float lane_floor = floorf(lane_f);
+    int curr_lane = (int)lane_floor;
+    float vmax = SPEED_VALUES[5] * TICK_RATE * env->width;
+    float px = env->ai_player.player_x;
 
-    FreewayEnemy* enemy;
-    for (int lane = 0; lane < NUM_LANES; lane++) {
-        for (int i = 0; i < MAX_ENEMIES_PER_LANE; i++){
-            enemy = &env->enemies[lane*MAX_ENEMIES_PER_LANE + i];
-            if (enemy->is_enabled){
-                env->observations[4 + lane * MAX_ENEMIES_PER_LANE + i] = enemy->enemy_x / env->width;
-                env->observations[4 + lane * MAX_ENEMIES_PER_LANE + i] += (lane < NUM_LANES/2 ? enemy->enemy_height/(2 * env->width): -enemy->enemy_height/(2 * env->width));
-            }
-            else {
-                env->observations[4 + lane * MAX_ENEMIES_PER_LANE + i] = 0.0f;
+    obs[0] = env->ai_player.player_y / env->height;
+    obs[1] = env->ai_player.ticks_stunts_left > 0;
+    obs[2] = lane_f - lane_floor;
+    obs[3] = lane_f / (float)NUM_LANES;
+
+    // Relative lanes: prev, curr, next, next+1. Missing lane / no car:
+    // present=0, dx=+1 (real wrap-dx is in [-0.5, 0.5]).
+    int offsets[OBS_LANE_WINDOW] = {-1, 0, 1, 2};
+    for (int w = 0; w < OBS_LANE_WINDOW; w++) {
+        int lane = curr_lane + offsets[w];
+        float best_abs[OBS_CARS_PER_LANE];
+        float best_dx[OBS_CARS_PER_LANE];
+        int best_i[OBS_CARS_PER_LANE];
+        for (int r = 0; r < OBS_CARS_PER_LANE; r++) {
+            best_abs[r] = 1e9f;
+            best_dx[r] = 0.0f;
+            best_i[r] = -1;
+        }
+        if (lane >= 0 && lane < NUM_LANES) {
+            for (int i = 0; i < MAX_ENEMIES_PER_LANE; i++) {
+                FreewayEnemy* e = &env->enemies[lane * MAX_ENEMIES_PER_LANE + i];
+                if (!e->is_enabled) {
+                    continue;
+                }
+                float dx = e->enemy_x - px;
+                dx -= env->width * floorf((dx + 0.5f * env->width) / env->width);
+                float adx = fabsf(dx);
+                if (adx < best_abs[0]) {
+                    best_abs[1] = best_abs[0];
+                    best_dx[1] = best_dx[0];
+                    best_i[1] = best_i[0];
+                    best_abs[0] = adx;
+                    best_dx[0] = dx;
+                    best_i[0] = i;
+                } else if (adx < best_abs[1]) {
+                    best_abs[1] = adx;
+                    best_dx[1] = dx;
+                    best_i[1] = i;
+                }
             }
         }
-    }   
+        for (int r = 0; r < OBS_CARS_PER_LANE; r++) {
+            int o = 4 + (w * OBS_CARS_PER_LANE + r) * OBS_CAR_FEATS;
+            if (best_i[r] < 0) {
+                obs[o + 0] = 0.0f;
+                obs[o + 1] = 1.0f;
+                obs[o + 2] = 0.0f;
+                obs[o + 3] = 0.0f;
+            } else {
+                FreewayEnemy* e = &env->enemies[
+                    lane * MAX_ENEMIES_PER_LANE + best_i[r]];
+                obs[o + 0] = 1.0f;
+                obs[o + 1] = best_dx[r] / env->width;
+                obs[o + 2] = e->enemy_width / (float)env->width;
+                obs[o + 3] = e->enemy_vx / vmax;
+            }
+        }
+    }
 }
 
 void spawn_enemies(Freeway* env) {
@@ -348,7 +389,7 @@ void step_player(Freeway* env, FreewayPlayer* player, int action) {
             player->hits+=1;
             player->ticks_stunts_left = TICKS_STUNT;
             if (env->use_dense_rewards){
-                env->rewards[0] += PENALTY_HIT;
+                env->agents[0].rewards[0] += PENALTY_HIT;
                 env->ep_return += PENALTY_HIT;
             }
             if (env->difficulty == 1){
@@ -360,12 +401,12 @@ void step_player(Freeway* env, FreewayPlayer* player, int action) {
     if (player->player_y <= env->road_start - (player->best_lane_idx+1) * env->lane_size){
         player->best_lane_idx += 1; 
         if (env->use_dense_rewards){
-            env->rewards[0] += 1.0 / (float) NUM_LANES;
+            env->agents[0].rewards[0] += 1.0 / (float) NUM_LANES;
             env->ep_return += 1.0 / (float) NUM_LANES;
         }
         else{
             if (player->best_lane_idx == NUM_LANES){
-                env->rewards[0] = 1.0;
+                env->agents[0].rewards[0] = 1.0;
                 env->ep_return += 1.0;
             }
         }
@@ -373,11 +414,11 @@ void step_player(Freeway* env, FreewayPlayer* player, int action) {
 
     if (player->best_lane_idx == NUM_LANES) {
         reached_end(env, player);
-        env->rewards[0] += 1.0;
+        env->agents[0].rewards[0] += 1.0;
         env->ep_return += 1.0;
     }
 }
-void c_reset(Freeway* env) {
+void puf_reset(Freeway* env) {
     env->ai_player.player_y = env->height / 2;
     env->ai_player.best_lane_idx = 0;
     env->ai_player.ticks_stunts_left = 0;
@@ -400,10 +441,25 @@ void c_reset(Freeway* env) {
     compute_observations(env);
 }
 
-void c_step(Freeway* env) {
-    env->terminals[0] = 0;
-    env->rewards[0] = 0.0;
-    int ai_action = env->actions[0];
+// W/S or arrows drive the extra human chicken when the window is open.
+static void freeway_human_controls(Freeway *env) {
+    if (!IsWindowReady() || env->human_actions == NULL) {
+        return;
+    }
+    env->human_actions[0] = 0;
+    if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W)) {
+        env->human_actions[0] = 1;
+    }
+    if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S)) {
+        env->human_actions[0] = 2;
+    }
+}
+
+void puf_step(Freeway* env) {
+    freeway_human_controls(env);
+    env->agents[0].terminals[0] = 0;
+    env->agents[0].rewards[0] = 0.0;
+    int ai_action = env->agents[0].actions[0];
     int human_action = env->human_actions[0];
     env->time_left = GAME_LENGTH - env->tick*TICK_RATE;
 
@@ -416,17 +472,15 @@ void c_step(Freeway* env) {
         move_enemies(env);
     }
     if (env->tick * TICK_RATE >= GAME_LENGTH) {
-        env->terminals[0] = 1.0;
+        env->agents[0].terminals[0] = 1.0;
         add_log(env);
-        c_reset(env);
+        puf_reset(env);
     }
     if (env->tick % RANDOMIZE_SPEED_FREQ == 0) {
         randomize_enemy_speed(env);
     }
     compute_observations(env);
 }
-
-
 
 typedef struct Client Client;
 struct Client {
@@ -442,17 +496,41 @@ static inline bool file_exists(const char* path) {
     return access(path, F_OK) != -1;
 }
 
+static Texture2D freeway_load_tex(const char* path) {
+    Texture2D tex = LoadTexture(path);
+    if (tex.id != 0) {
+        SetTextureFilter(tex, TEXTURE_FILTER_POINT);
+        SetTextureWrap(tex, TEXTURE_WRAP_CLAMP);
+    }
+    return tex;
+}
+
+// Flip via dest width. Negative *source* width samples UVs outside [0,1] on
+// GLES CLAMP_TO_EDGE and paints a solid rectangle (web). Desktop GL_REPEAT
+// hid that.
+static void freeway_draw_tex(Texture2D tex, Rectangle dest, int flip, Color tint) {
+    if (tex.id == 0) {
+        return;
+    }
+    Rectangle src = {0, 0, (float)tex.width, (float)tex.height};
+    if (flip < 0) {
+        dest.x += dest.width;
+        dest.width = -dest.width;
+    }
+    DrawTexturePro(tex, src, dest, (Vector2){0, 0}, 0, tint);
+}
+
 Client* make_client(Freeway* env) {
     Client* client = (Client*)calloc(1, sizeof(Client));
     
     InitWindow(env->width, env->height, "PufferLib Freeway");
     SetTargetFPS(60/env->frameskip);
-    client->car_body = LoadTexture("resources/freeway/tex_car_body.png");
-    client->car_wheels = LoadTexture("resources/freeway/tex_car_wheels.png");
-    client->chicken = LoadTexture("resources/freeway/tex_chicken0.png");
-    client->puffer = LoadTexture("resources/shared/puffers.png");
-    client->truck_body = LoadTexture("resources/freeway/tex_truck_body.png");
-    client->truck_wheels = LoadTexture("resources/freeway/tex_truck_wheels.png");
+    client->car_body = freeway_load_tex("resources/freeway/tex_car_body.png");
+    client->car_wheels = freeway_load_tex("resources/freeway/tex_car_wheels.png");
+    client->chicken = freeway_load_tex("resources/freeway/tex_chicken0.png");
+    client->puffer = freeway_load_tex("resources/shared/puffers.png");
+    client->truck_body = freeway_load_tex("resources/freeway/tex_truck_body.png");
+    client->truck_wheels = freeway_load_tex("resources/freeway/tex_truck_wheels.png");
     return client;
 }
 
@@ -473,7 +551,7 @@ Color CAR_COLORS[10] = {
     (Color){ 0, 100, 0, 255 },      // Dark Green
     (Color){ 0, 0, 139, 255 }       // Dark Blue
 };
-void c_render(Freeway* env) {
+void puf_render(Freeway* env) {
     if (env->client == NULL) {
         env->client = make_client(env);
     }
@@ -486,6 +564,7 @@ void c_render(Freeway* env) {
     if (IsKeyPressed(KEY_TAB)) {
         ToggleFullscreen();
     }
+    freeway_human_controls(env);
 
     BeginDrawing();
     ClearBackground((Color){170, 170, 170, 255});
@@ -568,7 +647,6 @@ void c_render(Freeway* env) {
     );
 
     // Draw enemies
-    Rectangle src_rec;
     FreewayEnemy* enemy;
     for (int lane = 0; lane < NUM_LANES; lane++) {
         for (int i = 0; i < MAX_ENEMIES_PER_LANE; i++) {
@@ -576,38 +654,15 @@ void c_render(Freeway* env) {
             if (enemy->is_enabled) {
                 Texture2D body = enemy->type == 0 ? client->car_body : client->truck_body;
                 Texture2D wheels = enemy->type == 0 ? client->car_wheels : client->truck_wheels;
-                if (lane < NUM_LANES/2) {
-                    src_rec= enemy->type == 0 ? (Rectangle){16,0,16,10} : (Rectangle){32,10,32,10};
-                }
-                else {
-                    src_rec = enemy->type == 0 ? (Rectangle){16 + 16, 0, -16, 10} : (Rectangle){32 + 32, 10, -32, 10};
-                }
-                DrawTexturePro(
-                    body,
-                    src_rec,
-                    (Rectangle){
-                        enemy->enemy_x - enemy->enemy_width / 2, 
-                        enemy->enemy_y - enemy->enemy_height/ 2,
-                        enemy->enemy_width, 
-                        enemy->enemy_height,
-                    },
-                    (Vector2){0, 0},
-                    0,
-                    CAR_COLORS[lane]
-                );
-                DrawTexturePro(
-                    wheels,
-                    src_rec,
-                    (Rectangle){
-                        enemy->enemy_x - enemy->enemy_width / 2, 
-                        enemy->enemy_y - enemy->enemy_height/ 2,
-                        enemy->enemy_width, 
-                        enemy->enemy_height,
-                    },
-                    (Vector2){0, 0},
-                    0,
-                    CAR_COLORS[lane]
-                );
+                int flip = (lane < NUM_LANES / 2) ? 1 : -1;
+                Rectangle dest = {
+                    enemy->enemy_x - enemy->enemy_width / 2,
+                    enemy->enemy_y - enemy->enemy_height / 2,
+                    enemy->enemy_width,
+                    enemy->enemy_height,
+                };
+                freeway_draw_tex(body, dest, flip, CAR_COLORS[lane]);
+                freeway_draw_tex(wheels, dest, flip, WHITE);
             }
         }
     }
@@ -619,6 +674,39 @@ void c_render(Freeway* env) {
     DrawText(TextFormat("Time: %i", rounded_time_left), round(0.45*env->width) - 40, 3, 40, (Color) {255, 160, 160, 255});
 
     EndDrawing();
+    puf_web_vsync();
 
     //PlaySound(client->sound);
 }
+
+// --- Native trainer (pufferl) API ---
+void puf_log(Log* log, Dict* out) {
+    dict_set(out, "perf", log->perf);
+    dict_set(out, "score", log->score);
+    dict_set(out, "episode_return", log->episode_return);
+    dict_set(out, "episode_length", log->episode_length);
+    dict_set(out, "up_action_frac", log->up_action_frac);
+    dict_set(out, "hits", log->hits);
+    dict_set(out, "n", log->n);
+}
+
+void puf_init(Env* env, Dict* kwargs) {
+    env->num_agents = 1;
+    env->frameskip = dict_get(kwargs, "frameskip");
+    env->width = dict_get(kwargs, "width");
+    env->height = dict_get(kwargs, "height");
+    env->player_width = dict_get(kwargs, "player_width");
+    env->player_height = dict_get(kwargs, "player_height");
+    env->car_width = dict_get(kwargs, "car_width");
+    env->car_height = dict_get(kwargs, "car_height");
+    env->lane_size = dict_get(kwargs, "lane_size");
+    env->difficulty = dict_get(kwargs, "difficulty");
+    env->level = dict_get(kwargs, "level");
+    env->enable_human_player = dict_get(kwargs, "enable_human_player");
+    env->env_randomization = dict_get(kwargs, "env_randomization");
+    env->use_dense_rewards = dict_get(kwargs, "use_dense_rewards");
+    env->agents[0].action_mask = NULL;
+    env->agents[0].policy = 0;
+    init(env);
+}
+

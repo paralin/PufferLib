@@ -3,6 +3,8 @@ c_*.c
 pufferlib/extensions.c
 pufferlib/puffernet.c
 logs/
+logs_release/
+ocean/osrs/data/
 
 # Build dir
 build/
@@ -167,10 +169,31 @@ pufferlib/ocean/impulse_wars/*-release/
 pufferlib/ocean/impulse_wars/debug-*/
 pufferlib/ocean/impulse_wars/release-*/
 pufferlib/ocean/impulse_wars/benchmark/
+ocean/impulse_wars/include/
+
+# Generated antibody data
+ocean/antibody/generated/
 
 # Data
 resources/drive/data/*
 resources/drive/binaries/*
+resources/boxoban/levels/
+resources/boxoban/boxoban_maps_*.bin
 
-vendor/nle/
+# Policy weights live in the website repo (docs/assets/models/)
+resources/**/*_weights.bin
+resources/**/*weights*.bin
+resources/onlyfish/danadvantage.bin
+resources/onlyfish/lonelypuff.bin
+/*_weights.bin
+/*_best.bin
+/*_web.bin
+
+
+# Generated trailer recording
+resources/trailer/shots/*.mp4
+
+# Local refactor baselines (not for commit)
+.refactor-snapshots/
+
 vendor/fast-nle/

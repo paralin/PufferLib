@@ -6,6 +6,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+typedef float obs_t;
+#include "pufferenv.h"
+
+#define ACT_SIZES {4}
+#define OBS_SIZE 291
+#define NUM_ATNS 1
 
 #define PX_PADDING_TOP 40 // 40px padding on top of the window
 
@@ -16,7 +22,7 @@
 #define GHOST_OBSERVATIONS_COUNT 9
 #define PLAYER_OBSERVATIONS_COUNT 11
 #define NUM_GHOSTS 4
-#define FRAMES 7  // Fixed number of frames per step for interpolation
+#define FRAMES 7  // vsync interpolant frames per env tick
 
 #define NUM_DOTS 240
 #define NUM_POWERUPS 4
@@ -52,7 +58,7 @@ typedef enum Tile {
 #define MAP_HEIGHT 31
 #define MAP_WIDTH 28
 
-static const char original_map[MAP_HEIGHT][MAP_WIDTH] = {
+static const char original_map[MAP_HEIGHT][MAP_WIDTH + 1] = {
     "############################",
     "#............##............#",
     "#.####.#####.##.#####.####.#",
@@ -108,8 +114,12 @@ typedef struct Ghost {
 } Ghost;
 
 typedef struct Client Client;
-typedef struct PacmanEnv {
+struct Env {
         Client *client;
+        Log log;
+        Agent agents[1];
+        int tag;
+        int boundary_reached;
         bool randomize_starting_position; // randomize player starting position
         int min_start_timeout;            // randomized ghost delay range
         int max_start_timeout;
@@ -118,12 +128,7 @@ typedef struct PacmanEnv {
         int scatter_mode_length;
         int chase_mode_length;
 
-        float *observations;
-        float *actions;
-        float *rewards;
-        float *terminals;
         int num_agents;
-        Log log;
 
         int step_count;
         int score;
@@ -152,7 +157,8 @@ typedef struct PacmanEnv {
 
         Ghost ghosts[NUM_GHOSTS];
         unsigned int rng;
-} PacmanEnv;
+};
+typedef Env PacmanEnv;
 
 void add_log(PacmanEnv *env) {
     env->log.score += env->score;
@@ -196,7 +202,7 @@ void init(PacmanEnv *env) {
     // one time map setup
     for (int y = 0; y < MAP_HEIGHT; y++) {
         for (int x = 0; x < MAP_WIDTH; x++) {
-            source_tile = original_map[y][x];
+            source_tile = (Tile)original_map[y][x];
 
             pos = (Position){x, y};
             target_tile = tile_at(env, pos);
@@ -228,15 +234,7 @@ void init(PacmanEnv *env) {
     }
 }
 
-void allocate(PacmanEnv *env) {
-    init(env);
-    env->observations = (float *)calloc(OBSERVATIONS_COUNT, sizeof(float));
-    env->actions = (float *)calloc(1, sizeof(float));
-    env->rewards = (float *)calloc(1, sizeof(float));
-    env->terminals = (float *)calloc(1, sizeof(float));
-}
-
-void c_close(PacmanEnv *env) {
+void puf_close(PacmanEnv *env) {
     free(env->game_map);
     free(env->possible_spawn_pos);
 
@@ -244,19 +242,11 @@ void c_close(PacmanEnv *env) {
     free(env->pickup_obs_map);
 }
 
-void free_allocated(PacmanEnv *env) {
-    free(env->actions);
-    free(env->observations);
-    free(env->terminals);
-    free(env->rewards);
-    c_close(env);
-}
-
 #define INV_MAP_WIDTH (1.0f / MAP_WIDTH)
 #define INV_MAP_HEIGHT (1.0f / MAP_HEIGHT)
 
 void compute_observations(PacmanEnv *env) {
-    float *obs = env->observations;
+    obs_t* obs = env->agents[0].observations;
     // player observations
     obs[0] = env->player_pos.x * INV_MAP_WIDTH;
     obs[1] = env->player_pos.y * INV_MAP_HEIGHT;
@@ -286,8 +276,11 @@ void compute_observations(PacmanEnv *env) {
         obs[p + 8] = ghost->return_to_spawn;
     }
 
-    memcpy(obs + PLAYER_OBSERVATIONS_COUNT + (NUM_GHOSTS * GHOST_OBSERVATIONS_COUNT),
-           env->pickup_obs, sizeof(float) * (NUM_DOTS + NUM_POWERUPS));
+    // Element-wise copy; memcpy of a float[] can overflow if the store type is narrower.
+    int base = PLAYER_OBSERVATIONS_COUNT + NUM_GHOSTS * GHOST_OBSERVATIONS_COUNT;
+    for (int i = 0; i < NUM_DOTS + NUM_POWERUPS; i++) {
+        obs[base + i] = env->pickup_obs[i];
+    }
 }
 
 void update_interpolation(PacmanEnv *env) {
@@ -339,7 +332,7 @@ static inline void reset_round(PacmanEnv *env) {
     env->player_direction = RIGHT;
 }
 
-void c_reset(PacmanEnv *env) {
+void puf_reset(PacmanEnv *env) {
     env->score = 0;
     reset_round(env);
     compute_observations(env);
@@ -382,7 +375,7 @@ static inline void player_move(PacmanEnv *env, int action) {
         }
         if (*new_tile == DOT_TILE || *new_tile == POWER_TILE) {
             env->score += 1.0f;
-            env->rewards[0] += 1.0f;
+            env->agents[0].rewards[0] += 1.0f;
 
             env->remaining_pickups--;
             *new_tile = EMPTY_TILE;
@@ -498,7 +491,7 @@ static inline void ghost_move(PacmanEnv *env, Ghost *ghost, Position old_player_
             ghost->half_move = false;
             ghost->return_to_spawn = true;
 
-            env->rewards[0] += 1.0f;
+            env->agents[0].rewards[0] += 1.0f;
         } else {
             env->player_caught = true;
         }
@@ -523,15 +516,15 @@ static inline void check_mode_change(PacmanEnv *env) {
     }
 }
 
-void c_step(PacmanEnv *env) {
+void puf_step(PacmanEnv *env) {
     update_interpolation(env);
 
     Position old_player_pos = env->player_pos;
-    int action = env->actions[0];
+    int action = env->agents[0].actions[0];
 
     env->step_count += 1;
-    env->terminals[0] = 0;
-    env->rewards[0] = 0.0f;
+    env->agents[0].terminals[0] = 0;
+    env->agents[0].rewards[0] = 0.0f;
 
     env->reverse_directions = false;
     env->player_caught = false;
@@ -565,8 +558,8 @@ void c_step(PacmanEnv *env) {
     if (env->player_caught || env->step_count >= MAX_STEPS || env->remaining_pickups <= 0) {
         add_log(env);
 
-        env->terminals[0] = 1;
-        c_reset(env);
+        env->agents[0].terminals[0] = 1;
+        puf_reset(env);
     }
 }
 
@@ -636,7 +629,6 @@ void draw_entity(Client *client, Texture2D texture, Position previous_pos, Posit
         draw_tiled(client, texture, position, rotation, flip_x, source_width, source_height);
     }
 }
-
 
 Client *make_client(PacmanEnv *env) {
     Client *client = (Client *)calloc(1, sizeof(Client));
@@ -859,31 +851,43 @@ void handle_input(PacmanEnv *env) {
     }
 }
 
-void c_render(PacmanEnv *env) {
+void puf_render(PacmanEnv *env) {
     if (env->client == NULL) {
         env->client = make_client(env);
     }
     Client *client = env->client;
-
-    float progress = client->frame / (float)FRAMES;
-    client->frame = (client->frame + 1) % (FRAMES);
-
     handle_input(env);
-
-    BeginDrawing();
-    ClearBackground(PUFF_BACKGROUND);
-
-    render_map(client, env);
-
-    render_player(client, env, progress);
-    for (int i = 0; i < 4; i++) {
-        render_ghost(client, &env->ghosts[i], &client->ghost_sprites[i], progress);
+    for (int i = 0; i < FRAMES; i++) {
+        float progress = i / (float)FRAMES;
+        client->frame = i;
+        if (IsKeyDown(KEY_LEFT_SHIFT)) {
+            if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S)) {
+                env->agents[0].actions[0] = DOWN;
+            }
+            if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W)) {
+                env->agents[0].actions[0] = UP;
+            }
+            if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A)) {
+                env->agents[0].actions[0] = LEFT;
+            }
+            if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D)) {
+                env->agents[0].actions[0] = RIGHT;
+            }
+        }
+        BeginDrawing();
+        ClearBackground(PUFF_BACKGROUND);
+        render_map(client, env);
+        render_player(client, env, progress);
+        for (int g = 0; g < 4; g++) {
+            render_ghost(client, &env->ghosts[g], &client->ghost_sprites[g], progress);
+        }
+        DrawText(TextFormat("Score: %i", env->score), 10, 10, 20, WHITE);
+        DrawText(TextFormat("Mode: %s", env->scatter_mode ? "Scatter" : "Chase"),
+            150, 10, 20, WHITE);
+        DrawText("[Shift] WASD/arrows", 300, 10, 16, WHITE);
+        EndDrawing();
+        puf_web_vsync();
     }
-
-    DrawText(TextFormat("Score: %i", env->score), 10, 10, 20, WHITE);
-    DrawText(TextFormat("Mode: %s", env->scatter_mode ? "Scatter" : "Chase"), 150, 10, 20, WHITE);
-
-    EndDrawing();
 }
 
 void unload_direction_sprites(DirectionSprites *sprites) {
@@ -905,3 +909,27 @@ void close_client(Client *client) {
     unload_direction_sprites(&client->eyes);
     free(client);
 }
+
+// --- Native trainer (pufferl) API ---
+void puf_log(Log* log, Dict* out) {
+    dict_set(out, "perf", log->perf);
+    dict_set(out, "score", log->score);
+    dict_set(out, "episode_return", log->episode_return);
+    dict_set(out, "episode_length", log->episode_length);
+    dict_set(out, "n", log->n);
+}
+
+void puf_init(Env* env, Dict* kwargs) {
+    env->num_agents = 1;
+    env->randomize_starting_position = dict_get(kwargs, "randomize_starting_position");
+    env->min_start_timeout = dict_get(kwargs, "min_start_timeout");
+    env->max_start_timeout = dict_get(kwargs, "max_start_timeout");
+    env->frightened_time = dict_get(kwargs, "frightened_time");
+    env->max_mode_changes = dict_get(kwargs, "max_mode_changes");
+    env->scatter_mode_length = dict_get(kwargs, "scatter_mode_length");
+    env->chase_mode_length = dict_get(kwargs, "chase_mode_length");
+    env->agents[0].action_mask = NULL;
+    env->agents[0].policy = 0;
+    init(env);
+}
+

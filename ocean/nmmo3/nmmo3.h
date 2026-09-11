@@ -19,6 +19,19 @@
 #include "simplex.h"
 #include "tile_atlas.h"
 #include "raylib.h"
+typedef unsigned char obs_t;
+#include "pufferenv.h"
+
+#define ACT_SIZES {26}
+#define OBS_SIZE 1707
+#define NUM_ATNS 1
+#define TICK_FRAMES 36
+typedef Env MMO;
+
+#ifdef PUFFERCPU_EVAL_MAIN
+#define PUF_NMMO3_NET 1
+#include "nmmo3_net.h"
+#endif
 
 #if defined(PLATFORM_DESKTOP)
     #define GLSL_VERSION 330
@@ -184,7 +197,10 @@ void shuffle(int* array, int n, unsigned int* rng) {
 }
 
 double sample_exponential(double halving_rate, unsigned int* rng) {
-    double u = (double)rand_r(rng) / RAND_MAX; // Random number u in [0, 1)
+    double u = (double)rand_r(rng) / ((double)RAND_MAX + 1.0);
+    if (u > 0.999999) {
+        u = 0.999999;
+    }
     return 1 + halving_rate*(-log(1 - u) / log(2));
 }
 
@@ -234,6 +250,8 @@ struct Log {
     float equip_defense;
     float r;
     float c;
+    float n_attack;
+    float n_attack_hit;
 };
  
 // TODO: This is actually simplex and we should probably use the original impl
@@ -283,7 +301,7 @@ void flood_fill(unsigned char* input, char* output,
         }
     }
 
-    int* pos = calloc(width*height, sizeof(int));
+    int* pos = (int*)calloc(width*height, sizeof(int));
     range((int*)pos, width*height);
     shuffle((int*)pos, width*height, rng);
 
@@ -368,7 +386,7 @@ void flood_fill(unsigned char* input, char* output,
 void cellular_automata(char* grid,
         int width, int height, int colors, int max_fill, unsigned int* rng) {
 
-    int* pos = calloc(2*width*height, sizeof(int));
+    int* pos = (int*)calloc(2*width*height, sizeof(int));
     int pos_sz = 0;
     for (int r = 0; r < height; r++) {
         for (int c = 0; c < width; c++) {
@@ -384,7 +402,14 @@ void cellular_automata(char* grid,
     }
 
     bool done = false;
-    while (!done) {
+    // Unfilled cells with no assigned neighbors never get a color, so this
+    // loop can run forever. Cap iterations; leftover cells stay -1.
+    int ca_guard = 0;
+    int ca_limit = width * height + 1;
+    while (!done && ca_guard++ < ca_limit) {
+        if (pos_sz <= 0) {
+            break;
+        }
         // In place shuffle on active buffer only
         for (int i = 0; i < pos_sz; i+=2) {
             int r = pos[i];
@@ -472,20 +497,20 @@ void generate_terrain(char* terrain, unsigned char* rendered,
         int R, int C, int x_border, int y_border, unsigned int* rng) {
     // Perlin noise for the base terrain
     // TODO: Not handling octaves correctly
-    float* perlin_map = calloc(R*C, sizeof(float));
+    float* perlin_map = (float*)calloc(R*C, sizeof(float));
     int offset_x = rand_r(rng) % 100000;
     int offset_y = rand_r(rng) % 100000;
     perlin_noise(perlin_map, C, R, 1.0/64.0, 2, offset_x, offset_y);
  
     // Flood fill connected components to determine biomes
-    unsigned char* ridges = calloc(R*C, sizeof(unsigned char));
+    unsigned char* ridges = (unsigned char*)calloc(R*C, sizeof(unsigned char));
     for (int r = 0; r < R; r++) {
         for (int c = 0; c < C; c++) {
             int adr = r*C + c;
             ridges[adr] = (perlin_map[adr]>0.35) & (perlin_map[adr]<0.65);
         }
     }
-    char *biomes = calloc(R*C, sizeof(char));
+    char *biomes = (char*)calloc(R*C, sizeof(char));
     flood_fill(ridges, biomes, R, C, 4, 4000, rng);
 
     // Cellular automata to cover unfilled ridges
@@ -553,6 +578,8 @@ struct Entity {
     int time_alive;
     int purchases;
     int sales;
+    int n_attack;
+    int n_attack_hit;
 };
 
 typedef struct Item Item;
@@ -636,9 +663,9 @@ struct RespawnBuffer {
 };
 
 RespawnBuffer* make_respawn_buffer(int size, int ticks) {
-    RespawnBuffer* buffer = calloc(1, sizeof(RespawnBuffer));
-    buffer->data = calloc(ticks*size, sizeof(Respawnable));
-    buffer->lengths = calloc(ticks, sizeof(int));
+    RespawnBuffer* buffer = (RespawnBuffer*)calloc(1, sizeof(RespawnBuffer));
+    buffer->data = (Respawnable*)calloc(ticks*size, sizeof(Respawnable));
+    buffer->lengths = (int*)calloc(ticks, sizeof(int));
     buffer->ticks = ticks;
     buffer->size = size;
     return buffer;
@@ -675,8 +702,7 @@ Respawnable pop_from_buffer(RespawnBuffer* buffer, int tick) {
 }
 
 typedef struct Client Client;
-typedef struct MMO MMO;
-struct MMO {
+struct Env {
     Client* client;
     int width;
     int height;
@@ -714,13 +740,29 @@ struct MMO {
     RespawnBuffer* enemy_respawn_buffer;
     RespawnBuffer* drop_respawn_buffer;
     Log log;
+    Agent* agents;
+    int tag;
+    int boundary_reached;
     unsigned int rng;
     float reward_combat_level;
     float reward_prof_level;
     float reward_item_level;
     float reward_market;
     float reward_death;
+    // 1: zero entity bytes when pids[cell] is empty (no stale last-seen enemy).
+    int clear_stale_entities;
 };
+
+static inline void sync_mmo_agent_buffers(MMO* env) {
+    if (env->agents == NULL || env->num_agents <= 0 || env->agents[0].observations == NULL) {
+        return;
+    }
+
+    env->observations = env->agents[0].observations;
+    env->actions = env->agents[0].actions;
+    env->rewards = env->agents[0].rewards;
+    env->terminals = env->agents[0].terminals;
+}
 
 Entity* get_entity(MMO* env, int pid) {
     if (pid < env->num_agents) {
@@ -746,6 +788,8 @@ void add_player_log(MMO* env, int pid) {
     log->sales += player->sales;
     log->equip_attack += player->equipment_attack;
     log->equip_defense += player->equipment_defense;
+    log->n_attack += player->n_attack;
+    log->n_attack_hit += player->n_attack_hit;
     log->r += player->r;
     log->c += player->c;
     log->episode_return += (
@@ -768,12 +812,12 @@ void init(MMO* env) {
     init_items();
 
     int sz = env->width*env->height;
-    env->counts = calloc(sz, sizeof(unsigned char));
-    env->terrain = calloc(sz, sizeof(char));
-    env->rendered = calloc(sz*3, sizeof(unsigned char));
+    env->counts = (unsigned char*)calloc(sz, sizeof(unsigned char));
+    env->terrain = (char*)calloc(sz, sizeof(char));
+    env->rendered = (unsigned char*)calloc(sz*3, sizeof(unsigned char));
 
-    env->pids = calloc(sz, sizeof(short));
-    env->items = calloc(sz, sizeof(unsigned char));
+    env->pids = (short*)calloc(sz, sizeof(short));
+    env->items = (unsigned char*)calloc(sz, sizeof(unsigned char));
 
     // Circular buffers for respawning resources and enemies
     env->resource_respawn_buffer = make_respawn_buffer(2*env->num_resources
@@ -782,26 +826,70 @@ void init(MMO* env) {
         env->num_enemies, env->enemy_respawn_ticks);
     env->drop_respawn_buffer = make_respawn_buffer(2*env->num_enemies, 20);
 
-    env->returns = calloc(env->num_agents, sizeof(Reward));
-    env->reward_struct = calloc(env->num_agents, sizeof(Reward));
-    env->players = calloc(env->num_agents, sizeof(Entity));
-    env->enemies = calloc(env->num_enemies, sizeof(Entity));
+    env->returns = (Reward*)calloc(env->num_agents, sizeof(Reward));
+    env->reward_struct = (Reward*)calloc(env->num_agents, sizeof(Reward));
+    env->players = (Entity*)calloc(env->num_agents, sizeof(Entity));
+    env->enemies = (Entity*)calloc(env->num_enemies, sizeof(Entity));
 
     // TODO: Figure out how to cast to array. Size is static
     int num_market = (MAX_TIERS+1)*(I_N+1);
     env->market = (ItemMarket*)calloc(num_market, sizeof(ItemMarket));
 }
 
-void allocate_mmo(MMO* env) {
-    // TODO: Not hardcode
-    env->observations = calloc(env->num_agents*(11*15*10+47+10), sizeof(unsigned char));
-    env->rewards = calloc(env->num_agents, sizeof(float));
-    env->terminals = calloc(env->num_agents, sizeof(float));
-    env->actions = calloc(env->num_agents, sizeof(float));
+void puf_init(Env* env, Dict* kwargs) {
+    env->width = dict_get(kwargs, "width");
+    env->height = dict_get(kwargs, "height");
+    env->num_agents = dict_get(kwargs, "num_agents");
+    env->num_enemies = dict_get(kwargs, "num_enemies");
+    env->num_resources = dict_get(kwargs, "num_resources");
+    env->num_weapons = dict_get(kwargs, "num_weapons");
+    env->num_gems = dict_get(kwargs, "num_gems");
+    env->tiers = dict_get(kwargs, "tiers");
+    env->levels = dict_get(kwargs, "levels");
+    env->teleportitis_prob = dict_get(kwargs, "teleportitis_prob");
+    env->enemy_respawn_ticks = dict_get(kwargs, "enemy_respawn_ticks");
+    env->item_respawn_ticks = dict_get(kwargs, "item_respawn_ticks");
+    env->x_window = dict_get(kwargs, "x_window");
+    env->y_window = dict_get(kwargs, "y_window");
+    env->reward_combat_level = dict_get(kwargs, "reward_combat_level");
+    env->reward_prof_level = dict_get(kwargs, "reward_prof_level");
+    env->reward_item_level = dict_get(kwargs, "reward_item_level");
+    env->reward_market = dict_get(kwargs, "reward_market");
+    env->reward_death = dict_get(kwargs, "reward_death");
+    env->clear_stale_entities = dict_get(kwargs, "clear_stale_entities");
+    env->agents = (Agent*)calloc(env->num_agents, sizeof(Agent));
+    for (int i = 0; i < env->num_agents; i++) {
+        env->agents[i].action_mask = NULL;
+        env->agents[i].policy = 0;
+    }
     init(env);
 }
 
-void c_close(MMO* env) {
+void puf_log(Log* log, Dict* out) {
+    dict_set(out, "perf", log->perf);
+    dict_set(out, "score", log->score);
+    dict_set(out, "episode_return", log->episode_return);
+    dict_set(out, "episode_length", log->episode_length);
+    dict_set(out, "return_comb_lvl", log->return_comb_lvl);
+    dict_set(out, "return_prof_lvl", log->return_prof_lvl);
+    dict_set(out, "return_item_atk_lvl", log->return_item_atk_lvl);
+    dict_set(out, "return_item_def_lvl", log->return_item_def_lvl);
+    dict_set(out, "return_market_buy", log->return_market_buy);
+    dict_set(out, "return_market_sell", log->return_market_sell);
+    dict_set(out, "return_death", log->return_death);
+    dict_set(out, "min_comb_prof", log->min_comb_prof);
+    dict_set(out, "purchases", log->purchases);
+    dict_set(out, "sales", log->sales);
+    dict_set(out, "equip_attack", log->equip_attack);
+    dict_set(out, "equip_defense", log->equip_defense);
+    dict_set(out, "n_attack", log->n_attack);
+    dict_set(out, "n_attack_hit", log->n_attack_hit);
+    dict_set(out, "r", log->r);
+    dict_set(out, "c", log->c);
+    dict_set(out, "n", log->n);
+}
+
+void puf_close(MMO* env) {
     free(env->counts);
     free(env->terrain);
     free(env->rendered);
@@ -811,18 +899,11 @@ void c_close(MMO* env) {
     free_respawn_buffer(env->enemy_respawn_buffer);
     free_respawn_buffer(env->drop_respawn_buffer);
     free(env->market);
-}
-
-void free_allocated_mmo(MMO* env) {
-    free(env->observations);
-    free(env->rewards);
-    free(env->terminals);
     free(env->returns);
     free(env->reward_struct);
     free(env->players);
     free(env->enemies);
-    free(env->actions);
-    c_close(env);
+    free(env->agents);
 }
 
 bool is_buy(int mode) {
@@ -971,6 +1052,13 @@ void compute_all_obs(MMO* env) {
                     env->observations[obs_adr+7] = seen->hp / 20; // Bucketed for discrete
                     env->observations[obs_adr+8] = seen->anim;
                     env->observations[obs_adr+9] = seen->dir;
+                } else if (env->clear_stale_entities) {
+                    env->observations[obs_adr+4] = 0;
+                    env->observations[obs_adr+5] = 0;
+                    env->observations[obs_adr+6] = 0;
+                    env->observations[obs_adr+7] = 0;
+                    env->observations[obs_adr+8] = 0;
+                    env->observations[obs_adr+9] = 0;
                 }
                 obs_adr += 10;
             }
@@ -1020,30 +1108,38 @@ void compute_all_obs(MMO* env) {
 }
 
 int safe_tile(MMO* env, int delta) {
-    bool valid = false;
-    int idx;
-    while (!valid) {
-        valid = true;
-        idx = rand_r(&env->rng) % (env->width * env->height);
-        char tile = env->terrain[idx];
-        if (!is_grass(tile)) {
-            valid = false;
+    int n = env->width * env->height;
+    int idx = 0;
+    for (int attempt = 0; attempt < 1024; attempt++) {
+        idx = rand_r(&env->rng) % n;
+        if (!is_grass(env->terrain[idx])) {
             continue;
         }
         int r = idx / env->width;
         int c = idx % env->width;
- 
-        for (int dr = -delta; dr <= delta; dr++) {
+        bool ok = true;
+        for (int dr = -delta; dr <= delta && ok; dr++) {
             for (int dc = -delta; dc <= delta; dc++) {
-                int adr = map_offset(env, r+dr, c+dc);
-                if (env->pids[adr] != -1) {
-                    valid = false;
+                int rr = r + dr;
+                int cc = c + dc;
+                if (rr < 0 || rr >= env->height || cc < 0 || cc >= env->width) {
+                    ok = false;
+                    break;
+                }
+                if (env->pids[map_offset(env, rr, cc)] != -1) {
+                    ok = false;
                     break;
                 }
             }
-            if (!valid) {
-                break;
-            }
+        }
+        if (ok) {
+            return idx;
+        }
+    }
+    for (int attempt = 0; attempt < n; attempt++) {
+        idx = rand_r(&env->rng) % n;
+        if (is_grass(env->terrain[idx])) {
+            return idx;
         }
     }
     return idx;
@@ -1057,6 +1153,8 @@ void spawn(MMO* env, Entity* entity) {
     entity->time_alive = 0;
     entity->purchases = 0;
     entity->sales = 0;
+    entity->n_attack = 0;
+    entity->n_attack_hit = 0;
 
     int idx = safe_tile(env, 5);
     int r = idx / env->width;
@@ -1193,8 +1291,15 @@ void pickup_item(MMO* env, int pid) {
 
 bool dest_check(MMO* env, int r, int c);
 inline bool dest_check(MMO* env, int r, int c) {
+    if (r < 0 || r >= env->height || c < 0 || c >= env->width) {
+        return false;
+    }
     int adr = map_offset(env, r, c);
-    return PASSABLE[(int)env->terrain[adr]] & (env->pids[adr] == -1);
+    unsigned char tile = (unsigned char)env->terrain[adr];
+    if (tile >= 16) {
+        return false;
+    }
+    return PASSABLE[tile] & (env->pids[adr] == -1);
 }
 
 void move(MMO* env, int pid, int direction, bool run) {
@@ -1576,6 +1681,9 @@ void enemy_ai(MMO* env, int pid) {
 
     for (int rr = r-NPC_AGGRO_RANGE; rr <= r+NPC_AGGRO_RANGE; rr++) {
         for (int cc = c-NPC_AGGRO_RANGE; cc <= c+NPC_AGGRO_RANGE; cc++) {
+            if (rr < 0 || rr >= env->height || cc < 0 || cc >= env->width) {
+                continue;
+            }
             int adr = map_offset(env, rr, cc);
             int target_id = env->pids[adr];
             if (target_id == -1 || target_id >= env->num_agents) {
@@ -1636,7 +1744,9 @@ void enemy_ai(MMO* env, int pid) {
     wander(env, pid);
 }
 
-void c_reset(MMO* env) {
+void puf_reset(Env* env) {
+    sync_mmo_agent_buffers(env);
+
     env->tick = 0;
 
     env->market_sells = 0;
@@ -1668,7 +1778,7 @@ void c_reset(MMO* env) {
     int enemy_count = 0;
 
     // Randomly generate spawn candidates
-    int *spawn_cands = calloc(env->width*env->height, sizeof(int));
+    int *spawn_cands = (int*)calloc(env->width*env->height, sizeof(int));
     range((int*)spawn_cands, env->width*env->height);
     shuffle((int*)spawn_cands, env->width*env->height, &env->rng);
 
@@ -1724,8 +1834,14 @@ void c_reset(MMO* env) {
         int adr = map_offset(env, r, c);
         //int tier = 1 + env->tiers*level/env->levels;
         int tier = 0;
-        while (tier < 1 || tier > env->tiers) {
-            tier = sample_exponential(1, &env->rng);
+        for (int tries = 0; tries < 64 && (tier < 1 || tier > env->tiers); tries++) {
+            tier = (int)sample_exponential(1, &env->rng);
+        }
+        if (tier < 1) {
+            tier = 1;
+        }
+        if (tier > env->tiers) {
+            tier = env->tiers;
         }
 
         if (spawned) {
@@ -1800,8 +1916,14 @@ void c_reset(MMO* env) {
     //level = fmin(level, env->levels);
     for (int enemy_count = 0; enemy_count < env->num_enemies; enemy_count++) {
         int level = 0;
-        while (level < 1 || level > env->levels) {
-            level = sample_exponential(8, &env->rng);
+        for (int tries = 0; tries < 64 && (level < 1 || level > env->levels); tries++) {
+            level = (int)sample_exponential(8, &env->rng);
+        }
+        if (level < 1) {
+            level = 1;
+        }
+        if (level > env->levels) {
+            level = env->levels;
         }
         if (rand_r(&env->rng) % 8 == 0) {
             level = 1;
@@ -1839,7 +1961,9 @@ void c_reset(MMO* env) {
     compute_all_obs(env);
 }
 
-void c_step(MMO* env) {
+void puf_step(Env* env) {
+    sync_mmo_agent_buffers(env);
+
     env->tick += 1;
     int tick = env->tick;
 
@@ -2104,8 +2228,10 @@ void c_step(MMO* env) {
             Reward* ret = &env->returns[pid];
             ret->market_sell += env->reward_market;
         } else if (action == ATN_ATTACK) {
+            entity->n_attack += 1;
             int target_id = find_target(env, pid, ENTITY_ENEMY);
             if (target_id != -1) {
+                entity->n_attack_hit += 1;
                 attack(env, pid, target_id);
             }
         } else if (is_move(action)) {
@@ -2132,7 +2258,6 @@ void c_step(MMO* env) {
 }
 
 #define FRAME_RATE 60
-#define TICK_FRAMES 36
 #define DELAY_FRAMES 24
 #define SPRITE_SIZE 128
 #define TILE_SIZE 64
@@ -2457,12 +2582,12 @@ Client* make_client(MMO* env) {
     InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "NMMO3");
     SetTargetFPS(FRAME_RATE);
 
-    Client* client = calloc(1, sizeof(Client));
+    Client* client = (Client*)calloc(1, sizeof(Client));
     client->start_time = time(NULL);
     client->frame = 0;
     client->command_len = 0;
 
-    client->terrain = calloc(env->height*env->width, sizeof(int));
+    client->terrain = (int*)calloc(env->height*env->width, sizeof(int));
     render_conversion(env->terrain, client->terrain, env->height, env->width, &env->rng);
 
     client->shader = LoadShader("", TextFormat("resources/nmmo3/map_shader_%i.fs", GLSL_VERSION));
@@ -2480,7 +2605,7 @@ Client* make_client(MMO* env) {
     ImageFormat(&img, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
     client->shader_terrain = LoadTextureFromImage(img);
     UnloadImage(img);
-    client->shader_terrain_data = malloc(env->width*env->height*4);
+    client->shader_terrain_data = (unsigned char*)malloc(env->width*env->height*4);
     //SetShaderValue(client->shader, client->shader_terrain_loc, &client->terrain, SHADER_UNIFORM_INT);
    
     for (int i = 0; i < env->width*env->height; i++) {
@@ -2496,6 +2621,8 @@ Client* make_client(MMO* env) {
         client->shader_terrain_data[4*i+2] = 0;
         client->shader_terrain_data[4*i+3] = 255;
     }
+    // Terrain atlas coords are static; water anim is a shader time uniform.
+    UpdateTexture(client->shader_terrain, client->shader_terrain_data);
 
     client->render_mode = RENDER_MODE_CENTERED;
     client->tiles = LoadTexture("resources/nmmo3/merged_sheet.png");
@@ -2516,8 +2643,8 @@ Client* make_client(MMO* env) {
 
     // TODO: Why do I need to cast here?
     client->camera = (Camera2D){
-        .target = {.x = env->width/2*TILE_SIZE, .y = env->height/2*TILE_SIZE},
         .offset = {.x = 0.0, .y = 0.0},
+        .target = {.x = env->width/2*TILE_SIZE, .y = env->height/2*TILE_SIZE},
         .rotation = 0.0,
         .zoom = 1.0,
     };
@@ -2694,6 +2821,13 @@ int simple_hash(int n) {
     return ((n * 2654435761) & 0xFFFFFFFF) % INT_MAX;
 }
 
+static int entity_in_view(const Entity* e, int start_r, int start_c,
+        int end_r, int end_c) {
+    // +1 tile: lerp still draws the previous cell.
+    return e->r >= start_r - 1 && e->r < end_r + 1
+        && e->c >= start_c - 1 && e->c < end_c + 1;
+}
+
 void draw_entity(Client* client, MMO* env, int pid, float delta) {
     Entity* entity = get_entity(env, pid);
     Animation* animation = &ANIMATIONS[entity->anim];
@@ -2773,8 +2907,6 @@ void draw_min(Client* client, MMO* env, int x, int y,
     SetShaderValue(client->shader, client->shader_resolution_loc, client->shader_resolution, SHADER_UNIFORM_VEC3);
 
     SetShaderValueTexture(client->shader, client->shader_texture_tiles_loc, client->tiles);
-
-    UpdateTexture(client->shader_terrain, client->shader_terrain_data);
     SetShaderValueTexture(client->shader, client->shader_terrain_loc, client->shader_terrain);
 
     DrawRectangle(
@@ -2887,8 +3019,11 @@ void render_centered(Client* client, MMO* env, int pid, int action, float delta)
         start_r, end_c-start_c, end_r-start_r,
         env->width, env->height, 1, delta);
 
-    for (int pid = 0; pid < env->num_agents+env->num_enemies; pid++) {
-        draw_entity(client, env, pid, delta);
+    for (int eid = 0; eid < env->num_agents + env->num_enemies; eid++) {
+        if (!entity_in_view(get_entity(env, eid), start_r, start_c, end_r, end_c)) {
+            continue;
+        }
+        draw_entity(client, env, eid, delta);
     }
 
     EndMode2D();
@@ -2919,8 +3054,7 @@ int process_centered_input() {
     if (IsKeyDown(KEY_ESCAPE)) {
         CloseWindow();
     }
-
-    if (shift_key()) {
+    if (IsKeyDown(KEY_SPACE)) {
         if (down_key()) {
             return ATN_DOWN_SHIFT;
         } else if (up_key()) {
@@ -2930,7 +3064,9 @@ int process_centered_input() {
         } else if (right_key()) {
             return ATN_RIGHT_SHIFT;
         }
-    } else if (up_key()) {
+        return ATN_ATTACK;
+    }
+    if (up_key()) {
         return ATN_UP;
     } else if (down_key()) {
         return ATN_DOWN;
@@ -2938,8 +3074,6 @@ int process_centered_input() {
         return ATN_LEFT;
     } else if (right_key()) {
         return ATN_RIGHT;
-    } else if (IsKeyDown(KEY_SPACE)) {
-        return ATN_ATTACK;
     } else if (IsKeyDown(KEY_ONE)) {
         return ATN_ONE;
     } else if (IsKeyDown(KEY_TWO)) {
@@ -3049,8 +3183,11 @@ void render_fixed(Client* client, MMO* env, float delta) {
     draw_min(client, env, start_c, start_r,
         end_c-start_c, end_r-start_r, env->width, env->height, 1, delta);
 
-    for (int pid = 0; pid < env->num_agents+env->num_enemies; pid++) {
-        draw_entity(client, env, pid, delta);
+    for (int eid = 0; eid < env->num_agents + env->num_enemies; eid++) {
+        if (!entity_in_view(get_entity(env, eid), start_r, start_c, end_r, end_c)) {
+            continue;
+        }
+        draw_entity(client, env, eid, delta);
     }
 
     EndMode2D();
@@ -3115,60 +3252,59 @@ void process_command_input(Client* client, MMO* env) {
     DrawText(text, 10, 10, 20, BLACK);
 }
 
-int c_render(MMO* env) {
+void puf_render(MMO* env) {
     if (env->client == NULL) {
-        // Must reset before making client
         env->client = make_client(env);
     }
     Client* client = env->client;
-    float delta = (float)client->frame / 36.0f;
+    int tick_action = ATN_NOOP;
+    // One env tick = TICK_FRAMES vsyncs. Desktop: EndDrawing waits.
+    for (int f = 0; f < TICK_FRAMES; f++) {
+        float delta = (float)f / (float)TICK_FRAMES;
+        BeginDrawing();
+        ClearBackground(BLANK);
 
-    BeginDrawing();
-    ClearBackground(BLANK);
-    int action = 0;
-
-    if (IsKeyDown(KEY_ESCAPE)) {
-        CloseWindow();
-        exit(0);
-    }
-    if (IsKeyPressed(KEY_TAB)) {
-        ToggleBorderlessWindowed();
-        if (client->render_mode == RENDER_MODE_CENTERED) {
-            client->render_mode = RENDER_MODE_FIXED;
+        if (IsKeyDown(KEY_ESCAPE)) {
+            CloseWindow();
+            exit(0);
+        }
+        if (IsKeyPressed(KEY_TAB)) {
+            if (client->render_mode == RENDER_MODE_CENTERED) {
+                client->render_mode = RENDER_MODE_FIXED;
+            } else {
+                client->render_mode = RENDER_MODE_CENTERED;
+            }
+        }
+        if (IsKeyPressed(KEY_GRAVE)) { // tilde
+            client->command_mode = !client->command_mode;
+            GetCharPressed(); // clear tilde key
+        }
+        if (client->render_mode == RENDER_MODE_FIXED) {
+            if (!client->command_mode) {
+                process_fixed_input(client);
+            }
+            render_fixed(client, env, delta);
         } else {
-            client->render_mode = RENDER_MODE_CENTERED;
+            int action = ATN_NOOP;
+            if (!client->command_mode) {
+                action = process_centered_input();
+            }
+            if (action != ATN_NOOP) {
+                tick_action = action;
+            }
+            if (shift_key() && env->agents[0].actions) {
+                env->agents[0].actions[0] = tick_action;
+            }
+            render_centered(client, env, client->my_player, action, delta);
         }
-    }
-    if (IsKeyPressed(KEY_GRAVE)) { // tilde
-        client->command_mode = !client->command_mode;
-        GetCharPressed(); // clear tilde key
-    }
-    if (client->render_mode == RENDER_MODE_FIXED) {
-        if (!client->command_mode) {
-            process_fixed_input(client);
+        if (client->command_mode) {
+            process_command_input(client, env);
         }
-        render_fixed(client, env, delta);
-    } else {
-        if (!client->command_mode) {
-            action = process_centered_input();
+        if (IsKeyDown(KEY_H)) {
+            DrawTextEx(client->font, TextFormat("FPS: %d", GetFPS()),
+                (Vector2){16, 16}, 24, 4, YELLOW);
         }
-        render_centered(client, env, client->my_player, action, delta);
+        EndDrawing();
+        puf_web_vsync();
     }
-    if (client->command_mode) {
-        process_command_input(client, env);
-    }
-
-    if (IsKeyDown(KEY_H)) {
-        DrawTextEx(client->font, TextFormat("FPS: %d", GetFPS()),
-            (Vector2){16, 16}, 24, 4, YELLOW);
-    }
-
-    EndDrawing();
-    client->frame += 1;
-    if (client->frame >= 36) {
-        client->frame = 0;
-    }
-    return action;
 }
-
-
