@@ -910,6 +910,32 @@ struct Weights {
     void* network;
 };
 
+// ArchTrainLength narrows views inside the preallocated training capacity.
+// It changes no parameter, pointer or rollout activation; graph nodes retain
+// their own shape arguments. Call only between completed learner operations.
+void ArchTrainLength(Weights& weights, Activations& activations, int batch, int time) {
+    auto* encoder = (EncoderActivations*)activations.encoder;
+    encoder->out.shape[0] = encoder->saved_input.shape[0] = batch * time;
+    auto* decoder = (DecoderActivations*)activations.decoder;
+    Prec* rows[] = {&decoder->out, &decoder->grad_out, &decoder->saved_input, &decoder->grad_input};
+    for (Prec* tensor : rows) {
+        tensor->shape[0] = batch * time;
+    }
+    auto* network = (MinGRUActivations*)activations.network;
+    auto* recurrent = (MinGRUWeights*)weights.network;
+    network->grad_input_buf.shape[0] = batch * time;
+    for (int layer = 0; layer < recurrent->num_layers; ++layer) {
+        network->saved_inputs[layer].shape[1] = time;
+        network->combined_bufs[layer].shape[0] = batch * time;
+        PrefixScan& scan = network->scan_bufs[layer];
+        scan.T = time;
+        Prec* sequences[] = {&scan.scan_h, &scan.out, &scan.grad_combined, &scan.grad_input};
+        for (Prec* tensor : sequences) {
+            tensor->shape[1] = time;
+        }
+    }
+}
+
 Prec arch_forward(Arch* p, Weights& w, Activations& activations,
         Prec obs, Prec state, cudaStream_t stream) {
     Prec enc_out = p->encoder.forward(

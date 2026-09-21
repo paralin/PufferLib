@@ -55,7 +55,7 @@ extern "C" int score(const float* p, const float* q, const float* actions,
     return 0;
 }
 extern "C" void targets(const float* rewards, const float* dones, float* result,
-        int horizon, float gamma, bool whole_match, int* counts) {
-    KlpoTargets(rewards, dones, result, horizon, gamma, whole_match, counts);
+        int horizon, int end_step, float gamma, bool whole_match, int* counts) {
+    KlpoTargets(rewards, dones, result, horizon, end_step, gamma, whole_match, counts);
 }
 #endif

@@ -33,6 +33,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <vector>
 
 // Project
 #include "ini.h"
@@ -297,6 +298,7 @@ __device__ __forceinline__ void block_reduce_sum(
 typedef struct {
     bool klpo;
     float klpo_beta;
+    int klpo_collect_steps;
     bool klpo_whole_match;
     int horizon;
     int total_agents;
@@ -438,6 +440,16 @@ RolloutBuf rollout_time_view(RolloutBuf* base, int start_t, int T) {
     return view;
 }
 
+// RolloutTrainLength keeps learner rows contiguous while narrowing time views.
+void RolloutTrainLength(RolloutBuf* data, int time) {
+    Prec* fields[] = {&data->observations, &data->values, &data->logprobs,
+        &data->rewards, &data->terminals, &data->action_mask};
+    for (Prec* field : fields) {
+        field->shape[1] = time;
+    }
+    data->actions.shape[1] = data->behavior.shape[1] = data->targets.shape[1] = time;
+}
+
 // Env batch. Device IO is always PuffeRL.env (EnvBuf).
 // CPU: host pins + workers. GPU: single-buffer device envs (no host pins).
 struct VecEnv {
@@ -561,6 +573,11 @@ typedef struct PuffeRL {
     float* current_gamma;
     float* klpo_counts;
     long klpo_episodes, klpo_decisions;
+    int* klpo_ends[2];  // Pinned physical-row endpoints, owned by the rollout slot.
+    int* klpo_device_ends;
+    long klpo_slot_steps[2];
+    bool klpo_pending;
+    cudaGraphExec_t klpo_graphs[2][32];
     long completed_episodes;
     RolloutBuf train_rollouts;  // Pre-allocated transposed copy for train_impl
     EnvBuf env;
@@ -1210,8 +1227,11 @@ static void* vec_thread_main(void* arg) {
             }
             return NULL;
         }
+        std::vector<int> closed(env_count, 0);
+        bool klpo = pufferl->hypers.klpo;
+        int last_step = 0;
         int h2d_pending = 0;
-        for (int t = 0; t < horizon; t++) {
+        for (int t = 0; t < horizon - (klpo ? 1 : 0); t++) {
             cudaEventRecord(ev[MODEL_START], stream);
             pufferl_forward(pufferl, buf, t, stream);
             cudaEventRecord(ev[MODEL_END], stream);
@@ -1236,8 +1256,20 @@ static void* vec_thread_main(void* arg) {
             clock_gettime(CLOCK_MONOTONIC, &t0);
             #pragma omp parallel for schedule(static) num_threads(vec->num_workers)
             for (int i = env_start; i < env_start + env_count; i++) {
+                if (klpo && closed[i - env_start]) {
+                    continue;
+                }
                 puf_step(&envs[i]);
+                if (klpo && t + 1 >= pufferl->hypers.klpo_collect_steps
+                        && *envs[i].agents[0].terminals != 0) {
+                    closed[i - env_start] = 1;
+                    for (int seat = 0; seat < envs[i].num_agents; ++seat) {
+                        int physical = envs[i].agents[seat].terminals - vec->terminals;
+                        pufferl->klpo_ends[pufferl->write_slot][physical] = t + 1;
+                    }
+                }
             }
+            last_step = t + 1;
             clock_gettime(CLOCK_MONOTONIC, &t1);
             my_accum[PROF_ENV] += (t1.tv_sec - t0.tv_sec) * 1000.0f
                 + (t1.tv_nsec - t0.tv_nsec) / 1e6f;
@@ -1245,6 +1277,33 @@ static void* vec_thread_main(void* arg) {
             cpu_upload(pufferl, agent_start, apb, stream);
             cudaEventRecord(ev[H2D_END], stream);
             h2d_pending = 1;
+            if (klpo) {
+                bool complete = true;
+                for (int done : closed) {
+                    complete = complete && done;
+                }
+                if (complete) {
+                    break;
+                }
+            }
+        }
+        if (klpo) {
+            for (int done : closed) {
+                if (!done) {
+                    fprintf(stderr, "KLPO match exceeded train.horizon capacity; "
+                        "increase capacity or reduce klpo_collect_steps\n");
+                    exit(1);
+                }
+            }
+            // The final action's outcome must be retained without sampling or
+            // executing an extra action from the automatically reset match.
+            RolloutBuf output = rollout_time_view(&pufferl->rollouts,
+                pufferl->write_slot * horizon, horizon);
+            Prec rewards = puf_slice(output.rewards, last_step, agent_start, apb);
+            Prec terminals = puf_slice(output.terminals, last_step, agent_start, apb);
+            cast_rew_term<<<grid_size(apb), BLOCK_SIZE, 0, stream>>>(
+                rewards.data, pufferl->env.rewards.data + agent_start,
+                terminals.data, pufferl->env.terminals.data + agent_start, apb);
         }
         cudaStreamSynchronize(stream);
         if (h2d_pending) {
@@ -1351,8 +1410,10 @@ static void rollout_start(PuffeRL* p) {
 }
 
 void rollout_finish(PuffeRL* p, double t0) {
-    p->collected_steps += (long)p->hypers.horizon
-        * p->vec->policy_layout[1] * p->vec->buffers;
+    if (!p->hypers.klpo) {
+        p->collected_steps += (long)p->hypers.horizon
+            * p->vec->policy_layout[1] * p->vec->buffers;
+    }
     if (PUF_BACKEND == PUF_GPU) {
         cudaStreamSynchronize(p->streams[0]);
         float model_ms = 0.0f, env_ms = 0.0f, ms;
@@ -1382,6 +1443,17 @@ void rollout_finish(PuffeRL* p, double t0) {
     for (int buf = 0; buf < p->vec->buffers; buf++) {
         int* state = &p->vec->worker_state[buf];
         while (__atomic_load_n(state, __ATOMIC_SEQ_CST) != BUF_WAITING) {}
+    }
+    if (p->hypers.klpo) {
+        long decisions = 0;
+        int learners = p->vec->policy_layout[1];
+        for (int buf = 0; buf < p->vec->buffers; ++buf) {
+            for (int row = 0; row < learners; ++row) {
+                decisions += p->klpo_ends[p->write_slot][buf * p->vec->agents_per_buf + row];
+            }
+        }
+        p->klpo_slot_steps[p->write_slot] = decisions;
+        p->collected_steps += decisions;
     }
     float sec = (float)(wall_clock() - t0);
     p->profile.accum[PROF_ROLLOUT] += sec * 1000.0f;
@@ -1579,7 +1651,7 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
     if (!hypers->klpo) {
         prepare_rollout(pufferl, src, slot, stream);
     }
-    int T = hypers->horizon;
+    int T = rollouts->observations.shape[1];
     int batch_size = pufferl->vec->policy_layout[1] * hypers->num_buffers * hypers->horizon;
     int mb_segs = hypers->minibatch_size / hypers->horizon;
     int total_minibatches = hypers->replay_ratio * batch_size / hypers->minibatch_size;
@@ -1693,13 +1765,14 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
 
     int batch_size = pufferl->vec->policy_layout[1] * hypers->num_buffers * hypers->horizon;
     bool anneal_lr = hypers->anneal_lr;
-    int current_epoch = pufferl->epoch;
+    long current_epoch = hypers->klpo ? pufferl->global_step : pufferl->epoch;
     Muon* muon = &pufferl->muon;
 
     // Schedule over this rank's train epochs (same as outer loop), not global
     // total_timesteps/batch — multi-GPU would otherwise only traverse 1/W of the
     // cosine and never reach min_lr / min_ent.
-    int total_epochs = hypers->total_timesteps / hypers->world_size / batch_size;
+    long total_epochs = hypers->klpo ? hypers->total_timesteps
+        : hypers->total_timesteps / hypers->world_size / batch_size;
     if (anneal_lr) {
         float lr_min = hypers->min_lr_ratio * hypers->lr;
         float lr = cosine_annealing(hypers->lr, lr_min, current_epoch, total_epochs);
@@ -1739,32 +1812,56 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
 
     int slot = hypers->async ? pufferl->async_ready_slot : 0;
     int total_minibatches = hypers->replay_ratio * batch_size / hypers->minibatch_size;
+    int bucket = 0;
     if (hypers->klpo) {
 #ifdef PUF_CONDITIONAL_GROUPS
+        int longest = 0;
+        for (int row = 0; row < pufferl->vec->total_agents; ++row) {
+            longest = std::max(longest, pufferl->klpo_ends[slot][row]);
+        }
+        int time = 1;
+        while (time <= longest) {
+            time *= 2;
+            ++bucket;
+        }
+        time = std::min(time, hypers->horizon);
+        src.observations.shape[0] = time;
+        RolloutTrainLength(&pufferl->train_rollouts, time);
+        RolloutTrainLength(&pufferl->replay.batch, time);
+        TrainGraph* graph = &pufferl->train_buf;
+        graph->mb_advantages.shape[1] = graph->mb_imp.shape[1] = graph->mb_gae_v.shape[1] = time;
+        pufferl->ppo_bufs.grad_logits.shape[1] = pufferl->ppo_bufs.grad_values.shape[1] = time;
+        int samples = graph->mb_advantages.shape[0];
+        ArchTrainLength(pufferl->policies[0].weights, pufferl->train_activs, samples, time);
         prepare_rollout(pufferl, src, slot, train_stream);
         RolloutBuf* data = &pufferl->train_rollouts;
         int rows = data->observations.shape[0];
+        cudaMemcpyAsync(pufferl->klpo_device_ends, pufferl->klpo_ends[slot],
+            pufferl->vec->total_agents * sizeof(int), cudaMemcpyHostToDevice, train_stream);
         cudaMemsetAsync(pufferl->klpo_counts, 0, 2 * sizeof(float), train_stream);
         KlpoPrepare<<<grid_size(rows), BLOCK_SIZE, 0, train_stream>>>(
             data->rewards.data, data->terminals.data, data->targets.data,
-            pufferl->replay.probabilities.data, pufferl->klpo_counts, rows, hypers->horizon,
+            pufferl->replay.probabilities.data, pufferl->klpo_counts, rows, time,
+            pufferl->klpo_device_ends, pufferl->vec->agents_per_buf, pufferl->vec->policy_layout[1],
             pufferl->current_gamma, hypers->klpo_whole_match, hypers->prio_alpha);
         float counts[2];
         cudaMemcpyAsync(counts, pufferl->klpo_counts, sizeof(counts),
             cudaMemcpyDeviceToHost, train_stream);
         cudaStreamSynchronize(train_stream);
+        if (counts[0] <= 0 || (long)counts[1] != pufferl->klpo_slot_steps[slot]) {
+            fprintf(stderr, "KLPO complete-match accounting mismatch: %.0f targets for %ld actions\n",
+                counts[1], pufferl->klpo_slot_steps[slot]);
+            exit(1);
+        }
         pufferl->klpo_episodes += (long)counts[0];
         pufferl->klpo_decisions += (long)counts[1];
-        // Empty windows consume interactions but must not step optimizer momentum.
-        if (counts[0] == 0) {
-            pufferl->epoch += 1;
-            return;
-        }
         ReplayCDF<<<1, 1, 0, train_stream>>>(pufferl->replay.probabilities.data,
             pufferl->replay.cdf.data, rows);
 #endif
     }
-    bool first = hypers->cudagraphs && pufferl->train_cudagraph[slot] == NULL;
+    cudaGraphExec_t* train_graph = hypers->klpo ? &pufferl->klpo_graphs[slot][bucket]
+        : &pufferl->train_cudagraph[slot];
+    bool first = hypers->cudagraphs && *train_graph == NULL;
     profile_begin("train_forward_backward", hypers->profile);
     if (first) {
         double t_cap = wall_clock();
@@ -1776,7 +1873,7 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
         assert(cudaStreamEndCapture(train_stream, &graph)
             == cudaSuccess && "cudaStreamEndCapture failed");
         assert(cudaGraphInstantiate(
-            &pufferl->train_cudagraph[slot], graph, 0)
+            train_graph, graph, 0)
             == cudaSuccess && "cudaGraphInstantiate failed");
         cudaGraphDestroy(graph);
         double dt = wall_clock() - t_cap;
@@ -1784,7 +1881,7 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
         pufferl->last_log_time += dt;
     }
     if (hypers->cudagraphs) {
-        cudaGraphLaunch(pufferl->train_cudagraph[slot], train_stream);
+        cudaGraphLaunch(*train_graph, train_stream);
     } else {
         train_epoch_gpu(pufferl, src, slot, train_stream);
     }
@@ -1952,6 +2049,9 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     if (!dict_find(train, "klpo_returns")) {
         dict_set_str(train, "klpo_returns", "whole_match");
     }
+    if (!dict_find(train, "klpo_collect_steps")) {
+        dict_set(train, "klpo_collect_steps", 2048);
+    }
     if (!dict_find(train, "klpo_beta")) {
         dict_set(train, "klpo_beta", 0.1);
     }
@@ -1964,6 +2064,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     Hypers hypers = {
         .klpo = strcmp(learner, "klpo") == 0,
         .klpo_beta = puf_ini_get(ini, "train", "klpo_beta"),
+        .klpo_collect_steps = puf_ini_get(ini, "train", "klpo_collect_steps"),
         .klpo_whole_match = strcmp(returns, "whole_match") == 0,
         .horizon = puf_ini_get(ini, "train", "horizon"),
         .total_agents = puf_ini_get(ini, "vec", "total_agents"),
@@ -2019,10 +2120,12 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         fprintf(stderr, "KLPO currently requires conditional discrete controls\n");
         exit(1);
 #endif
-        if (!hypers.prioritized_replay || hypers.reset_every_horizon || ctx->world_size != 1
+        if (PUF_BACKEND == PUF_GPU || !hypers.prioritized_replay || hypers.reset_every_horizon || ctx->world_size != 1
+                || hypers.klpo_collect_steps < 1 || hypers.klpo_collect_steps >= hypers.horizon
                 || hypers.replay_ratio <= 0 || !isfinite(hypers.klpo_beta) || hypers.klpo_beta <= 0
                 || (strcmp(returns, "whole_match") && strcmp(returns, "discounted"))) {
-            fprintf(stderr, "KLPO requires prioritized replay, recurrent carry, one GPU, "
+            fprintf(stderr, "KLPO requires a CPU environment, collection target below horizon capacity, "
+                "prioritized replay, recurrent carry, one GPU, "
                 "positive replay_ratio/beta, and whole_match or discounted returns\n");
             exit(1);
         }
@@ -2221,6 +2324,10 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     cudaMalloc((void**)&pufferl->current_gamma, sizeof(float));
     if (hypers.klpo) {
         cudaMalloc((void**)&pufferl->klpo_counts, 2 * sizeof(float));
+        cudaMalloc((void**)&pufferl->klpo_device_ends, total_agents * sizeof(int));
+        for (int slot = 0; slot < async_slots; ++slot) {
+            cudaHostAlloc((void**)&pufferl->klpo_ends[slot], total_agents * sizeof(int), cudaHostAllocPortable);
+        }
     }
 
     muon_init(&pufferl->muon, &primary->params_alloc, hypers.momentum, acts);
@@ -2701,7 +2808,20 @@ double rollout_start(PuffeRL* p, int slot) {
             n * sizeof(precision_t), cudaMemcpyDeviceToDevice, p->default_stream);
         cudaStreamSynchronize(p->default_stream);
     }
-    if (p->hypers.reset_every_horizon) {
+    if (p->hypers.klpo) {
+        RolloutBuf data = rollout_time_view(&p->rollouts, slot * p->hypers.horizon,
+            p->hypers.horizon);
+        Prec* fields[] = {&data.observations, &data.values, &data.logprobs,
+            &data.rewards, &data.terminals, &data.action_mask};
+        for (Prec* field : fields) {
+            cudaMemsetAsync(field->data, 0, numel(field->shape) * sizeof(precision_t),
+                p->default_stream);
+        }
+        cudaMemsetAsync(data.actions.data, 0, numel(data.actions.shape) * sizeof(float), p->default_stream);
+        cudaMemsetAsync(data.behavior.data, 0, numel(data.behavior.shape) * sizeof(float), p->default_stream);
+        memset(p->klpo_ends[slot], 0, p->vec->total_agents * sizeof(int));
+    }
+    if (p->hypers.reset_every_horizon || p->hypers.klpo) {
         for (int b = 0; b < p->num_policies; b++) {
             for (int i = 0; i < p->hypers.num_buffers; i++) {
                 Prec* st = &p->policies[b].buffer_states[i];
@@ -2719,7 +2839,8 @@ double rollout_start(PuffeRL* p, int slot) {
 void rollouts(PuffeRL* p) {
     double t0 = rollout_start(p, 0);
     rollout_finish(p, t0);
-    p->global_step += (long)p->hypers.horizon * p->vec->policy_layout[1] * p->vec->buffers;
+    p->global_step += p->hypers.klpo ? p->klpo_slot_steps[0]
+        : (long)p->hypers.horizon * p->vec->policy_layout[1] * p->vec->buffers;
 }
 
 typedef struct {
@@ -3192,6 +3313,7 @@ static PuffeRL* eval_make(Ini* ini, TrainContext* ctx, int mode, int render) {
         puf_ini_put(ini, "selfplay.enabled", "0");
     }
     puf_ini_put(ini, "base.reset_every_horizon", "0");
+    puf_ini_put(ini, "train.learner", "ppo");
     if (render) {
         puf_ini_put(ini, "train.horizon", "1");
     }
@@ -3356,7 +3478,10 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     long batch_size = (long)pufferl->vec->policy_layout[1]
         * pufferl->vec->buffers * pufferl->hypers.horizon;
     long local_timesteps = total_timesteps / ctx->world_size;
-    long train_epochs = local_timesteps / batch_size;
+    long minimum_batch = pufferl->hypers.klpo
+        ? (long)pufferl->vec->policy_layout[1] * pufferl->vec->buffers * pufferl->hypers.klpo_collect_steps
+        : batch_size;
+    long train_epochs = (local_timesteps + minimum_batch - 1) / minimum_batch + 1;
     long checkpoint_interval = puf_ini_get(ini, "base", "checkpoint_interval");
     char target_key[128];
     sweep_metric_key(ini, target_key, sizeof(target_key));
@@ -3367,11 +3492,13 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     TrainResult result = {0};
     char final_checkpoint[4096] = {0};
 
-    for (long epoch = pufferl->epoch; epoch < train_epochs; epoch++) {
+    for (long epoch = pufferl->epoch;
+            pufferl->hypers.klpo ? (pufferl->global_step < local_timesteps || pufferl->klpo_pending)
+                : epoch < local_timesteps / batch_size; ++epoch) {
         if (pufferl->hypers.async) {
             // Cleanba 2-slot: warmup fills slot 0; then collect into write
             // while training the other slot (exactly one epoch old).
-            int prefetch_next = epoch + 1 < train_epochs;
+            int prefetch_next = epoch + 1 < local_timesteps / batch_size;
             if (!pufferl->async_boot) {
                 double t0 = rollout_start(pufferl, 0);
                 rollout_finish(pufferl, t0);
@@ -3382,12 +3509,20 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
 
             int ready_slot = pufferl->async_ready_slot;
             int write_slot = pufferl->async_write_slot;
+            if (pufferl->hypers.klpo) {
+                bool save_due = (checkpoint_seconds > 0 && wall_clock() >= next_checkpoint)
+                    || (checkpoint_interval > 0 && (epoch + 1) % checkpoint_interval == 0);
+                prefetch_next = pufferl->global_step + pufferl->klpo_slot_steps[ready_slot] < local_timesteps
+                    && !train_stop_requested && !(stop_at > 0 && time(NULL) >= stop_at) && !save_due;
+                pufferl->klpo_pending = prefetch_next;
+            }
             double t0 = 0.0;
             if (prefetch_next) {
                 t0 = rollout_start(pufferl, write_slot);
             }
 
-            pufferl->global_step += batch_size;
+            pufferl->global_step += pufferl->hypers.klpo
+                ? pufferl->klpo_slot_steps[ready_slot] : batch_size;
             RolloutBuf train_src = rollout_time_view(&pufferl->rollouts,
                 ready_slot * pufferl->hypers.horizon, pufferl->hypers.horizon);
             train_impl(pufferl, &train_src);
@@ -3396,18 +3531,23 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
                 rollout_finish(pufferl, t0);
                 pufferl->async_ready_slot = 1 - ready_slot;
                 pufferl->async_write_slot = 1 - write_slot;
+            } else if (pufferl->hypers.klpo) {
+                pufferl->async_boot = false;
             }
         } else {
             rollouts(pufferl);
             train_impl(pufferl, NULL);
         }
 
-        stopped = train_stop_requested || (stop_at > 0 && time(NULL) >= stop_at);
+        bool finished = pufferl->hypers.klpo ? pufferl->global_step >= local_timesteps
+            : epoch + 1 >= local_timesteps / batch_size;
+        bool drained = !pufferl->hypers.klpo || !pufferl->klpo_pending;
+        stopped = drained && (train_stop_requested || (stop_at > 0 && time(NULL) >= stop_at));
         char saved_checkpoint[4096] = {0};
-        if (stopped || epoch == train_epochs - 1
+        if (drained && (stopped || finished
                 || (checkpoint_seconds > 0 && wall_clock() >= next_checkpoint)
                 || (checkpoint_interval > 0
-                && (epoch + 1) % checkpoint_interval == 0)) {
+                && (epoch + 1) % checkpoint_interval == 0))) {
             next_checkpoint = wall_clock() + checkpoint_seconds;
             snprintf(saved_checkpoint, sizeof(saved_checkpoint),
                 "%s/%016ld.bin", checkpoint_dir, pufferl->global_step);
@@ -3437,7 +3577,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         }
 
         if (last_log.size && wall_clock()
-                < pufferl->last_log_time + 0.6 && epoch < train_epochs - 1
+                < pufferl->last_log_time + 0.6 && !finished
                 && !saved_checkpoint[0]) {
             continue;
         }
@@ -3465,6 +3605,8 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             dict_set(&new_log, "klpo/complete_episodes", pufferl->klpo_episodes);
             dict_set(&new_log, "klpo/used_decisions", pufferl->klpo_decisions);
             dict_set(&new_log, "klpo/used_fraction", (double)pufferl->klpo_decisions / global_step);
+            dict_set(&new_log, "klpo/pending_decisions", pufferl->collected_steps - global_step);
+            dict_set(&new_log, "klpo/train_length", pufferl->train_rollouts.observations.shape[1]);
         }
         dict_set(&new_log, "learner_rows", pufferl->vec->policy_layout[1] * pufferl->vec->buffers);
         dict_set(&new_log, "policy_rows", pufferl->vec->total_agents);

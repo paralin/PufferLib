@@ -96,34 +96,31 @@ __device__ KlpoScore KlpoConditionalScore(const float* p, const float* q,
 }
 #endif
 
-// Rewards/dones at t describe the outcome of action t-1. NaN marks incomplete
-// edges. A reset on each end is required: no value bootstrap or stale prefix.
-// Returns the number of complete episodes and their number of action decisions.
+// Rewards/dones at t describe action t-1. Collection begins at a real reset
+// and drains through the terminal at end_step. Only padding receives NaN.
 __device__ void KlpoTargets(const precision_t* rewards, const precision_t* dones,
-        float* targets, int horizon, float gamma, bool whole_match, int* counts) {
+        float* targets, int horizon, int end_step, float gamma, bool whole_match, int* counts) {
     for (int t = 0; t < horizon; ++t) {
         targets[t] = NAN;
     }
-    int start = -1;
+    int start = 0;
     counts[0] = counts[1] = 0;
-    for (int end = 0; end < horizon; ++end) {
+    for (int end = 1; end <= end_step; ++end) {
         if (to_float(dones[end]) == 0) {
             continue;
         }
-        if (start >= 0) {
-            float value = 0;
-            for (int t = end - 1; t >= start; --t) {
-                value = to_float(rewards[t + 1]) + (whole_match ? 1.0f : gamma) * value;
+        float value = 0;
+        for (int t = end - 1; t >= start; --t) {
+            value = to_float(rewards[t + 1]) + (whole_match ? 1.0f : gamma) * value;
+            targets[t] = value;
+        }
+        if (whole_match) {
+            for (int t = start; t < end; ++t) {
                 targets[t] = value;
             }
-            if (whole_match) {
-                for (int t = start; t < end; ++t) {
-                    targets[t] = value;
-                }
-            }
-            counts[0] += 1;
-            counts[1] += end - start;
         }
+        counts[0] += 1;
+        counts[1] += end - start;
         start = end;
     }
 }

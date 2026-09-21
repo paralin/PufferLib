@@ -11,14 +11,16 @@ __global__ void KlpoRecord(Prec decoder, const float* actions, float* behavior) 
 
 __global__ void KlpoPrepare(const precision_t* rewards, const precision_t* dones,
         float* targets, float* priorities, float* counts, int rows, int horizon,
+        const int* ends, int buffer_rows, int learner_rows,
         const float* gamma, bool whole_match, float alpha) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows) {
         return;
     }
     int n[2];
+    int physical = row / learner_rows * buffer_rows + row % learner_rows;
     KlpoTargets(rewards + row * horizon, dones + row * horizon,
-        targets + row * horizon, horizon, *gamma, whole_match, n);
+        targets + row * horizon, horizon, ends[physical], *gamma, whole_match, n);
     float mass = 0;
     for (int t = 0; t < horizon; ++t) {
         float value = targets[row * horizon + t];

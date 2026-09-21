@@ -46,26 +46,41 @@ returns. Full inverse sampling correction, including the global episode count,
 preserves the episode average over the retained data. The user-selected
 `prio_beta0` schedule is overridden with 1 for KLPO. Replay must be enabled.
 
-Only episodes whose start and end both lie inside one collection window train.
-This guarantees a fixed recorded sampler and a real recurrent reset. Unfinished
-edges, including the initial partial episode, have no loss. Empty windows do
-not step optimizer momentum. This filtering favors shorter episodes; matches
-longer than the horizon cannot contribute. It is a current collector limitation,
-not an unbiased full-match sampling claim. Use a long horizon, inspect
-`klpo/used_fraction`, and account for discarded interactions when comparing
-sample efficiency. Do not substitute bootstrapped values to hide this loss.
+Collection starts at a real match reset. `--train.klpo_collect_steps=2048`
+is a minimum per-row collection target. After reaching it, each environment
+finishes its current match and pauses. The sampler stays fixed until the whole
+cohort is complete. Every executed decision, including the first match and final
+terminal outcome, contributes; there is no value bootstrap or discarded tail.
+
+`--train.horizon` is the bounded allocation capacity, not a forced match boundary.
+It must hold the collection target, the longest remaining match, and the final
+outcome. Capacity exhaustion stops with an error rather than silently truncating
+experience. Training uses the smallest power-of-two time bucket covering the
+collected data, capped at capacity. Padding has no loss; HIP/CUDA graphs are
+cached by bucket and rollout slot. Minibatch size remains expressed in capacity
+rows: `minibatch_size / horizon` rows per update.
+
+An async collector can have one complete cohort queued while another trains.
+At a checkpoint, stop signal, deadline, or decision budget, the trainer finishes
+and learns from queued experience before publishing a paired checkpoint. The
+budget or deadline can be exceeded by this bounded drain. Checkpoints retain
+optimizer, sampler RNG and counters, then resume with fresh matches; they do
+not serialize an in-progress environment. A hard kill can lose work since the
+last checkpoint. Old paired PPO checkpoints still load.
 
 `klpo/complete_episodes` and `klpo/used_decisions` are cumulative unique retained
 data, not multiplied by replay reuse. `fresh_decisions` counts collection,
-including asynchronous prefetch. `loss/kl` is exact mean schedule KL(q || p),
+including asynchronous prefetch. `klpo/pending_decisions` reports that queued
+experience, and is zero at checkpoints and graceful exit. `klpo/used_fraction`
+is one for the new collector; `klpo/train_length` reports the active time bucket.
+`loss/kl` is exact mean schedule KL(q || p),
 `loss/entropy` is mean schedule entropy, and `loss/policy` is the per-episode
 surrogate; none is an independent gameplay score.
 
-Current support is one GPU and conditional discrete controls with recurrent
-carry. Continuous actions, arbitrary masked categories and multi-GPU episode
-normalization are not implemented. Paired resume restores optimizer, RNG and
-counters and starts fresh matches, as PPO does. It does not resume an interrupted
-match or preserve discarded rollout edges. Old paired PPO checkpoints still load.
+Current support is one GPU, a CPU environment with shared terminal boundaries
+across its agents, and conditional discrete controls with recurrent carry.
+Continuous actions, arbitrary masked categories, GPU environments and multi-GPU
+episode normalization are not implemented.
 
 ## Checks
 
@@ -80,6 +95,7 @@ The arithmetic probe compiles the production score and target functions. Its
 independent float64 autograd reference enumerates and merges schedules. The
 native trainer check exercises eager/graph agreement, asynchronous collection,
 complete-match and discounted targets, recurrent weight updates, inert value
-weights, empty-window skipping, PPO and paired resume. The HIP build has been
+weights, complete decision accounting, capacity rejection, periodic checkpoint
+and SIGTERM drain, PPO and paired resume. The HIP build has been
 exercised on an RX 7700 XT; CUDA execution and learning-quality superiority are
 not established by these checks.

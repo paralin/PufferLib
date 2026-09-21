@@ -27,7 +27,7 @@ def native(tmp_path_factory):
     pointer = np.ctypeslib.ndpointer(dtype=np.float32, flags="C_CONTIGUOUS")
     result.score.argtypes = [pointer] * 5
     if not hip:
-        result.targets.argtypes = [pointer] * 3 + [ctypes.c_int, ctypes.c_float,
+        result.targets.argtypes = [pointer] * 3 + [ctypes.c_int, ctypes.c_int, ctypes.c_float,
             ctypes.c_bool, np.ctypeslib.ndpointer(dtype=np.int32)]
     return result
 
@@ -88,20 +88,21 @@ def test_native_score_and_gradient(native, scale, constant):
 def test_complete_episode_targets(native):
     if os.environ.get("KLPO_TEST_HIP") == "1":
         pytest.skip("boundary scan covered by the host probe and native train smoke")
-    rewards = np.array([99, 98, 1, 2, 3, 4, 5, 6, 7], np.float32)
-    dones = np.array([0, 1, 0, 0, 1, 0, 1, 0, 0], np.float32)
+    # Two complete matches cross a notional target at action 2. Outcome index
+    # six belongs to the final executed action, not to a seventh action.
+    rewards = np.array([99, 1, 2, 3, 4, 5, 6, 88, 77], np.float32)
+    dones = np.array([0, 0, 0, 0, 1, 0, 1, 1, 1], np.float32)
     output = np.empty(9, np.float32)
     counts = np.zeros(2, np.int32)
-    native.targets(rewards, dones, output, 9, 0.5, False, counts)
-    np.testing.assert_allclose(output, [np.nan, 2.75, 3.5, 3, 6.5, 5,
+    native.targets(rewards, dones, output, 9, 6, 0.5, False, counts)
+    np.testing.assert_allclose(output, [3.25, 4.5, 5, 4, 8, 6,
                                        np.nan, np.nan, np.nan])
-    np.testing.assert_array_equal(counts, [2, 5])
-    native.targets(rewards, dones, output, 9, 0.5, True, counts)
-    np.testing.assert_allclose(output, [np.nan, 6, 6, 6, 9, 9, np.nan, np.nan, np.nan])
-    dones.fill(0)
-    native.targets(rewards, dones, output, 9, 0.5, False, counts)
-    assert np.isnan(output).all()
-    np.testing.assert_array_equal(counts, [0, 0])
+    np.testing.assert_array_equal(counts, [2, 6])
+    native.targets(rewards, dones, output, 9, 6, 0.5, True, counts)
+    np.testing.assert_allclose(output, [10, 10, 10, 10, 11, 11, np.nan, np.nan, np.nan])
+    # Padding can look terminal and contain arbitrary rewards without creating
+    # another episode or changing the last match's target.
+    np.testing.assert_array_equal(counts, [2, 6])
 
 
 def test_prioritized_episode_average():
