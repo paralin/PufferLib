@@ -10,7 +10,7 @@ struct Replay {
 };
 
 void RegisterReplay(Replay* replay, Allocator* alloc, int rows, int samples,
-        int horizon, int inputs, int actions, int mask, int layers, int hidden) {
+        int horizon, int inputs, int actions, int mask, int layers, int hidden, bool klpo) {
     replay->advantages = {.shape = {rows, horizon}};
     replay->returns = {.shape = {rows, horizon}};
     replay->state = {.shape = {layers, samples, hidden}};
@@ -23,7 +23,7 @@ void RegisterReplay(Replay* replay, Allocator* alloc, int rows, int samples,
     alloc_register(alloc, &replay->probabilities);
     alloc_register(alloc, &replay->cdf);
     alloc_register(alloc, &replay->importance);
-    register_rollout_buffers(&replay->batch, alloc, samples, horizon, inputs, actions, mask);
+    register_rollout_buffers(&replay->batch, alloc, samples, horizon, inputs, actions, mask, klpo);
     cudaMalloc((void**)&replay->indices, samples * sizeof(int));
     cudaMalloc((void**)&replay->beta, sizeof(float));
 }
@@ -113,6 +113,13 @@ void GatherReplay(Replay* replay, const RolloutBuf& source, Prec state,
         int width = src[i]->shape[1] * (src[i]->shape[2] > 0 ? src[i]->shape[2] : 1);
         ReplayGather<<<grid_size(samples * width), BLOCK_SIZE, 0, stream>>>(
             dst[i]->data, src[i]->data, replay->indices, samples, width);
+    }
+    if (source.behavior.data) {
+        int width = horizon * source.behavior.shape[2];
+        ReplayGather<<<grid_size(samples * width), BLOCK_SIZE, 0, stream>>>(
+            replay->batch.behavior.data, source.behavior.data, replay->indices, samples, width);
+        ReplayGather<<<grid_size(samples * horizon), BLOCK_SIZE, 0, stream>>>(
+            replay->batch.targets.data, source.targets.data, replay->indices, samples, horizon);
     }
     int action_width = horizon * source.actions.shape[2];
     ReplayGather<<<grid_size(samples * action_width), BLOCK_SIZE, 0, stream>>>(

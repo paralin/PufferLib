@@ -66,7 +66,7 @@ void CheckLayout(Dict* state, PuffeRL* p, bool write) {
         {"total_agents", p->vec->total_agents}, {"buffers", p->vec->buffers},
         {"learner_rows", p->vec->policy_layout[1]}, {"policies", p->num_policies},
         {"hidden_size", p->hypers.hidden_size}, {"layers", p->hypers.num_layers},
-        {"horizon", p->hypers.horizon}, {"seed", p->seed},
+        {"klpo", p->hypers.klpo}, {"horizon", p->hypers.horizon}, {"seed", p->seed},
 #ifdef __HIP_PLATFORM_AMD__
         {"hip", 1},
 #else
@@ -77,6 +77,10 @@ void CheckLayout(Dict* state, PuffeRL* p, bool write) {
         if (write) {
             dict_set(state, field.name, field.value);
         } else {
+            if (strcmp(field.name, "klpo") == 0 && !dict_find(state, field.name)) {
+                Require(!p->hypers.klpo, "PPO state cannot resume as KLPO");
+                continue;
+            }
             Require(dict_get(state, field.name) == field.value,
                 std::string("incompatible ") + field.name);
         }
@@ -124,6 +128,8 @@ void Save(const char* weights_path, Ini* config, PuffeRL* p, Selfplay* pool) {
     dict_set(state, "global_step", p->global_step);
     dict_set(state, "collected_steps", p->collected_steps);
     dict_set(state, "episodes", p->completed_episodes);
+    dict_set(state, "klpo_episodes", p->klpo_episodes);
+    dict_set(state, "klpo_decisions", p->klpo_decisions);
     dict_set(state, "pool_size", pool->pool_size);
     dict_set(state, "pool_rng", pool->rng);
     StateFiles(temporary, p, true);
@@ -154,6 +160,10 @@ void Load(const char* directory, PuffeRL* p, Selfplay* pool) {
     p->global_step = dict_get(state, "global_step");
     p->collected_steps = dict_get(state, "collected_steps");
     p->completed_episodes = dict_get(state, "episodes");
+    if (p->hypers.klpo) {
+        p->klpo_episodes = dict_get(state, "klpo_episodes");
+        p->klpo_decisions = dict_get(state, "klpo_decisions");
+    }
     Require(p->epoch >= 0 && p->global_step >= 0 && p->completed_episodes >= 0,
         "negative training counters");
     StateFiles(root, p, false);
