@@ -34,13 +34,18 @@ typedef float obs_t;
 struct Log { float perf, n; };
 struct Env {
     Log log;
-    Agent agents[1];
+    Agent agents[2];
     int tag, boundary_reached, num_agents;
     unsigned int rng;
 };
-void puf_init(Env* env, Dict* kwargs) { env->num_agents = 1; }
+void puf_init(Env* env, Dict* kwargs) {
+    env->num_agents = 2;
+    env->agents[1].policy = 1;
+}
 void puf_reset(Env* env) {
-    memset(env->agents[0].observations, 0, OBS_SIZE * sizeof(obs_t));
+    for (int a = 0; a < env->num_agents; ++a) {
+        memset(env->agents[a].observations, 0, OBS_SIZE * sizeof(obs_t));
+    }
 }
 void puf_step(Env* env) {}
 void puf_render(Env* env) {}
@@ -63,13 +68,17 @@ int main(int argc, char** argv) {
     puf_ini_load_file(&ini, "config/default.ini");
     puf_ini_put(&ini, "base.async", argv[1]);
     puf_ini_put(&ini, "base.cudagraphs", "-1");
-    puf_ini_put(&ini, "vec.total_agents", "4");
+    puf_ini_put(&ini, "vec.total_agents", "8");
+    puf_ini_put(&ini, "vec.num_policies", "2");
+    puf_ini_put(&ini, "vec.hist_policy_percent", "0.5");
+    puf_ini_put(&ini, "vec.hist_policy_hidden_size", "32");
+    puf_ini_put(&ini, "vec.hist_policy_num_layers", "1");
     puf_ini_put(&ini, "vec.num_buffers", "1");
     puf_ini_put(&ini, "vec.num_threads", "1");
     puf_ini_put(&ini, "policy.hidden_size", "32");
     puf_ini_put(&ini, "policy.num_layers", "1");
     puf_ini_put(&ini, "train.horizon", "4");
-    puf_ini_put(&ini, "train.minibatch_size", "16");
+    puf_ini_put(&ini, "train.minibatch_size", "8");
     TrainContext ctx = {.rank = 0, .world_size = 1, .gpu_id = 0, .artifact_owner = 1};
     PuffeRL* p = create_pufferl(&ini, &ctx);
     Policy* pol = &p->policies[0];
@@ -164,6 +173,9 @@ int main(int argc, char** argv) {
     assert(stat(path, &st) == 0 && st.st_size == n * (long)sizeof(float));
     cudaMemset(pol->master_weights.data, 0, n * sizeof(float));
     cudaMemset(pol->param.data, 0, params->total_bytes);
+    if (p->hypers.async) {
+        cudaMemset(p->actor_param.data, 0, p->weight_alloc.total_bytes);
+    }
     pufferl_load_policy(p, 0, path);
     cudaMemcpy(actual, pol->master_weights.data, n * sizeof(float), cudaMemcpyDeviceToHost);
     assert(memcmp(actual, expected, n * sizeof(float)) == 0);
@@ -173,12 +185,44 @@ int main(int argc, char** argv) {
         assert(to_float(restored[j]) == to_float(from_float(expected[j])));
     }
     if (p->hypers.async) {
-        cudaMemset(p->actor_param.data, 0, p->weight_alloc.total_bytes);
-        puf_copy(&p->actor_param, &pol->param, p->default_stream);
-        assert(cudaDeviceSynchronize() == cudaSuccess);
         cudaMemcpy(gradients, p->actor_param.data, p->weight_alloc.total_bytes,
             cudaMemcpyDeviceToHost);
         assert(memcmp(gradients, restored, params->total_bytes) == 0);
+    }
+    // Replacing an opponent resets both seats only in that opponent's matches.
+    for (int i = 0; i < p->vec->size; ++i) {
+        Env* env = &p->vec->envs[i];
+        env->boundary_reached = 1;
+        for (int a = 0; a < env->num_agents; ++a) {
+            env->agents[a].observations[0] = 7;
+            *env->agents[a].rewards = 3;
+            *env->agents[a].terminals = 0;
+        }
+    }
+    for (int i = 0; i < p->num_policies; ++i) {
+        Prec* state = &p->policies[i].buffer_states[0];
+        cudaMemset(state->data, 1, numel(state->shape) * sizeof(precision_t));
+    }
+    pufferl_reset_policy_envs(p, 1);
+    for (int i = 0; i < p->vec->size; ++i) {
+        Env* env = &p->vec->envs[i];
+        bool reset = env->tag == 1;
+        assert(env->boundary_reached == !reset);
+        for (int a = 0; a < env->num_agents; ++a) {
+            Agent* agent = &env->agents[a];
+            assert(agent->observations[0] == (reset ? 0 : 7));
+            assert(*agent->rewards == (reset ? 0 : 3));
+            assert(*agent->terminals == reset);
+            int physical = (int)(agent->rewards - p->vec->rewards);
+            int policy = physical >= p->vec->policy_layout[1];
+            Prec* state = &p->policies[policy].buffer_states[0];
+            int local = physical - p->vec->policy_layout[policy];
+            precision_t value;
+            cudaMemcpy(&value, state->data + local * 32, sizeof(value), cudaMemcpyDeviceToHost);
+            unsigned char bytes[sizeof(value)];
+            memset(bytes, reset ? 0 : 1, sizeof(bytes));
+            assert(memcmp(&value, bytes, sizeof(value)) == 0);
+        }
     }
     assert(unlink(path) == 0);
     close_pufferl(p);

@@ -159,3 +159,13 @@ def test_checkpoint_and_stop_drain_prefetch(trainer, tmp_path):
         assert counters["klpo_decisions"] == counters["global_step"]
     np.testing.assert_array_equal(weights(output / "actor.bin"),
                                   weights(states[-1] / "weights.f32"))
+
+
+def test_final_evaluation_preserves_training_metadata(trainer, tmp_path):
+    run(trainer, tmp_path, "eval-metadata", **{
+        "base.eval_episodes": 2, "base.eval_agents": 2,
+    })
+    saved = tmp_path / "logs/llb-rust/eval-metadata.ini"
+    assert read_ini(saved, "train")["learner"] == "klpo"
+    assert read_ini(saved, "vec")["total_agents"] == "8"
+    assert read_ini(saved, "base")["load_model_path"] == "None"

@@ -3639,7 +3639,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             selfplay_add_checkpoint(&selfplay, saved_checkpoint);
         }
 
-        // Opponent replacement clears that policy's recurrent state between rollouts.
+        // Opponent replacement starts fresh matches between rollouts.
         if (use_selfplay && selfplay.opp_timeout_steps > 0) {
             long step = pufferl->global_step * pufferl->hypers.world_size;
             for (int s = 0; s < selfplay.num_hist; s++) {
@@ -3805,6 +3805,15 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     // child vec workers in BUF_RUNNING/BUF_WAITING while rank 0 waitpid()s
     // (and previously poisoned rank-0 CUDA graphs if children exited early).
     close_pufferl(pufferl);
+    // Evaluation changes vector sizes and policy settings, not the training record.
+    Ini* training_ini = ini;
+    Ini eval_ini = {};
+    eval_ini.num_sections = ini->num_sections;
+    eval_ini.sections = (Dict*)calloc(eval_ini.num_sections, sizeof(Dict));
+    for (int i = 0; i < eval_ini.num_sections; ++i) {
+        dict_copy(&eval_ini.sections[i], &ini->sections[i]);
+    }
+    ini = &eval_ini;
     if (ctx->artifact_owner && !bot_ladder && !pool_eval && eval_episodes > 0
             && eval_ckpt[0]) {
         puf_ini_put(ini, "base.load_model_path", eval_ckpt);
@@ -3828,7 +3837,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         FILE* fp = fopen(log_path, "w");
         assert(fp && "failed to open log for writing");
         fprintf(fp, "# PufferLib log v1\n");
-        puf_ini_write(fp, ini);
+        puf_ini_write(fp, training_ini);
         fclose(fp);
     }
 
@@ -3948,6 +3957,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     }
     free(log_history.items);
     free(selfplay.pool);
+    puf_ini_free(&eval_ini);
     return result;
 }
 

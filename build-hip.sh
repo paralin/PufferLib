@@ -35,7 +35,7 @@ sed -i \
     -e 's/\* 1e-6f;/\/ clock_khz;/' \
     "$build/src/pufferl.cu"
 # hipBLAS manages its workspace internally.
-sed -i '/hipblasSetWorkspace/d; /hipMalloc(workspace, ws_bytes)/d' "$build/src/algo.cu"
+sed -i '/hipblasSetWorkspace/d; /hipMalloc(.*workspace, ws_bytes)/d' "$build/src/algo.cu"
 
 "$rocm/bin/hipcc" --offload-arch="${HIP_ARCH:-native}" -std=c++17 -O2 -fopenmp \
     -Wno-narrowing -Wno-deprecated-declarations \
