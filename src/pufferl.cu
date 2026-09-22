@@ -837,7 +837,7 @@ Float puf_slice(Float p, int t, int start, int count) {
 }
 
 static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
-        cudaStream_t stream) {
+        cudaStream_t stream, bool warm_stateless = false) {
     Hypers* hypers = &pufferl->hypers;
     int graph_slot = hypers->async ? pufferl->write_slot : 0;
     RolloutBuf rollouts = pufferl->rollouts;
@@ -890,6 +890,7 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
         }
 
         Policy* pol = &pufferl->policies[b];
+        if (warm_stateless && pol->arch.network.num_layers != 0) continue;
         Weights* w = (!pol->frozen && hypers->async)
             ? &pufferl->actor_weights : &pol->weights;
         Activations* acts = &pol->buf_acts[buf];
@@ -915,6 +916,7 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
         }
 
         Prec dec = arch_forward(&pol->arch, *w, *acts, obs_b, *st, stream);
+        if (warm_stateless) continue;
 
         Prec p_logstd = {};
         DecoderWeights* dw = (DecoderWeights*)w->decoder;
@@ -1207,6 +1209,12 @@ static void* vec_thread_main(void* arg) {
     cudaEvent_t ev[NUM_EV];
     for (int i = 0; i < NUM_EV; i++) {
         cudaEventCreate(&ev[i]);
+    }
+    // All workers finish lazy BLAS initialization before any can capture a
+    // graph. Stateless warmup consumes no samples and advances no history.
+    if (pufferl->hypers.num_layers == 0) {
+        pufferl_forward_step(pufferl, buf, 0, stream, true);
+        assert(cudaStreamSynchronize(stream) == cudaSuccess);
     }
     __atomic_store_n(state, BUF_WAITING, __ATOMIC_SEQ_CST);
     float* my_accum = &vec->accum[buf * NUM_PROF];
