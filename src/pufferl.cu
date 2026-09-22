@@ -1003,11 +1003,11 @@ __host__ __device__ static inline void log_accum(float* acc, Log* log, int clear
 }
 
 __global__ void log_reduce(Env* envs,
-        float* out, int num_envs, int clear) {
+        float* out, int total_agents, int clear) {
     extern __shared__ float sh[];
     int tid = threadIdx.x;
     float local[LOG_NF] = {};
-    for (int i = tid; i < num_envs; i += blockDim.x) {
+    for (int i = tid; i < total_agents / envs->num_agents; i += blockDim.x) {
         log_accum(local, &envs[i].log, clear);
     }
     for (int j = 0; j < LOG_NF; j++) {
@@ -1019,7 +1019,7 @@ __global__ void log_reduce(Env* envs,
 static void env_log_sum(VecEnv* vec, Log* out, int clear) {
     if (PUF_BACKEND == PUF_GPU) {
         log_reduce<<<1, 256, LOG_NF * 256 * sizeof(float)>>>(
-            vec->envs, vec->log_scratch, vec->size, clear);
+            vec->envs, vec->log_scratch, vec->total_agents, clear);
         cudaMemcpy(out, vec->log_scratch, sizeof(Log), cudaMemcpyDeviceToHost);
         return;
     }
@@ -1039,7 +1039,6 @@ static Env* puf_vec_create(int, Dict*, obs_t*, float*, float*, float*) {
 static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
     if (PUF_BACKEND == PUF_GPU) {
         assert(vec->buffers == 1 && "GPU env: num_buffers must be 1");
-        vec->size = vec->total_agents;
         vec->envs = puf_vec_create(vec->total_agents, ek,
             p->env.obs.data, p->env.actions.data,
             p->env.rewards.data, p->env.terminals.data);
@@ -2889,12 +2888,6 @@ typedef struct {
 #define SELFPLAY_MAX_HIST 8
 #define SELFPLAY_MAX_LADDER 16
 #define SELFPLAY_PATH_MAX 4096
-// Bot-ladder parallelism, held fixed so rung scores stay comparable across
-// sweep trials that vary vec.total_agents. selfplay.eval_bot_games / this is
-// the games each env plays; scripted bots keep their kNN across episodes, so
-// one game per env measures only cold bots.
-#define SELFPLAY_LADDER_ENVS 8192
-
 // One historical opponent ↔ policies[policy_idx] (env tag == policy_idx).
 typedef struct {
     int policy_idx;
@@ -3277,8 +3270,9 @@ static EvalResult eval_loop(Ini* ini, PuffeRL* p, int mode, int verbose,
         if (verbose) {
             puf_dashboard_print(ini, p, show, board ? epoch : 0);
         }
+        DictItem* m = dict_find(&el, metric_key);
         result.score = match ? dict_get(&el, "env/policy_0_score")
-            : dict_get(&el, metric_key);
+            : (m ? m->value : dict_get(&el, "env/score"));
         result.perf = dict_get(&el, "env/perf");
         if (match) {
             result.draw = dict_get(&el, "env/draw_rate");
@@ -3794,11 +3788,17 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             puf_ini_put(ini, ek, over->str);
         }
         // Fixed parallelism; ignore swept train total_agents. Each env plays
-        // bot_games / SELFPLAY_LADDER_ENVS games, so bots face a warmed-up kNN
-        // rather than being re-measured cold once per env.
+        // bot_games / ladder_envs games, so bots face a warmed-up kNN rather
+        // than being re-measured cold once per env.
         char nbuf[32];
-        snprintf(nbuf, sizeof(nbuf), "%d", SELFPLAY_LADDER_ENVS);
+        long envs = puf_ini_get(ini, "selfplay", "eval_bot_envs");
+        snprintf(nbuf, sizeof(nbuf), "%ld", envs);
         puf_ini_put(ini, "vec.total_agents", nbuf);
+        long threads = puf_ini_get(ini, "selfplay", "eval_bot_threads");
+        if (threads > 0) {
+            snprintf(nbuf, sizeof(nbuf), "%ld", threads);
+            puf_ini_put(ini, "vec.num_threads", nbuf);
+        }
         double ladder[SELFPLAY_MAX_LADDER];
         int rungs = puf_ini_get_list(ini, "selfplay", "eval_bots", ladder,
             SELFPLAY_MAX_LADDER);
