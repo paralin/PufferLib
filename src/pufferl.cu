@@ -903,16 +903,18 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
         Prec val_b  = puf_slice(rollouts.values,       t, sub, n);
         Prec mask_b = puf_slice(rollouts.action_mask,  t, sub, n);
 
-        // Per-policy state is compact (n agents); local index 0..n-1.
-        int state_n = (int)st->shape[0] * n * (int)st->shape[2];
-        zero_term_state<<<grid_size(state_n), BLOCK_SIZE, 0, stream>>>(
-            *st, env->terminals, 0, sub, n);
+        if (pol->arch.network.num_layers > 0) {
+            // Per-policy state is compact (n agents); local index 0..n-1.
+            int state_n = (int)st->shape[0] * n * (int)st->shape[2];
+            zero_term_state<<<grid_size(state_n), BLOCK_SIZE, 0, stream>>>(
+                *st, env->terminals, 0, sub, n);
 
-        // Carry path: snapshot trainable policy state into per-slot initial_states.
-        if (!pol->frozen && t == 0 && rollouts.initial_states.data != NULL) {
-            Prec slot_st = init_slot(rollouts.initial_states, graph_slot);
-            snapshot_state<<<grid_size(state_n), BLOCK_SIZE, 0, stream>>>(
-                slot_st, *st, buf * layout[1], n);
+            // Carry path: snapshot trainable policy state into per-slot initial_states.
+            if (!pol->frozen && t == 0 && rollouts.initial_states.data != NULL) {
+                Prec slot_st = init_slot(rollouts.initial_states, graph_slot);
+                snapshot_state<<<grid_size(state_n), BLOCK_SIZE, 0, stream>>>(
+                    slot_st, *st, buf * layout[1], n);
+            }
         }
 
         Prec dec = arch_forward(&pol->arch, *w, *acts, obs_b, *st, stream);
@@ -1220,6 +1222,8 @@ static void* vec_thread_main(void* arg) {
     float* my_accum = &vec->accum[buf * NUM_PROF];
     struct timespec t0, t1;
     float ms = 0.0f;
+    // Per-step GPU timing inserts queue barriers; collect it only on request.
+    bool time_gpu = pufferl->hypers.profile;
     while (true) {
         while (__atomic_load_n(state, __ATOMIC_SEQ_CST) != BUF_RUNNING) {
             if (__atomic_load_n(&vec->shutdown, __ATOMIC_SEQ_CST)) {
@@ -1240,20 +1244,22 @@ static void* vec_thread_main(void* arg) {
         int last_step = 0;
         int h2d_pending = 0;
         for (int t = 0; t < horizon - (klpo ? 1 : 0); t++) {
-            cudaEventRecord(ev[MODEL_START], stream);
+            if (time_gpu) cudaEventRecord(ev[MODEL_START], stream);
             pufferl_forward(pufferl, buf, t, stream);
-            cudaEventRecord(ev[MODEL_END], stream);
+            if (time_gpu) cudaEventRecord(ev[MODEL_END], stream);
             cudaMemcpyAsync(
                 &vec->actions[agent_start * NUM_ATNS],
                 &pufferl->env.actions.data[agent_start * NUM_ATNS],
                 apb * NUM_ATNS * sizeof(float),
                 cudaMemcpyDeviceToHost, stream);
-            cudaEventRecord(ev[COPY_END], stream);
+            if (time_gpu) cudaEventRecord(ev[COPY_END], stream);
             cudaStreamSynchronize(stream);
-            cudaEventElapsedTime(&ms, ev[MODEL_START], ev[MODEL_END]);
-            my_accum[PROF_MODEL] += ms;
-            cudaEventElapsedTime(&ms, ev[MODEL_END], ev[COPY_END]);
-            my_accum[PROF_COPY] += ms;
+            if (time_gpu) {
+                cudaEventElapsedTime(&ms, ev[MODEL_START], ev[MODEL_END]);
+                my_accum[PROF_MODEL] += ms;
+                cudaEventElapsedTime(&ms, ev[MODEL_END], ev[COPY_END]);
+                my_accum[PROF_COPY] += ms;
+            }
             if (h2d_pending) {
                 cudaEventElapsedTime(&ms, ev[H2D_START], ev[H2D_END]);
                 my_accum[PROF_COPY] += ms;
@@ -1281,10 +1287,10 @@ static void* vec_thread_main(void* arg) {
             clock_gettime(CLOCK_MONOTONIC, &t1);
             my_accum[PROF_ENV] += (t1.tv_sec - t0.tv_sec) * 1000.0f
                 + (t1.tv_nsec - t0.tv_nsec) / 1e6f;
-            cudaEventRecord(ev[H2D_START], stream);
+            if (time_gpu) cudaEventRecord(ev[H2D_START], stream);
             cpu_upload(pufferl, agent_start, apb, stream);
-            cudaEventRecord(ev[H2D_END], stream);
-            h2d_pending = 1;
+            if (time_gpu) cudaEventRecord(ev[H2D_END], stream);
+            h2d_pending = time_gpu;
             if (klpo) {
                 bool complete = true;
                 for (int done : closed) {
@@ -2651,11 +2657,16 @@ void puf_dashboard_print(Ini* ini, PuffeRL* p, Dict* log, int epoch) {
     };
     for (int i = 0; i < (int)(sizeof(rows) / sizeof(rows[0])); i++) {
         char bt[64], bp[16], cv[32];
-        double sec = rows[i].perf_key
-            ? dash_num(log, rows[i].perf_key, 0) : rows[i].perf_sec;
-        dash_duration(bt, sizeof(bt), sec);
-        snprintf(bp, sizeof(bp), "%d%%",
-            perf_total > 0 ? (int)(100.0 * sec / perf_total) : 0);
+        DictItem* timing = rows[i].perf_key ? dict_find(log, rows[i].perf_key) : NULL;
+        if (!rows[i].perf_key || timing) {
+            double sec = timing ? timing->value : rows[i].perf_sec;
+            dash_duration(bt, sizeof(bt), sec);
+            snprintf(bp, sizeof(bp), "%d%%",
+                perf_total > 0 ? (int)(100.0 * sec / perf_total) : 0);
+        } else {
+            snprintf(bt, sizeof(bt), "off");
+            bp[0] = 0;
+        }
         DictItem* lit = dict_find(log, rows[i].loss_key);
         if (lit) {
             snprintf(cv, sizeof(cv), "%.3f", lit->value);
@@ -3643,6 +3654,8 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
 
         float train_total = 0;
         for (int i = 0; i < NUM_PROF; i++) {
+            if (PUF_BACKEND != PUF_GPU && !pufferl->hypers.profile
+                    && (i == PROF_MODEL || i == PROF_COPY)) continue;
             float sec = pufferl->profile.accum[i] / 1000.0f;
             char key[256];
             snprintf(key, sizeof(key), "perf/%s", PROF_NAMES[i]);
