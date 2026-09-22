@@ -2274,7 +2274,8 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         for (int i = 0; i < num_buffers; i++) {
             pol->buf_acts[i] = arch_reg_rollout(
                 &pol->arch, pol->weights, aalloc, slice);
-            pol->buffer_states[i] = {.shape = {L, slice, h}};
+            // Stateless policies leave this shared-API scratch state unused.
+            pol->buffer_states[i] = {.shape = {std::max(L, 1), slice, h}};
             alloc_register(aalloc, &pol->buffer_states[i]);
         }
     }
@@ -2293,6 +2294,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     pufferl->async_num_slots = async_slots;
     int rollout_horizon = async_slots * horizon;
     int learner_agents = vec->policy_layout[1] * num_buffers;
+    int state_layers = std::max(num_layers, 1);
     if (learner_agents % minibatch_segments != 0) {
         fprintf(stderr, "learner rows must be divisible by minibatch rows\n");
         exit(1);
@@ -2302,7 +2304,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     // Carry path: per-slot initial RNN states. reset_every_horizon zeros train_state.
     if (!hypers.reset_every_horizon) {
         pufferl->rollouts.initial_states = {
-            .shape = {async_slots, num_layers, learner_agents, hidden_size}};
+            .shape = {async_slots, state_layers, learner_agents, hidden_size}};
         alloc_register(acts, &pufferl->rollouts.initial_states);
     }
     register_train_buffers(pufferl->train_buf, acts, minibatch_segments, horizon);
@@ -2310,11 +2312,11 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         acts, learner_agents, horizon, input_size, num_action_heads, act_n, hypers.klpo);
     register_ppo_buffers(pufferl->ppo_bufs, acts, minibatch_segments,
         hypers.horizon, decoder_output_size, is_continuous);
-    pufferl->train_state = {.shape = {num_layers, learner_agents, hidden_size}};
+    pufferl->train_state = {.shape = {state_layers, learner_agents, hidden_size}};
     alloc_register(acts, &pufferl->train_state);
     if (hypers.prioritized_replay) {
         RegisterReplay(&pufferl->replay, acts, learner_agents, minibatch_segments,
-            horizon, input_size, num_action_heads, act_n, num_layers, hidden_size, hypers.klpo);
+            horizon, input_size, num_action_heads, act_n, state_layers, hidden_size, hypers.klpo);
     }
 
     cudaMalloc((void**)&pufferl->rng_offset, (num_buffers + 1) * sizeof(long));

@@ -479,6 +479,10 @@ MinGRU* make_mingru(Weights* weights, int batch_size, int hidden_size, int num_l
 void mingru(MinGRU* layer, float* input) {
     int B = layer->batch_size;
     int H = layer->hidden_size;
+    if (layer->num_layers == 0) {
+        _relu(input, layer->output, B * H);
+        return;
+    }
     float* x = input;
     for (int l = 0; l < layer->num_layers; l++) {
         float* state_l = layer->state + l * B * H;

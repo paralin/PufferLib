@@ -721,6 +721,18 @@ struct MinGRUWeights {
     Prec* weights;  // [num_layers]
 };
 
+// Zero recurrent layers select a stateless ReLU between encoder and decoder.
+__global__ void stateless_relu(const precision_t* input, precision_t* output, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) output[i] = from_float(fmaxf(to_float(input[i]), 0.0f));
+}
+
+__global__ void stateless_relu_backward(const precision_t* output,
+        const precision_t* gradient, precision_t* result, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) result[i] = to_float(output[i]) > 0 ? gradient[i] : from_float(0);
+}
+
 Prec mingru_state_layer(Prec& state, int layer, int agent_off, int B) {
     long A = state.shape[1], H = state.shape[2];
     return {
@@ -761,6 +773,10 @@ void mingru_reg_train(void* w, void* activations,
     a->grad_next_state = {.shape = {B, 1, H}};
     alloc_register(acts, &a->grad_input_buf);
     alloc_register(acts, &a->grad_next_state);
+    if (m->num_layers == 0) {
+        a->out = {.shape = {B, TT, H}};
+        alloc_register(acts, &a->out);
+    }
     for (int i = 0; i < m->num_layers; i++) {
         a->scan_bufs[i] = {
             .B = B, .T = TT, .H = H,
@@ -818,6 +834,11 @@ Prec mingru_forward(void* w, Prec x, Prec state,
     MinGRUActivations* a = (MinGRUActivations*)activations;
     int B = state.shape[1];
     int H = state.shape[2];
+    if (m->num_layers == 0) {
+        stateless_relu<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
+            x.data, a->out.data, B * H);
+        return a->out;
+    }
     for (int i = 0; i < m->num_layers; i++) {
         Prec state_i = mingru_state_layer(state, i, 0, B);
         puf_mm(&x, &m->weights[i], &a->combined[i], stream);
@@ -835,6 +856,11 @@ Prec mingru_forward_train(void* w, Prec x, Prec state, Prec terminals,
     MinGRUWeights* m = (MinGRUWeights*)w;
     MinGRUActivations* a = (MinGRUActivations*)activations;
     int B = (int)x.shape[0];
+    if (m->num_layers == 0) {
+        int n = numel(x.shape);
+        stateless_relu<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(x.data, a->out.data, n);
+        return a->out;
+    }
     for (int i = 0; i < m->num_layers; i++) {
         puf_copy(&a->saved_inputs[i], &x, stream);
         Prec state_i = mingru_state_layer(state, i, agent_off, B);
@@ -868,6 +894,12 @@ __global__ void add_kernel(precision_t* __restrict__ dst,
 Prec mingru_backward(void* w, Prec grad, void* activations, cudaStream_t stream) {
     MinGRUWeights* m = (MinGRUWeights*)w;
     MinGRUActivations* a = (MinGRUActivations*)activations;
+    if (m->num_layers == 0) {
+        int n = numel(grad.shape);
+        stateless_relu_backward<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+            a->out.data, grad.data, a->grad_input_buf.data, n);
+        return a->grad_input_buf;
+    }
     for (int i = m->num_layers - 1; i >= 0; i--) {
         PrefixScan& scan = a->scan_bufs[i];
         if (scan.T >= 256 && scan.B * scan.H <= 32768
@@ -924,6 +956,7 @@ void ArchTrainLength(Weights& weights, Activations& activations, int batch, int 
     auto* network = (MinGRUActivations*)activations.network;
     auto* recurrent = (MinGRUWeights*)weights.network;
     network->grad_input_buf.shape[0] = batch * time;
+    if (recurrent->num_layers == 0) network->out.shape[1] = time;
     for (int layer = 0; layer < recurrent->num_layers; ++layer) {
         network->saved_inputs[layer].shape[1] = time;
         network->combined_bufs[layer].shape[0] = batch * time;
