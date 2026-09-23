@@ -325,6 +325,7 @@ typedef struct {
     float gamma;
     float gamma_end;
     long gamma_episodes;
+    float reward_scale;
     float reward_clip;
     float gae_lambda;
     bool vtrace;
@@ -1636,11 +1637,12 @@ float cosine_annealing(float base, float min_v, long t, long T) {
     return min_v + 0.5f * (base - min_v) * (1.0f + (float)cos(M_PI * u));
 }
 
-__global__ void clamp_precision_kernel(precision_t* dst, float lo, float hi, int n) {
+// Scales learner rewards, then clips them when clip is positive.
+__global__ void transform_rewards_kernel(precision_t* dst, float scale, float clip, int n) {
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n;
             idx += blockDim.x * gridDim.x) {
-        float v = to_float(dst[idx]);
-        dst[idx] = from_float(fminf(fmaxf(v, lo), hi));
+        float v = scale * to_float(dst[idx]);
+        dst[idx] = from_float(clip > 0 ? fminf(fmaxf(v, -clip), clip) : v);
     }
 }
 
@@ -1685,10 +1687,10 @@ static void prepare_rollout(PuffeRL* pufferl, RolloutBuf src, int slot,
             rollouts->behavior.data, src.behavior.data, T, B, mask_c, buffer_rows, learner_rows);
     }
 
-    if (hypers->reward_clip > 0) {
-        clamp_precision_kernel<<<grid_size(
+    if (hypers->reward_scale != 1 || hypers->reward_clip > 0) {
+        transform_rewards_kernel<<<grid_size(
             numel(rollouts->rewards.shape)), BLOCK_SIZE, 0, stream>>>(
-            rollouts->rewards.data, -hypers->reward_clip, hypers->reward_clip,
+            rollouts->rewards.data, hypers->reward_scale, hypers->reward_clip,
             numel(rollouts->rewards.shape));
     }
 
@@ -2156,6 +2158,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         .gamma = puf_ini_get(ini, "train", "gamma"),
         .gamma_end = puf_ini_get(ini, "train", "gamma_end"),
         .gamma_episodes = (long)puf_ini_get(ini, "train", "gamma_episodes"),
+        .reward_scale = puf_ini_get(ini, "train", "reward_scale"),
         .reward_clip = puf_ini_get(ini, "train", "reward_clip"),
         .gae_lambda = puf_ini_get(ini, "train", "gae_lambda"),
         .vtrace = puf_ini_get(ini, "train", "vtrace") != 0,
@@ -2171,13 +2174,14 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         .num_threads = puf_ini_get(ini, "vec", "num_threads"),
         .seed = puf_ini_get(ini, "base", "seed"),
     };
-    if (!isfinite(hypers.reward_clip) || hypers.reward_clip < 0
+    if (!isfinite(hypers.reward_scale) || hypers.reward_scale <= 0
+            || !isfinite(hypers.reward_clip) || hypers.reward_clip < 0
             || !isfinite(hypers.prio_alpha) || hypers.prio_alpha < 0
             || !isfinite(hypers.prio_beta0) || hypers.prio_beta0 < 0 || hypers.prio_beta0 > 1
             || hypers.gamma_episodes < 0
             || (hypers.gamma_episodes > 0 && (!(hypers.gamma >= 0 && hypers.gamma < 1)
                 || !(hypers.gamma_end >= 0 && hypers.gamma_end < 1)))) {
-        fprintf(stderr, "invalid reward clipping, replay priority or discount schedule\n");
+        fprintf(stderr, "invalid reward scale or clipping, replay priority or discount schedule\n");
         exit(1);
     }
     if (hypers.klpo) {
