@@ -305,6 +305,8 @@ typedef struct {
     int num_buffers;
     int hidden_size;
     int num_layers;
+    bool layer_norm;
+    ValueHead value_head;
     float lr;
     float min_lr_ratio;
     bool anneal_lr;
@@ -634,11 +636,11 @@ __global__ void rng_init(curandStatePhilox4_32_10_t* states, uint64_t seed, int 
     }
 }
 
-// Action logits and value share one row: [logits..., value]. logstd empty ⇒ discrete.
+// Action logits and value share one row: [logits..., value columns]. logstd empty ⇒ discrete.
 // Discrete: always-cache logsumexp + inverse-CDF; mask always present (all-ones if env has none).
 // Continuous: ignores mask.
 __global__ void sample_logits(
-        Prec dec_out,              // (B, logits_dim + 1)
+        Prec dec_out,              // (B, logits_dim + value columns)
         Prec logstd,               // (1, od) continuous only; .data null if discrete
         int* act_sizes,            // (NUM_ATNS,)
         float* actions,            // (B, num_atns) float32 rollout store
@@ -647,7 +649,8 @@ __global__ void sample_logits(
         precision_t* value_out,    // (B,)
         curandStatePhilox4_32_10_t* rng_states,
         precision_t* action_mask,  // (B, A_total); always allocated
-        int mask_stride) {
+        int mask_stride,
+        ValueHead value_head) {
     int B = dec_out.shape[0];
     int fused_cols = dec_out.shape[1];
     int num_atns = NUM_ATNS;
@@ -755,7 +758,8 @@ __global__ void sample_logits(
     }
 
     logprobs[idx] = from_float(total_log_prob);
-    value_out[idx] = logits[logits_base + fused_cols - 1];
+    value_out[idx] = from_float(value_estimate(
+        logits + logits_base + fused_cols - value_cols(value_head), value_head));
     rng_states[idx] = state;
 }
 
@@ -933,7 +937,7 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
             act_b.data, env->actions.data + (long)sub * act_cols,
             lp_b.data, val_b.data,
             pufferl->rng_states[buf] + off,
-            mask_b.data, mask_stride);
+            mask_b.data, mask_stride, hypers->value_head);
 #ifdef PUF_CONDITIONAL_GROUPS
         if (hypers->klpo && !pol->frozen) {
             Float behavior = puf_slice(rollouts.behavior, t, sub, n);
@@ -1770,7 +1774,7 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
             pufferl->train_activs, graph.mb_obs, graph.mb_state,
             graph.mb_terminals, dest_off, graph, p_logstd,
             pufferl->act_sizes, pufferl->ppo_bufs.grad_logits.data,
-            pufferl->ppo_bufs.grad_values.data, stream);
+            pufferl->ppo_bufs.new_logprobs.data, hypers->value_head, stream);
         if (hypers->klpo) {
 #ifdef PUF_CONDITIONAL_GROUPS
             int blocks = grid_size(Nmb * Tmb);
@@ -1796,7 +1800,7 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
                 pufferl->act_sizes, pufferl->losses,
                 hypers->clip_coef, hypers->vf_clip_coef, hypers->vf_coef,
                 pufferl->ppo_bufs.ent_coef,
-                pufferl->ppo_bufs, pufferl->is_continuous, stream);
+                pufferl->ppo_bufs, hypers->value_head, pufferl->is_continuous, stream);
         }
 
         Float grad_logits = pufferl->ppo_bufs.grad_logits;
@@ -1894,7 +1898,8 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
         RolloutTrainLength(&pufferl->replay.batch, time);
         TrainGraph* graph = &pufferl->train_buf;
         graph->mb_advantages.shape[1] = graph->mb_imp.shape[1] = graph->mb_gae_v.shape[1] = time;
-        pufferl->ppo_bufs.grad_logits.shape[1] = pufferl->ppo_bufs.grad_values.shape[1] = time;
+        PPOBufs* ppo = &pufferl->ppo_bufs;
+        ppo->grad_logits.shape[1] = ppo->grad_values.shape[1] = ppo->new_logprobs.shape[1] = time;
         int samples = graph->mb_advantages.shape[0];
         ArchTrainLength(pufferl->policies[0].weights, pufferl->train_activs, samples, time);
         prepare_rollout(pufferl, src, slot, train_stream);
@@ -2138,6 +2143,12 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         .num_buffers = puf_ini_get(ini, "vec", "num_buffers"),
         .hidden_size = puf_ini_get(ini, "policy", "hidden_size"),
         .num_layers = puf_ini_get(ini, "policy", "num_layers"),
+        .layer_norm = puf_ini_get(ini, "policy", "layer_norm") != 0,
+        .value_head = {
+            .bins = (int)puf_ini_get(ini, "policy", "value_bins"),
+            .min = (float)puf_ini_get(ini, "policy", "value_min"),
+            .max = (float)puf_ini_get(ini, "policy", "value_max"),
+        },
         .lr = puf_ini_get(ini, "train", "learning_rate"),
         .min_lr_ratio = puf_ini_get(ini, "train", "min_lr_ratio"),
         .anneal_lr = puf_ini_get(ini, "train", "anneal_lr") != 0,
@@ -2182,6 +2193,14 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
             || (hypers.gamma_episodes > 0 && (!(hypers.gamma >= 0 && hypers.gamma < 1)
                 || !(hypers.gamma_end >= 0 && hypers.gamma_end < 1)))) {
         fprintf(stderr, "invalid reward scale or clipping, replay priority or discount schedule\n");
+        exit(1);
+    }
+    ValueHead value_head = hypers.value_head;
+    if ((hypers.layer_norm && hypers.num_layers == 0)
+            || (value_head.bins != 0 && (hypers.klpo || value_head.bins < 2
+                || value_head.bins > VALUE_MAX_BINS || !(value_head.min < value_head.max)))) {
+        fprintf(stderr, "layer_norm requires recurrent layers; value_bins must be 0 or 2..%d "
+            "with value_min < value_max, and PPO\n", VALUE_MAX_BINS);
         exit(1);
     }
     if (hypers.klpo) {
@@ -2334,8 +2353,12 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         int slice = vec->policy_layout[b + 1] - vec->policy_layout[b];
         assert(slice > 0 && "policy has no agents");
 
-        pol->arch = build_arch(input_size, h, L,
-            decoder_output_size, is_continuous, hypers.horizon);
+        pol->arch = build_arch({
+            .input_size = input_size, .hidden_size = h, .num_layers = L,
+            .output_size = decoder_output_size,
+            .value_cols = value_cols(hypers.value_head), .horizon = hypers.horizon,
+            .continuous = is_continuous, .layer_norm = hypers.layer_norm,
+        });
         pol->weights = weights_create(&pol->arch, &pol->params_alloc);
         Allocator* aalloc = pol->frozen ? &pol->activ_alloc : acts;
         pol->buf_acts = (Activations*)calloc(
@@ -2381,7 +2404,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     register_rollout_buffers(&pufferl->train_rollouts,
         acts, learner_agents, horizon, input_size, num_action_heads, act_n, hypers.klpo);
     register_ppo_buffers(pufferl->ppo_bufs, acts, minibatch_segments,
-        hypers.horizon, decoder_output_size, is_continuous);
+        hypers.horizon, decoder_output_size, value_cols(hypers.value_head), is_continuous);
     pufferl->train_state = {.shape = {state_layers, learner_agents, hidden_size}};
     alloc_register(acts, &pufferl->train_state);
     if (hypers.prioritized_replay) {

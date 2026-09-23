@@ -52,13 +52,14 @@ struct Decoder {
     reg_rollout_fn reg_rollout;
     create_weights_fn create_weights;
     int hidden_dim, output_dim;
+    int value_cols;  // 1 for a scalar value, else the value bin count
     bool continuous;
     size_t activation_size;
 };
 
 struct DecoderWeights {
     Prec weight, logstd;
-    int hidden_dim, output_dim;
+    int hidden_dim, output_dim, value_cols;
     bool continuous;
 };
 
@@ -76,6 +77,7 @@ struct Network {
     reg_rollout_fn reg_rollout;
     create_weights_fn create_weights;
     int hidden, num_layers, horizon;
+    bool layer_norm;
 };
 
 // Side-stream dW (mm_tn) overlaps dX (mm_nn) on main during linear bwd.
@@ -563,15 +565,96 @@ __global__ void sum_rows_to_precision_kernel(precision_t* __restrict__ dst,
     dst[col] = from_float(sum);
 }
 
+// Decoder rows are [logits (od), value (vc)]; vc is 1 or the value bin count.
 __global__ void assemble_decoder_grad(
         precision_t* __restrict__ dst, const float* __restrict__ grad_logits,
-        const float* __restrict__ grad_value, int B_TT, int od, int od_plus_1) {
+        const float* __restrict__ grad_value, int B_TT, int od, int vc) {
+    int cols = od + vc;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B_TT * od_plus_1) {
+    if (idx >= B_TT * cols) {
         return;
     }
-    int row = idx / od_plus_1, col = idx % od_plus_1;
-    dst[idx] = from_float((col < od) ? grad_logits[row * od + col] : grad_value[row]);
+    int row = idx / cols, col = idx % cols;
+    dst[idx] = from_float((col < od)
+        ? grad_logits[row * od + col] : grad_value[row * vc + col - od]);
+}
+
+constexpr int LAYER_NORM_THREADS = 256;
+constexpr float LAYER_NORM_EPS = 1e-5f;
+
+// Sum v across the block. Every thread receives the total.
+__device__ __forceinline__ float layer_norm_block_sum(float v, float* smem) {
+    int tid = threadIdx.x;
+    smem[tid] = v;
+    __syncthreads();
+    for (int s = LAYER_NORM_THREADS / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            smem[tid] += smem[tid + s];
+        }
+        __syncthreads();
+    }
+    float total = smem[0];
+    __syncthreads();
+    return total;
+}
+
+// Parameter-free LayerNorm, one block per row: out = (x - mean) * rstd.
+// rstd is stored for the backward pass when non-null.
+__global__ void layer_norm_forward(precision_t* __restrict__ out,
+        float* __restrict__ rstd, const precision_t* __restrict__ x, int H) {
+    __shared__ float smem[LAYER_NORM_THREADS];
+    const precision_t* row = x + (long)blockIdx.x * H;
+    precision_t* dst = out + (long)blockIdx.x * H;
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < H; i += LAYER_NORM_THREADS) {
+        sum += to_float(row[i]);
+    }
+    float mean = layer_norm_block_sum(sum, smem) / H;
+    float sq = 0.0f;
+    for (int i = threadIdx.x; i < H; i += LAYER_NORM_THREADS) {
+        float d = to_float(row[i]) - mean;
+        sq += d * d;
+    }
+    float r = rsqrtf(layer_norm_block_sum(sq, smem) / H + LAYER_NORM_EPS);
+    for (int i = threadIdx.x; i < H; i += LAYER_NORM_THREADS) {
+        dst[i] = from_float((to_float(row[i]) - mean) * r);
+    }
+    if (rstd != NULL && threadIdx.x == 0) {
+        rstd[blockIdx.x] = r;
+    }
+}
+
+// In-place LayerNorm backward from the normalized output y:
+// dx = rstd * (g - mean(g) - y * mean(g * y)).
+__global__ void layer_norm_backward(precision_t* __restrict__ grad,
+        const precision_t* __restrict__ y, const float* __restrict__ rstd, int H) {
+    __shared__ float smem[LAYER_NORM_THREADS];
+    precision_t* g = grad + (long)blockIdx.x * H;
+    const precision_t* yr = y + (long)blockIdx.x * H;
+    float sum_g = 0.0f, sum_gy = 0.0f;
+    for (int i = threadIdx.x; i < H; i += LAYER_NORM_THREADS) {
+        float gi = to_float(g[i]);
+        sum_g += gi;
+        sum_gy += gi * to_float(yr[i]);
+    }
+    float mean_g = layer_norm_block_sum(sum_g, smem) / H;
+    float mean_gy = layer_norm_block_sum(sum_gy, smem) / H;
+    float r = rstd[blockIdx.x];
+    for (int i = threadIdx.x; i < H; i += LAYER_NORM_THREADS) {
+        g[i] = from_float(r * (to_float(g[i]) - mean_g - to_float(yr[i]) * mean_gy));
+    }
+}
+
+static void layer_norm(Prec* out, float* rstd, Prec* x, cudaStream_t stream) {
+    int H = x->shape[ndim(x->shape) - 1];
+    int rows = numel(x->shape) / H;
+    layer_norm_forward<<<rows, LAYER_NORM_THREADS, 0, stream>>>(out->data, rstd, x->data, H);
+}
+
+static void layer_norm_grad(Prec* grad, Prec* y, float* rstd, cudaStream_t stream) {
+    int H = y->shape[ndim(y->shape) - 1];
+    int rows = numel(y->shape) / H;
+    layer_norm_backward<<<rows, LAYER_NORM_THREADS, 0, stream>>>(grad->data, y->data, rstd, H);
 }
 
 Prec encoder_forward(void* w, void* activations, Prec input, cudaStream_t stream) {
@@ -648,14 +731,14 @@ void decoder_init_weights(void* w, ulong* seed, cudaStream_t stream) {
     DecoderWeights* dw = (DecoderWeights*)w;
     Prec wt = {
         .data = dw->weight.data,
-        .shape = {dw->output_dim + 1, dw->hidden_dim},
+        .shape = {dw->output_dim + dw->value_cols, dw->hidden_dim},
     };
     puf_kaiming_init(&wt, 1.0f, (*seed)++, stream);
 }
 
 void decoder_reg_params(void* w, Allocator* alloc) {
     DecoderWeights* dw = (DecoderWeights*)w;
-    dw->weight = {.shape = {dw->output_dim + 1, dw->hidden_dim}};
+    dw->weight = {.shape = {dw->output_dim + dw->value_cols, dw->hidden_dim}};
     alloc_register(alloc, &dw->weight);
     if (dw->continuous) {
         dw->logstd = {.shape = {1, dw->output_dim}};
@@ -667,13 +750,13 @@ void decoder_reg_train(void* w, void* activations,
         Allocator* acts, Allocator* grads, int B_TT) {
     DecoderWeights* dw = (DecoderWeights*)w;
     DecoderActivations* a = (DecoderActivations*)activations;
-    int od1 = dw->output_dim + 1;
+    int cols = dw->output_dim + dw->value_cols;
     *a = (DecoderActivations){
-        .out =              {.shape = {B_TT, od1}},
-        .grad_out =         {.shape = {B_TT, od1}},
+        .out =              {.shape = {B_TT, cols}},
+        .grad_out =         {.shape = {B_TT, cols}},
         .saved_input =      {.shape = {B_TT, dw->hidden_dim}},
         .grad_input =       {.shape = {B_TT, dw->hidden_dim}},
-        .wgrad_scratch =    {.shape = {od1, dw->hidden_dim}},
+        .wgrad_scratch =    {.shape = {cols, dw->hidden_dim}},
         .logstd_scratch =   {.shape = {1, dw->output_dim}},
     };
     alloc_register(acts, &a->out);
@@ -689,7 +772,7 @@ void decoder_reg_train(void* w, void* activations,
 void decoder_reg_rollout(void* w, void* activations, Allocator* alloc, int B) {
     DecoderWeights* dw = (DecoderWeights*)w;
     DecoderActivations* a = (DecoderActivations*)activations;
-    a->out = {.shape = {B, dw->output_dim + 1}};
+    a->out = {.shape = {B, dw->output_dim + dw->value_cols}};
     alloc_register(alloc, &a->out);
 }
 
@@ -698,6 +781,7 @@ void* decoder_create_weights(void* self) {
     DecoderWeights* dw = (DecoderWeights*)calloc(1, sizeof(DecoderWeights));
     dw->hidden_dim = d->hidden_dim;
     dw->output_dim = d->output_dim;
+    dw->value_cols = d->value_cols;
     dw->continuous = d->continuous;
     return dw;
 }
@@ -707,9 +791,9 @@ Prec decoder_backward(void* w, void* activations, Float grad_logits,
     DecoderWeights* dw = (DecoderWeights*)w;
     DecoderActivations* a = (DecoderActivations*)activations;
     int B_TT = a->saved_input.shape[0];
-    int od = dw->output_dim, od1 = od + 1;
-    assemble_decoder_grad<<<grid_size(B_TT * od1), BLOCK_SIZE, 0, stream>>>(
-        a->grad_out.data, grad_logits.data, grad_value.data, B_TT, od, od1);
+    int od = dw->output_dim, vc = dw->value_cols;
+    assemble_decoder_grad<<<grid_size(B_TT * (od + vc)), BLOCK_SIZE, 0, stream>>>(
+        a->grad_out.data, grad_logits.data, grad_value.data, B_TT, od, vc);
     // dW // dX: weight grad on side stream, dX on main (needed for residual chain).
     puf_mm_tn_async_after(&a->grad_out, &a->saved_input, &a->wgrad_scratch, stream);
     if (dw->continuous && grad_logstd.data != NULL) {
@@ -720,22 +804,31 @@ Prec decoder_backward(void* w, void* activations, Float grad_logits,
     return a->grad_input;
 }
 
+// With layer_norm, each layer projects LayerNorm(x) while its highway keeps
+// the raw x, and the trunk output is normalized before the decoder.
 struct MinGRUActivations {
     // Rollout
-    Prec* combined;       // (B rollout, 3*T)[num_layers]
-    Prec out;             // (B rollout, T)
-    Prec next_state;      // (B rollout, T)
+    Prec* combined;       // (B rollout, 3*H)[num_layers]
+    Prec out;             // (B rollout, H)
+    Prec next_state;      // (B rollout, H)
+    Prec normed;          // (B rollout, H) projection input scratch
     // Training
-    Prec* saved_inputs;   // (B, TT, T)[num_layers]
+    Prec* saved_inputs;   // (B, TT, H)[num_layers]
+    Prec* normed_inputs;  // (B, TT, H)[num_layers]
+    Float* input_rstd;    // (B, TT)[num_layers]
     PrefixScan* scan_bufs;           // [num_layers]
-    Prec* combined_bufs;  // (B*TT, 3*T)[num_layers]
-    Prec* wgrad_scratch;  // (3*T, T)[num_layers]
-    Prec grad_input_buf;  // (B*TT, T)
-    Prec grad_next_state; // (B, 1, T)
+    Prec* combined_bufs;  // (B*TT, 3*H)[num_layers]
+    Prec* wgrad_scratch;  // (3*H, H)[num_layers]
+    Prec grad_input_buf;  // (B*TT, H)
+    Prec grad_next_state; // (B, 1, H)
+    // Both: normalized trunk output (B rollout, H) or (B, TT, H)
+    Prec out_norm;
+    Float out_rstd;       // (B, TT)
 };
 
 struct MinGRUWeights {
     int hidden, num_layers, horizon;
+    bool layer_norm;
     Prec* weights;  // [num_layers]
 };
 
@@ -784,6 +877,8 @@ void mingru_reg_train(void* w, void* activations,
     MinGRUActivations* a = (MinGRUActivations*)activations;
     int H = m->hidden, TT = m->horizon, B = B_TT / TT;
     a->saved_inputs = (Prec*)calloc(m->num_layers, sizeof(Prec));
+    a->normed_inputs = (Prec*)calloc(m->num_layers, sizeof(Prec));
+    a->input_rstd = (Float*)calloc(m->num_layers, sizeof(Float));
     a->scan_bufs = (PrefixScan*)calloc(m->num_layers, sizeof(PrefixScan));
     a->combined_bufs = (Prec*)calloc(m->num_layers, sizeof(Prec));
     a->wgrad_scratch = (Prec*)calloc(m->num_layers, sizeof(Prec));
@@ -817,6 +912,18 @@ void mingru_reg_train(void* w, void* activations,
         alloc_register(acts, &a->scan_bufs[i].grad_state);
         alloc_register(acts, &a->scan_bufs[i].grad_input);
         alloc_register(grads, &a->wgrad_scratch[i]);
+        if (m->layer_norm) {
+            a->normed_inputs[i] = {.shape = {B, TT, H}};
+            a->input_rstd[i] = {.shape = {B, TT}};
+            alloc_register(acts, &a->normed_inputs[i]);
+            alloc_register(acts, &a->input_rstd[i]);
+        }
+    }
+    if (m->layer_norm) {
+        a->out_norm = {.shape = {B, TT, H}};
+        a->out_rstd = {.shape = {B, TT}};
+        alloc_register(acts, &a->out_norm);
+        alloc_register(acts, &a->out_rstd);
     }
 }
 
@@ -834,6 +941,12 @@ void mingru_reg_rollout(void* weights, void* activations,
     a->next_state = {.shape = {B_inf, H}};
     alloc_register(alloc, &a->out);
     alloc_register(alloc, &a->next_state);
+    if (w->layer_norm) {
+        a->normed = {.shape = {B_inf, H}};
+        a->out_norm = {.shape = {B_inf, H}};
+        alloc_register(alloc, &a->normed);
+        alloc_register(alloc, &a->out_norm);
+    }
 }
 
 void* mingru_create_weights(void* self) {
@@ -842,6 +955,7 @@ void* mingru_create_weights(void* self) {
     mw->hidden = n->hidden;
     mw->num_layers = n->num_layers;
     mw->horizon = n->horizon;
+    mw->layer_norm = n->layer_norm;
     mw->weights = (Prec*)calloc(n->num_layers, sizeof(Prec));
     return mw;
 }
@@ -859,12 +973,21 @@ Prec mingru_forward(void* w, Prec x, Prec state,
     }
     for (int i = 0; i < m->num_layers; i++) {
         Prec state_i = mingru_state_layer(state, i, 0, B);
-        puf_mm(&x, &m->weights[i], &a->combined[i], stream);
+        Prec projected = x;
+        if (m->layer_norm) {
+            layer_norm(&a->normed, NULL, &x, stream);
+            projected = a->normed;
+        }
+        puf_mm(&projected, &m->weights[i], &a->combined[i], stream);
         mingru_gate<<<grid_size(B*H), BLOCK_SIZE, 0, stream>>>(
             a->out.data, a->next_state.data,
             a->combined[i].data, state_i.data, x.data, H, B);
         puf_copy(&state_i, &a->next_state, stream);
         x = a->out;
+    }
+    if (m->layer_norm) {
+        layer_norm(&a->out_norm, NULL, &x, stream);
+        return a->out_norm;
     }
     return x;
 }
@@ -882,7 +1005,12 @@ Prec mingru_forward_train(void* w, Prec x, Prec state, Prec terminals,
     for (int i = 0; i < m->num_layers; i++) {
         puf_copy(&a->saved_inputs[i], &x, stream);
         Prec state_i = mingru_state_layer(state, i, agent_off, B);
-        puf_mm(&x, &m->weights[i], &a->combined_bufs[i], stream);
+        Prec projected = x;
+        if (m->layer_norm) {
+            layer_norm(&a->normed_inputs[i], a->input_rstd[i].data, &x, stream);
+            projected = a->normed_inputs[i];
+        }
+        puf_mm(&projected, &m->weights[i], &a->combined_bufs[i], stream);
         PrefixScan& scan = a->scan_bufs[i];
         scan.combined_ptr = a->combined_bufs[i].data;
         scan.state_ptr = state_i.data;
@@ -897,6 +1025,10 @@ Prec mingru_forward_train(void* w, Prec x, Prec state, Prec terminals,
             mingru_scan_forward<<<grid_size(scan.B * scan.H), BLOCK_SIZE, 0, stream>>>(scan);
         }
         x = scan.out;
+    }
+    if (m->layer_norm) {
+        layer_norm(&a->out_norm, a->out_rstd.data, &x, stream);
+        return a->out_norm;
     }
     return x;
 }
@@ -918,6 +1050,9 @@ Prec mingru_backward(void* w, Prec grad, void* activations, cudaStream_t stream)
             a->out.data, grad.data, a->grad_input_buf.data, n);
         return a->grad_input_buf;
     }
+    if (m->layer_norm) {
+        layer_norm_grad(&grad, &a->out_norm, a->out_rstd.data, stream);
+    }
     for (int i = m->num_layers - 1; i >= 0; i--) {
         PrefixScan& scan = a->scan_bufs[i];
         if (scan.T >= 256 && scan.B * scan.H <= 32768
@@ -931,9 +1066,13 @@ Prec mingru_backward(void* w, Prec grad, void* activations, cudaStream_t stream)
                 stream>>>(scan, grad.data, a->grad_next_state.data);
         }
         // dW on side stream (per-layer scratch); dX on main continues the bwd chain.
-        puf_mm_tn_async_after(&scan.grad_combined, &a->saved_inputs[i],
+        Prec* projected = m->layer_norm ? &a->normed_inputs[i] : &a->saved_inputs[i];
+        puf_mm_tn_async_after(&scan.grad_combined, projected,
             &a->wgrad_scratch[i], stream);
         puf_mm_nn(&scan.grad_combined, &m->weights[i], &a->grad_input_buf, stream);
+        if (m->layer_norm) {
+            layer_norm_grad(&a->grad_input_buf, projected, a->input_rstd[i].data, stream);
+        }
         int n = numel(scan.grad_input.shape);
         add_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
             a->grad_input_buf.data, scan.grad_input.data, n);
@@ -975,8 +1114,14 @@ void ArchTrainLength(Weights& weights, Activations& activations, int batch, int 
     auto* recurrent = (MinGRUWeights*)weights.network;
     network->grad_input_buf.shape[0] = batch * time;
     if (recurrent->num_layers == 0) network->out.shape[1] = time;
+    if (recurrent->layer_norm) {
+        network->out_norm.shape[1] = network->out_rstd.shape[1] = time;
+    }
     for (int layer = 0; layer < recurrent->num_layers; ++layer) {
         network->saved_inputs[layer].shape[1] = time;
+        if (recurrent->layer_norm) {
+            network->normed_inputs[layer].shape[1] = network->input_rstd[layer].shape[1] = time;
+        }
         network->combined_bufs[layer].shape[0] = batch * time;
         PrefixScan& scan = network->scan_bufs[layer];
         scan.T = time;
@@ -1057,11 +1202,17 @@ Weights weights_create(Arch* p, Allocator* params) {
 // unsolved research problem.
 #include "ocean.cu"
 
+// Shape of one policy network. value_cols is 1 for a scalar value head or
+// the bin count of a categorical value head.
+struct ArchConfig {
+    int input_size, hidden_size, num_layers, output_size, value_cols, horizon;
+    bool continuous, layer_norm;
+};
+
 // Build an Arch (ops + dims) for this env. Encoder/decoder algorithms are
-// fixed at compile time; hidden_size/num_layers/horizon parameterize shape.
+// fixed at compile time; the config parameterizes shape.
 // Arch has no heap state so this returns by value; callers store it wherever.
-Arch build_arch(int input_size, int hidden_size,
-        int num_layers, int decoder_output_size, bool is_continuous, int horizon) {
+Arch build_arch(ArchConfig config) {
     Encoder encoder = {
         .forward = encoder_forward,
         .backward = encoder_backward,
@@ -1070,7 +1221,7 @@ Arch build_arch(int input_size, int hidden_size,
         .reg_train = encoder_reg_train,
         .reg_rollout = encoder_reg_rollout,
         .create_weights = encoder_create_weights,
-        .in_dim = input_size, .out_dim = hidden_size,
+        .in_dim = config.input_size, .out_dim = config.hidden_size,
         .activation_size = sizeof(EncoderActivations),
     };
     create_custom_encoder(&encoder);
@@ -1082,9 +1233,10 @@ Arch build_arch(int input_size, int hidden_size,
         .reg_train = decoder_reg_train,
         .reg_rollout = decoder_reg_rollout,
         .create_weights = decoder_create_weights,
-        .hidden_dim = hidden_size,
-        .output_dim = decoder_output_size,
-        .continuous = is_continuous,
+        .hidden_dim = config.hidden_size,
+        .output_dim = config.output_size,
+        .value_cols = config.value_cols,
+        .continuous = config.continuous,
         .activation_size = sizeof(DecoderActivations),
     };
     create_custom_decoder(&decoder);
@@ -1097,9 +1249,10 @@ Arch build_arch(int input_size, int hidden_size,
         .reg_train = mingru_reg_train,
         .reg_rollout = mingru_reg_rollout,
         .create_weights = mingru_create_weights,
-        .hidden = hidden_size,
-        .num_layers = num_layers,
-        .horizon = horizon,
+        .hidden = config.hidden_size,
+        .num_layers = config.num_layers,
+        .horizon = config.horizon,
+        .layer_norm = config.layer_norm,
     };
     return Arch{
         .encoder = encoder, .decoder = decoder, .network = network,
@@ -1338,6 +1491,53 @@ __device__ __forceinline__ float safe_continuous_logstd(const precision_t* logst
     return finite_or_clamp(to_float(logstd[idx]), -20.0f, 2.0f);
 }
 
+// Value head decoding. bins == 0 reads one scalar column. Otherwise the
+// columns are logits over bins evenly spaced on [min, max], trained with the
+// HL-Gauss cross-entropy (Farebrother et al. 2024) and read as their mean.
+struct ValueHead {
+    int bins;
+    float min, max;
+};
+
+__host__ __device__ __forceinline__ int value_cols(ValueHead head) {
+    return head.bins > 0 ? head.bins : 1;
+}
+
+__device__ __forceinline__ float value_bin_center(ValueHead head, int i) {
+    return head.min + (i + 0.5f) * (head.max - head.min) / head.bins;
+}
+
+// Softmax of the value logits into probs (sized bins); returns the mean value.
+__device__ __forceinline__ float value_bin_probs(const precision_t* __restrict__ logits,
+        ValueHead head, float* probs) {
+    float max_logit = -INFINITY;
+    for (int i = 0; i < head.bins; ++i) {
+        max_logit = fmaxf(max_logit, to_float(logits[i]));
+    }
+    float sum = 0.0f;
+    for (int i = 0; i < head.bins; ++i) {
+        probs[i] = __expf(to_float(logits[i]) - max_logit);
+        sum += probs[i];
+    }
+    float mean = 0.0f;
+    for (int i = 0; i < head.bins; ++i) {
+        probs[i] /= sum;
+        mean += probs[i] * value_bin_center(head, i);
+    }
+    return mean;
+}
+
+constexpr int VALUE_MAX_BINS = 128;
+
+__device__ __forceinline__ float value_estimate(const precision_t* __restrict__ logits,
+        ValueHead head) {
+    if (head.bins == 0) {
+        return to_float(logits[0]);
+    }
+    float probs[VALUE_MAX_BINS];
+    return value_bin_probs(logits, head, probs);
+}
+
 enum LossIdx {
     LOSS_PG = 0, LOSS_VF = 1, LOSS_ENT = 2, LOSS_TOTAL = 3,
     LOSS_OLD_APPROX_KL = 4, LOSS_APPROX_KL = 5, LOSS_CLIPFRAC = 6,
@@ -1383,7 +1583,8 @@ struct PPOGraphArgs {
 struct PPOKernelArgs {
     float* grad_logits;
     float* grad_logstd; // For continuous actions
-    float* grad_values_pred;
+    float* grad_values_pred; // (N, T, value_cols)
+    const float* new_logprobs;
     const precision_t* logits;
     const precision_t* logstd; // Continuous only
     const precision_t* values_pred;
@@ -1393,27 +1594,32 @@ struct PPOKernelArgs {
     float clip_coef, vf_clip_coef, vf_coef;
     const float* ent_coef;  // device ptr — host by-value bakes into CUDA graphs
     int T_seq, A_total, N;
+    ValueHead value_head;
     bool is_continuous;
 };
 
 struct PPOBufs {
     Float grad_logits, grad_values, grad_logstd;
+    Float new_logprobs;  // (N, T) written by cache_imp_and_v
     Float ppo_partials;
     float* ent_coef;     // device scalar (graphs cannot bake host by-value)
 };
 
-void register_ppo_buffers(PPOBufs& bufs, Allocator* alloc, int N, int T, int A_total, bool is_continuous) {
+void register_ppo_buffers(PPOBufs& bufs, Allocator* alloc, int N, int T, int A_total,
+        int value_columns, bool is_continuous) {
     long total = (long)N * T;
     int ppo_grid = ((int)total + PPO_THREADS - 1) / PPO_THREADS;
     bufs = (PPOBufs){
         .grad_logits = {.shape = {N, T, A_total}},
-        .grad_values = {.shape = {N, T, 1}},
+        .grad_values = {.shape = {N, T, value_columns}},
         .grad_logstd = {.shape = {N, T, A_total}},
+        .new_logprobs = {.shape = {N, T}},
         .ppo_partials = {.shape = {ppo_grid * LOSS_N}},
         .ent_coef = NULL,
     };
     alloc_register(alloc, &bufs.grad_logits);
     alloc_register(alloc, &bufs.grad_values);
+    alloc_register(alloc, &bufs.new_logprobs);
     if (is_continuous) {
         alloc_register(alloc, &bufs.grad_logstd);
     }
@@ -1478,10 +1684,11 @@ __global__ void cache_imp_and_v(
         precision_t* __restrict__ imp_out,
         precision_t* __restrict__ value_out,
         float* __restrict__ logps,
-        float* __restrict__ new_lp_out) {
+        float* __restrict__ new_lp_out,
+        ValueHead value_head) {
     int NT = (int)dec_out.shape[0] * (int)dec_out.shape[1];
     int fused_cols = (int)dec_out.shape[2];
-    int A_total = fused_cols - 1;
+    int A_total = fused_cols - value_cols(value_head);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= NT) {
         return;
@@ -1489,7 +1696,7 @@ __global__ void cache_imp_and_v(
     int logits_base = idx * fused_cols;
     int at_base = idx * A_total;
     precision_t* logits = dec_out.data;
-    value_out[idx] = logits[logits_base + A_total];
+    value_out[idx] = from_float(value_estimate(logits + logits_base + A_total, value_head));
 
     float new_lp = 0.0f;
     if (logstd.data) {
@@ -1547,7 +1754,7 @@ Prec arch_forward_train(Arch* p, Weights& w,
         Activations& activations, Prec x,
         Prec state, Prec terminals, int agent_off,
         TrainGraph& g, Prec logstd, int* act_sizes,
-        float* logps, float* new_lp, cudaStream_t stream) {
+        float* logps, float* new_lp, ValueHead value_head, cudaStream_t stream) {
     int B = x.shape[0], TT = x.shape[1];
     Prec h = p->encoder.forward(w.encoder,
         activations.encoder, *puf_squeeze(&x, 0), stream);
@@ -1558,8 +1765,41 @@ Prec arch_forward_train(Arch* p, Weights& w,
     Prec dec = *puf_unsqueeze(&dec_out, 0, B, TT);
     cache_imp_and_v<<<grid_size(B * TT), BLOCK_SIZE, 0, stream>>>(
         dec, g.mb_actions.data, g.mb_logprobs.data, g.mb_action_mask.data,
-        logstd, act_sizes, g.mb_imp.data, g.mb_gae_v.data, logps, new_lp);
+        logstd, act_sizes, g.mb_imp.data, g.mb_gae_v.data, logps, new_lp, value_head);
     return dec;
+}
+
+// Clipped scalar value loss 0.5 * max((v-r)^2, (v_clip-r)^2); writes scale * dL/dv.
+// When the clipped term wins, v_clip is constant in v, so the gradient is 0.
+__device__ __forceinline__ float value_clipped_loss(float pred, float old, float ret,
+        float clip, float scale, float* grad) {
+    float clipped = old + fmaxf(-clip, fminf(clip, pred - old));
+    float unclipped_loss = (pred - ret) * (pred - ret);
+    float clipped_loss = (clipped - ret) * (clipped - ret);
+    *grad = scale * ((clipped_loss > unclipped_loss) ? 0.0f : (pred - ret));
+    return 0.5f * fmaxf(unclipped_loss, clipped_loss);
+}
+
+// HL-Gauss cross-entropy against a Gaussian of width 0.75 bins centered on
+// the clamped return, integrated over each bin; writes scale * (probs - target).
+__device__ __forceinline__ float value_hl_gauss_loss(const precision_t* __restrict__ logits,
+        ValueHead head, float ret, float scale, float* grad) {
+    float width = (head.max - head.min) / head.bins;
+    float inv = 1.0f / (0.75f * width * 1.41421356f);
+    float target = fminf(head.max, fmaxf(head.min, ret));
+    float lo = erff((head.min - target) * inv);
+    float norm = erff((head.max - target) * inv) - lo;
+    float probs[VALUE_MAX_BINS];
+    value_bin_probs(logits, head, probs);
+    float loss = 0.0f;
+    for (int i = 0; i < head.bins; ++i) {
+        float hi = erff((head.min + (i + 1) * width - target) * inv);
+        float p = (hi - lo) / norm;
+        lo = hi;
+        loss -= p * __logf(fmaxf(probs[i], 1e-30f));
+        grad[i] = scale * (probs[i] - p);
+    }
+    return loss;
 }
 
 __global__ void ppo_loss_compute(
@@ -1577,27 +1817,23 @@ __global__ void ppo_loss_compute(
 
     if (idx < total_elements) {
         int nt = idx;
-        int logits_base = nt * (a.A_total + 1);
+        int vc = value_cols(a.value_head);
+        int logits_base = nt * (a.A_total + vc);
         int at_base = nt * a.A_total;  // logits-grad + mask base (A_total cols)
 
         float adv_for_pg = to_float(g.advantages[nt]);
-        float val = to_float(g.values[nt]);
         float ret = to_float(g.returns[nt]);
-        float val_pred = to_float(a.values_pred[logits_base]);
         float ent_coef = *a.ent_coef;
         float d_entropy_term = inv_NT * (-ent_coef);
-        float logratio = a.grad_values_pred[nt] - to_float(g.old_logprobs[nt]);
+        float logratio = a.new_logprobs[nt] - to_float(g.old_logprobs[nt]);
         float ratio = __expf(logratio);
 
-        // Value loss + gradient: 0.5 * max((v-r)^2, (v_clip-r)^2).
-        // When clipped term wins, v_clip is constant in val_pred → grad 0.
-        float v_error = val_pred - val;
-        float v_clipped = val + fmaxf(-a.vf_clip_coef, fminf(a.vf_clip_coef, v_error));
-        float v_loss_unclipped = (val_pred - ret) * (val_pred - ret);
-        float v_loss_clipped = (v_clipped - ret) * (v_clipped - ret);
-        float v_loss = 0.5f * fmaxf(v_loss_unclipped, v_loss_clipped);
-        float d_val_pred = (v_loss_clipped > v_loss_unclipped) ? 0.0f : (val_pred - ret);
-        a.grad_values_pred[nt] = inv_NT * a.vf_coef * d_val_pred;
+        float v_loss = a.value_head.bins > 0
+            ? value_hl_gauss_loss(a.values_pred + logits_base, a.value_head, ret,
+                inv_NT * a.vf_coef, a.grad_values_pred + nt * vc)
+            : value_clipped_loss(to_float(a.values_pred[logits_base]),
+                to_float(g.values[nt]), ret, a.vf_clip_coef,
+                inv_NT * a.vf_coef, a.grad_values_pred + nt);
         float clip_lo = 1.0f - a.clip_coef;
         float clip_hi = 1.0f + a.clip_coef;
         float ratio_clipped = fmaxf(clip_lo, fminf(clip_hi, ratio));
@@ -1721,10 +1957,10 @@ void ppo_loss_fwd_bwd(
         TrainGraph& graph,
         int* act_sizes, float* losses_acc,
         float clip_coef, float vf_clip_coef, float vf_coef, const float* ent_coef,
-        PPOBufs& bufs, bool is_continuous,
+        PPOBufs& bufs, ValueHead value_head, bool is_continuous,
         cudaStream_t stream) {
     int N = dec_out.shape[0], T = dec_out.shape[1], fused_cols = dec_out.shape[2];
-    int A_total = fused_cols - 1;  // last column is value
+    int A_total = fused_cols - value_cols(value_head);  // value columns follow the logits
     int total = N * T;
     int ppo_grid = (total + PPO_THREADS - 1) / PPO_THREADS;
 
@@ -1742,6 +1978,7 @@ void ppo_loss_fwd_bwd(
         .grad_logits = bufs.grad_logits.data,
         .grad_logstd = is_continuous ? bufs.grad_logstd.data : NULL,
         .grad_values_pred = bufs.grad_values.data,
+        .new_logprobs = bufs.new_logprobs.data,
         .logits = dec_out.data,
         .logstd = is_continuous ? logstd.data : NULL,
         .values_pred = dec_out.data + A_total,
@@ -1752,6 +1989,7 @@ void ppo_loss_fwd_bwd(
         .vf_coef = vf_coef,
         .ent_coef = ent_coef,
         .T_seq = T, .A_total = A_total, .N = N,
+        .value_head = value_head,
         .is_continuous = is_continuous,
     };
     ppo_loss_compute<<<ppo_grid, PPO_THREADS, 0, stream>>>(
