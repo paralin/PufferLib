@@ -66,6 +66,7 @@ void CheckLayout(Dict* state, PuffeRL* p, bool write) {
         {"total_agents", p->vec->total_agents}, {"buffers", p->vec->buffers},
         {"learner_rows", p->vec->policy_layout[1]}, {"policies", p->num_policies},
         {"hidden_size", p->hypers.hidden_size}, {"layers", p->hypers.num_layers},
+        {"layer_norm", p->hypers.layer_norm}, {"value_bins", p->hypers.value_head.bins},
         {"klpo", p->hypers.klpo}, {"horizon", p->hypers.horizon}, {"seed", p->seed},
 #ifdef __HIP_PLATFORM_AMD__
         {"hip", 1},
@@ -73,16 +74,13 @@ void CheckLayout(Dict* state, PuffeRL* p, bool write) {
         {"hip", 0},
 #endif
     };
+    // Flags added after version 1 are absent from older states, which had them off.
     for (const Field& field : fields) {
         if (write) {
             dict_set(state, field.name, field.value);
         } else {
-            if (strcmp(field.name, "klpo") == 0 && !dict_find(state, field.name)) {
-                Require(!p->hypers.klpo, "PPO state cannot resume as KLPO");
-                continue;
-            }
-            Require(dict_get(state, field.name) == field.value,
-                std::string("incompatible ") + field.name);
+            long saved = dict_find(state, field.name) ? (long)dict_get(state, field.name) : 0;
+            Require(saved == field.value, std::string("incompatible ") + field.name);
         }
     }
 }
