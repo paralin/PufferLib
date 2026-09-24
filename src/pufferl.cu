@@ -10,6 +10,7 @@
 #include <nvtx3/nvToolsExt.h>
 
 // C standard
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -2989,6 +2990,11 @@ typedef struct {
     char (*pool)[SELFPLAY_PATH_MAX];
     int pool_size;
     SelfplayHist hist[SELFPLAY_MAX_HIST];
+    // The first rival_slots opponents play another run's newest rival_recent
+    // saves instead of this run's pool; empty rival_dir disables rivals.
+    char rival_dir[SELFPLAY_PATH_MAX];
+    int rival_slots;
+    int rival_recent;
 } Selfplay;
 
 void selfplay_add_checkpoint(Selfplay* sp, const char* path) {
@@ -3008,6 +3014,38 @@ const char* selfplay_sample(Selfplay* sp) {
 }
 
 #include "checkpoint.cuh"
+
+// Draws one of the rival run's newest saves into path. A save is complete once
+// its .state directory is renamed into place; returns false before the first.
+bool selfplay_sample_rival(Selfplay* sp, char* path, size_t size) {
+    std::vector<long> steps;
+    std::error_code error;
+    for (const auto& entry : std::filesystem::directory_iterator(sp->rival_dir, error)) {
+        const auto& state = entry.path();
+        std::string stem = state.stem().string();
+        if (state.extension() == ".state" && !stem.empty()
+                && stem.find_first_not_of("0123456789") == std::string::npos
+                && std::filesystem::exists(state / "state.ini")) {
+            steps.push_back(std::stol(stem));
+        }
+    }
+    if (error || steps.empty()) return false;
+    std::sort(steps.begin(), steps.end(), std::greater<long>());
+    size_t recent = std::min(steps.size(), (size_t)sp->rival_recent);
+    long step = steps[rand_r(&sp->rng) % recent];
+    snprintf(path, size, "%s/%016ld.state/weights.f32", sp->rival_dir, step);
+    return true;
+}
+
+// Chooses the checkpoint for opponent slot, falling back to this run's pool
+// while the rival has no save. path receives a rival choice.
+const char* selfplay_opponent(Selfplay* sp, int slot, char* path, size_t size) {
+    if (slot < sp->rival_slots && selfplay_sample_rival(sp, path, size)) {
+        printf("selfplay: opponent %d plays rival %s\n", slot + 1, path);
+        return path;
+    }
+    return selfplay_sample(sp);
+}
 
 typedef struct {
     char section[64];
@@ -3545,6 +3583,16 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             selfplay.max_size, sizeof(*selfplay.pool));
         selfplay.opp_timeout_steps = puf_ini_get(ini, "selfplay", "opp_timeout_steps");
         selfplay.rng = puf_ini_get(ini, "selfplay", "seed") + pufferl->hypers.rank;
+        const char* rival = puf_ini_get_str(ini, "selfplay", "rival_dir");
+        if (strcmp(rival, "None") != 0) {
+            snprintf(selfplay.rival_dir, sizeof(selfplay.rival_dir), "%s", rival);
+        }
+        selfplay.rival_slots = selfplay.rival_dir[0]
+            ? puf_ini_get(ini, "selfplay", "rival_slots") : 0;
+        selfplay.rival_recent = puf_ini_get(ini, "selfplay", "rival_recent");
+        assert(selfplay.rival_slots >= 0 && selfplay.rival_slots <= selfplay.num_hist
+            && selfplay.rival_recent > 0
+            && "selfplay rivals need 0..num_hist slots and rival_recent > 0");
         long current_step = pufferl->global_step * pufferl->hypers.world_size;
 
         if (!resuming) {
@@ -3556,7 +3604,9 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             SelfplayHist* hist = &selfplay.hist[s];
             hist->policy_idx = s + 1;
             if (!resuming) {
-                pufferl_load_policy(pufferl, hist->policy_idx, selfplay_sample(&selfplay));
+                char rival[SELFPLAY_PATH_MAX];
+                pufferl_load_policy(pufferl, hist->policy_idx,
+                    selfplay_opponent(&selfplay, s, rival, sizeof(rival)));
             }
             hist->opp_started_step = current_step;
         }
@@ -3672,8 +3722,9 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             for (int s = 0; s < selfplay.num_hist; s++) {
                 SelfplayHist* hist = &selfplay.hist[s];
                 if (step - hist->opp_started_step >= selfplay.opp_timeout_steps) {
+                    char rival[SELFPLAY_PATH_MAX];
                     pufferl_load_policy(pufferl, hist->policy_idx,
-                        selfplay_sample(&selfplay));
+                        selfplay_opponent(&selfplay, s, rival, sizeof(rival)));
                     pufferl_reset_policy_envs(pufferl, hist->policy_idx);
                     hist->opp_started_step = step;
                 }
