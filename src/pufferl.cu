@@ -4129,8 +4129,11 @@ int main(int argc, char** argv) {
     puf_ini_load_env(&ini, PUFFER_ENV_NAME, ini_argc, ini_argv);
     std::string resume = puf_ini_get_str(&ini, "base", "resume_training_state");
     if (resume != "None") {
+        // The saved recipe overrides the current profile, which supplies only
+        // keys added since the save; arguments still override both.
         puf_ini_free(&ini);
         ini = {};
+        puf_ini_load_env(&ini, PUFFER_ENV_NAME, 0, NULL);
         puf_ini_load_file(&ini, (resume + "/config.ini").c_str());
         puf_ini_put(&ini, "base.run_id", "None");
         for (int i = 0; i < ini_argc; ++i) {
