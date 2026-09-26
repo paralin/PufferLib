@@ -2070,8 +2070,10 @@ void puf_load_weights_into(Float dst, Prec params,
     assert(fp && "failed to open weights for reading");
     char* buf = (char*)malloc(nbytes);
     size_t nread = fread(buf, 1, nbytes, fp);
+    // A longer file holds a larger policy; loading its prefix would run garbage.
+    bool exact = (int64_t)nread == nbytes && fgetc(fp) == EOF;
     fclose(fp);
-    assert((int64_t)nread == nbytes && "failed to read weights");
+    assert(exact && "weights file does not match the policy shape");
     cudaMemcpy(dst.data, buf, nbytes, cudaMemcpyHostToDevice);
     free(buf);
     if (USE_BF16) {
