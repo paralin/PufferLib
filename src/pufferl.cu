@@ -3441,15 +3441,18 @@ static PuffeRL* eval_make(Ini* ini, TrainContext* ctx, int mode, int render) {
         puf_ini_put(ini, "train.verb_eps", "0");
     }
     if (match) {
-        int h = puf_ini_get(ini, "policy", "hidden_size");
-        int L = puf_ini_get(ini, "policy", "num_layers");
-        char hb[32], lb[32];
-        snprintf(hb, sizeof(hb), "%d", h);
-        snprintf(lb, sizeof(lb), "%d", L);
+        // The enemy shares the actor's shape unless vec.hist_policy_hidden_size
+        // and vec.hist_policy_num_layers name its own.
+        if (puf_ini_get(ini, "vec", "hist_policy_hidden_size") <= 0
+                || puf_ini_get(ini, "vec", "hist_policy_num_layers") <= 0) {
+            char hb[32], lb[32];
+            snprintf(hb, sizeof(hb), "%d", (int)puf_ini_get(ini, "policy", "hidden_size"));
+            snprintf(lb, sizeof(lb), "%d", (int)puf_ini_get(ini, "policy", "num_layers"));
+            puf_ini_put(ini, "vec.hist_policy_hidden_size", hb);
+            puf_ini_put(ini, "vec.hist_policy_num_layers", lb);
+        }
         puf_ini_put(ini, "vec.num_policies", "2");
         puf_ini_put(ini, "vec.hist_policy_percent", "1");
-        puf_ini_put(ini, "vec.hist_policy_hidden_size", hb);
-        puf_ini_put(ini, "vec.hist_policy_num_layers", lb);
         puf_ini_put(ini, "selfplay.enabled", "0");
     }
     puf_ini_put(ini, "base.reset_every_horizon", "0");
