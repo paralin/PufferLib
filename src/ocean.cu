@@ -83,9 +83,17 @@ static void create_custom_encoder(Encoder* enc) {
 #endif
 }
 
+// A build may supply its env's decoder with -DPUFFER_ENV_DECODER='"file"',
+// naming a source under ocean/<env>/ that defines create_env_decoder.
+#ifdef PUFFER_ENV_DECODER
+#include PUFFER_ENV_DECODER
+#endif
+
 static void create_custom_decoder(Decoder* dec) {
 #ifdef PUFFER_NETHACK
     create_nethack_decoder(dec);
+#elif defined(PUFFER_ENV_DECODER)
+    create_env_decoder(dec);
 #else
     (void)dec;
 #endif

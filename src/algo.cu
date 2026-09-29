@@ -14,6 +14,7 @@ typedef void (*encoder_backward_fn)(void* weights, void* activations,
     Prec grad, cudaStream_t stream);
 typedef Prec (*decoder_backward_fn)(void* weights, void* activations,
     Float grad_logits, Float grad_logstd, Float grad_value, cudaStream_t stream);
+typedef Prec (*param_block_fn)(void* weights);
 typedef Prec (*network_forward_fn)(void* weights, Prec x,
     Prec state, void* activations, cudaStream_t stream);
 typedef Prec (*network_forward_train_fn)(void* weights, Prec x,
@@ -55,6 +56,9 @@ struct Decoder {
     int value_cols;  // 1 for a scalar value, else the value bin count
     bool continuous;
     size_t activation_size;
+    // Optional: the parameters a save of the linear decoder lacks. Loading such
+    // a save zero-fills them, so zero must leave the outputs unchanged.
+    param_block_fn plain_gap;
 };
 
 struct DecoderWeights {

@@ -2203,18 +2203,32 @@ void puf_save_weights(PuffeRL* p, const char* path) {
     free(buf);
 }
 
-void puf_load_weights_into(Float dst, Prec params,
+// Load a save into fp32 master weights and cast them to params. A save that
+// lacks the gap block, a view into params, loads with the block zeroed.
+void puf_load_weights_into(Float dst, Prec params, Prec gap,
         cudaStream_t stream, const char* path) {
-    int64_t nbytes = numel(dst.shape) * sizeof(float);
+    int64_t count = numel(dst.shape);
     FILE* fp = fopen(path, "rb");
     assert(fp && "failed to open weights for reading");
-    char* buf = (char*)malloc(nbytes);
-    size_t nread = fread(buf, 1, nbytes, fp);
+    fseek(fp, 0, SEEK_END);
+    int64_t floats = ftell(fp) / (int64_t)sizeof(float);
+    rewind(fp);
+    int64_t gap_count = gap.data ? numel(gap.shape) : 0;
+    int64_t gap_start = gap.data ? gap.data - params.data : count;
     // A longer file holds a larger policy; loading its prefix would run garbage.
-    bool exact = (int64_t)nread == nbytes && fgetc(fp) == EOF;
+    bool plain = gap_count > 0 && floats == count - gap_count;
+    assert((floats == count || plain) && "weights file does not match the policy shape");
+    float* buf = (float*)calloc(count, sizeof(float));
+    int64_t head = plain ? gap_start : count;
+    int64_t nread = fread(buf, sizeof(float), head, fp);
+    if (plain) {
+        int64_t tail = gap_start + gap_count;
+        nread += fread(buf + tail, sizeof(float), count - tail, fp);
+    }
+    bool exact = nread == floats && fgetc(fp) == EOF;
     fclose(fp);
     assert(exact && "weights file does not match the policy shape");
-    cudaMemcpy(dst.data, buf, nbytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(dst.data, buf, count * sizeof(float), cudaMemcpyHostToDevice);
     free(buf);
     if (USE_BF16) {
         int n = numel(params.shape);
@@ -2222,11 +2236,17 @@ void puf_load_weights_into(Float dst, Prec params,
     }
 }
 
+// The decoder parameters a save of the linear decoder lacks, or an empty view.
+static Prec policy_plain_gap(Policy* pol) {
+    Decoder* decoder = &pol->arch.decoder;
+    return decoder->plain_gap ? decoder->plain_gap(pol->weights.decoder) : Prec{};
+}
+
 // Load weights into policies[i] (full index; 0 = trainable, i>0 = frozen).
 void pufferl_load_policy(PuffeRL* pufferl, int i, const char* path) {
     assert(i >= 0 && i < pufferl->num_policies);
     Policy* pol = &pufferl->policies[i];
-    puf_load_weights_into(pol->master_weights, pol->param,
+    puf_load_weights_into(pol->master_weights, pol->param, policy_plain_gap(pol),
         pufferl->default_stream, path);
     for (int buffer = 0; buffer < pufferl->vec->buffers; ++buffer) {
         Prec* state = &pol->buffer_states[buffer];
@@ -2676,7 +2696,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         master_weights_setup(&teacher->master_weights, &teacher->param,
             false, pufferl->default_stream);
         puf_load_weights_into(teacher->master_weights, teacher->param,
-            pufferl->default_stream, teacher_path);
+            policy_plain_gap(teacher), pufferl->default_stream, teacher_path);
         for (int i = 0; i < num_buffers; i++) {
             Prec* state = &teacher->buffer_states[i];
             cudaMemset(state->data, 0, numel(state->shape) * sizeof(precision_t));
