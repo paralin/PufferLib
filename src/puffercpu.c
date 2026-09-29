@@ -807,12 +807,19 @@ int main(int argc, char** argv) {
     unsigned char* masks = calloc(
         (size_t)env.num_agents * (size_t)act_n, 1);
     memset(masks, 1, (size_t)env.num_agents * (size_t)act_n);
+    // This runner always executes its own samples; expert rows land in
+    // scratch. All-ones bytes are NaN floats.
+    float* expert_weights = malloc(n_agt * sizeof(float));
+    float* expert_actions = calloc(n_atn, sizeof(float));
+    memset(expert_weights, 0xff, n_agt * sizeof(float));
     for (int i = 0; i < env.num_agents; i++) {
         env.agents[i].observations = observations + i * OBS_SIZE;
         env.agents[i].actions = actions + i * NUM_ATNS;
         env.agents[i].rewards = rewards + i;
         env.agents[i].terminals = terminals + i;
         env.agents[i].action_mask = masks + i * act_n;
+        env.agents[i].expert_weight = expert_weights + i;
+        env.agents[i].expert_actions = expert_actions + i * NUM_ATNS;
         env.agents[i].policy = 0;
     }
     puf_reset(&env);

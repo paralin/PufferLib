@@ -10,7 +10,8 @@ struct Replay {
 };
 
 void RegisterReplay(Replay* replay, Allocator* alloc, int rows, int samples,
-        int horizon, int inputs, int actions, int mask, int layers, int hidden, bool klpo) {
+        int horizon, int inputs, int actions, int mask, int layers, int hidden, bool klpo,
+        bool teacher) {
     replay->advantages = {.shape = {rows, horizon}};
     replay->returns = {.shape = {rows, horizon}};
     replay->state = {.shape = {layers, samples, hidden}};
@@ -23,7 +24,8 @@ void RegisterReplay(Replay* replay, Allocator* alloc, int rows, int samples,
     alloc_register(alloc, &replay->probabilities);
     alloc_register(alloc, &replay->cdf);
     alloc_register(alloc, &replay->importance);
-    register_rollout_buffers(&replay->batch, alloc, samples, horizon, inputs, actions, mask, klpo);
+    register_rollout_buffers(&replay->batch, alloc, samples, horizon, inputs, actions, mask, klpo,
+        teacher);
     cudaMalloc((void**)&replay->indices, samples * sizeof(int));
     cudaMalloc((void**)&replay->beta, sizeof(float));
 }
@@ -106,10 +108,11 @@ void GatherReplay(Replay* replay, const RolloutBuf& source, Prec state,
     int samples = replay->importance.shape[0];
     int horizon = source.observations.shape[1];
     const Prec* src[] = {&source.observations, &source.logprobs, &source.values,
-        &source.rewards, &source.terminals, &source.action_mask};
+        &source.rewards, &source.terminals, &source.expert, &source.action_mask};
     Prec* dst[] = {&replay->batch.observations, &replay->batch.logprobs, &replay->batch.values,
-        &replay->batch.rewards, &replay->batch.terminals, &replay->batch.action_mask};
-    for (int i = 0; i < 6; ++i) {
+        &replay->batch.rewards, &replay->batch.terminals, &replay->batch.expert,
+        &replay->batch.action_mask};
+    for (int i = 0; i < (int)(sizeof(src) / sizeof(src[0])); ++i) {
         int width = src[i]->shape[1] * (src[i]->shape[2] > 0 ? src[i]->shape[2] : 1);
         ReplayGather<<<grid_size(samples * width), BLOCK_SIZE, 0, stream>>>(
             dst[i]->data, src[i]->data, replay->indices, samples, width);
@@ -124,6 +127,11 @@ void GatherReplay(Replay* replay, const RolloutBuf& source, Prec state,
     int action_width = horizon * source.actions.shape[2];
     ReplayGather<<<grid_size(samples * action_width), BLOCK_SIZE, 0, stream>>>(
         replay->batch.actions.data, source.actions.data, replay->indices, samples, action_width);
+    if (source.teacher.data) {
+        ReplayGather<<<grid_size(samples * action_width), BLOCK_SIZE, 0, stream>>>(
+            replay->batch.teacher.data, source.teacher.data, replay->indices, samples,
+            action_width);
+    }
     ReplayGatherState<<<grid_size(numel(replay->state.shape)), BLOCK_SIZE, 0, stream>>>(
         replay->state, state, replay->indices);
 }

@@ -124,7 +124,7 @@ void StateFiles(const fs::path& root, PuffeRL* p, bool write) {
     }
 }
 
-void Save(const char* weights_path, Ini* config, PuffeRL* p, Selfplay* pool) {
+void Save(const char* weights_path, Ini* config, PuffeRL* p, League* league) {
     Require(p->hypers.world_size == 1, "full-state checkpoints require one GPU");
     Require(cudaDeviceSynchronize() == cudaSuccess, "wait for checkpoint boundary");
     fs::path target(weights_path);
@@ -141,15 +141,20 @@ void Save(const char* weights_path, Ini* config, PuffeRL* p, Selfplay* pool) {
     dict_set(state, "episodes", p->completed_episodes);
     dict_set(state, "klpo_episodes", p->klpo_episodes);
     dict_set(state, "klpo_decisions", p->klpo_decisions);
-    dict_set(state, "pool_size", pool->pool_size);
-    dict_set(state, "pool_rng", pool->rng);
     StateFiles(temporary, p, true);
-    for (int i = 0; i < pool->pool_size; ++i) {
-        fs::copy_file(pool->pool[i], temporary / ("pool-" + std::to_string(i) + ".f32"));
+
+    // League members and slots survive a resume; win counts restart at the prior.
+    dict_set(state, "league_size", league->size);
+    dict_set(state, "league_rng", league->rng);
+    for (int i = 0; i < league->size; ++i) {
+        std::string index = std::to_string(i);
+        fs::copy_file(league->members[i].path, temporary / ("member-" + index + ".f32"));
+        dict_set(state, ("member_elo_" + index).c_str(), league->members[i].elo);
     }
-    for (int i = 0; i < pool->num_hist; ++i) {
-        std::string key = "opponent_step_" + std::to_string(i);
-        dict_set(state, key.c_str(), pool->hist[i].opp_started_step);
+    for (int s = 0; s < league->num_slots; ++s) {
+        std::string index = std::to_string(s);
+        dict_set(state, ("slot_member_" + index).c_str(), league->slot_member[s]);
+        dict_set(state, ("slot_step_" + index).c_str(), league->slot_step[s]);
     }
     WriteIni(temporary / "config.ini", config);
     WriteIni(temporary / "state.ini", &manifest);
@@ -160,7 +165,7 @@ void Save(const char* weights_path, Ini* config, PuffeRL* p, Selfplay* pool) {
     fs::rename(actor.string() + ".tmp", actor);
 }
 
-void Load(const char* directory, PuffeRL* p, Selfplay* pool) {
+void Load(const char* directory, PuffeRL* p, League* league) {
     Require(p->hypers.world_size == 1, "full-state resume requires one GPU");
     fs::path root(directory);
     Ini manifest = {};
@@ -178,17 +183,21 @@ void Load(const char* directory, PuffeRL* p, Selfplay* pool) {
     Require(p->epoch >= 0 && p->global_step >= 0 && p->completed_episodes >= 0,
         "negative training counters");
     StateFiles(root, p, false);
-    int count = dict_get(state, "pool_size");
-    Require(count >= 0 && count <= pool->max_size, "incompatible opponent pool size");
-    pool->pool_size = 0;
+    int count = dict_get(state, "league_size");
+    Require(count >= 0 && count <= league->max_size, "incompatible league size");
+    league->size = 0;
     for (int i = 0; i < count; ++i) {
-        std::string path = fs::absolute(root / ("pool-" + std::to_string(i) + ".f32")).string();
-        selfplay_add_checkpoint(pool, path.c_str());
+        std::string index = std::to_string(i);
+        std::string path = fs::absolute(root / ("member-" + index + ".f32")).string();
+        league_join(league, path.c_str(), dict_get(state, ("member_elo_" + index).c_str()));
     }
-    pool->rng = dict_get(state, "pool_rng");
-    for (int i = 0; i < pool->num_hist; ++i) {
-        std::string key = "opponent_step_" + std::to_string(i);
-        pool->hist[i].opp_started_step = dict_get(state, key.c_str());
+    league->rng = dict_get(state, "league_rng");
+    for (int s = 0; s < league->num_slots; ++s) {
+        std::string index = std::to_string(s);
+        league->slot_member[s] = dict_get(state, ("slot_member_" + index).c_str());
+        league->slot_step[s] = dict_get(state, ("slot_step_" + index).c_str());
+        Require(league->slot_member[s] >= 0 && league->slot_member[s] < count,
+            "league slot names no member");
     }
     p->last_log_step = p->global_step;
     Require(cudaDeviceSynchronize() == cudaSuccess, "finish restoring state");

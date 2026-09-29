@@ -326,6 +326,8 @@ typedef struct {
     float ent_coef;
     float min_ent_coef_ratio;
     bool anneal_ent_coef;
+    float teacher_weight;
+    long teacher_steps;
     float gamma;
     float gamma_end;
     long gamma_episodes;
@@ -371,6 +373,8 @@ struct RolloutBuf {
     Prec logprobs;      // ...
     Prec rewards;
     Prec terminals;
+    Prec expert;        // (horizon, agents) imitation weight; NaN for free rows
+    Float teacher;      // (horizon, agents, num_atns) teacher's sampled action
     Float behavior;     // KLPO historical normalized conditional tables, fp32
     Float targets;      // KLPO complete-episode feedback; NaN for incomplete edges
     Prec action_mask;   // (horizon, agents, mask_size)
@@ -380,7 +384,7 @@ struct RolloutBuf {
 // alloc_register stores the shape and data pointer.
 // Memory is only allocated after all buffers are registered.
 void register_rollout_buffers(RolloutBuf* bufs, Allocator* alloc,
-        int T, int B, int input_size, int num_atns, int mask_size, bool klpo = false) {
+        int T, int B, int input_size, int num_atns, int mask_size, bool klpo, bool teacher) {
     memset(bufs, 0, sizeof(*bufs));
     bufs->observations = {.shape = {T, B, input_size}};
     bufs->actions      = {.shape = {T, B, num_atns}};
@@ -388,15 +392,20 @@ void register_rollout_buffers(RolloutBuf* bufs, Allocator* alloc,
     bufs->logprobs     = {.shape = {T, B}};
     bufs->rewards      = {.shape = {T, B}};
     bufs->terminals    = {.shape = {T, B}};
+    bufs->expert       = {.shape = {T, B}};
     bufs->action_mask  = {.shape = {T, B, mask_size}};
     Prec* prec_fields[] = {
         &bufs->observations, &bufs->values, &bufs->logprobs,
-        &bufs->rewards, &bufs->terminals, &bufs->action_mask,
+        &bufs->rewards, &bufs->terminals, &bufs->expert, &bufs->action_mask,
     };
     for (int i = 0; i < (int)(sizeof(prec_fields) / sizeof(prec_fields[0])); i++) {
         alloc_register(alloc, prec_fields[i]);
     }
     alloc_register(alloc, &bufs->actions);
+    if (teacher) {
+        bufs->teacher = {.shape = {T, B, num_atns}};
+        alloc_register(alloc, &bufs->teacher);
+    }
     if (klpo) {
         bufs->behavior = {.shape = {T, B, mask_size}};
         bufs->targets = {.shape = {T, B}};
@@ -437,7 +446,11 @@ RolloutBuf rollout_time_view(RolloutBuf* base, int start_t, int T) {
     view.logprobs     = puf_time_view(base->logprobs,     start_t, T);
     view.rewards      = puf_time_view(base->rewards,      start_t, T);
     view.terminals    = puf_time_view(base->terminals,    start_t, T);
+    view.expert       = puf_time_view(base->expert,       start_t, T);
     view.action_mask  = puf_time_view(base->action_mask,  start_t, T);
+    if (base->teacher.data) {
+        view.teacher = puf_time_view(base->teacher, start_t, T);
+    }
     if (base->behavior.data) {
         view.behavior = puf_time_view(base->behavior, start_t, T);
         view.targets = puf_time_view(base->targets, start_t, T);
@@ -448,11 +461,12 @@ RolloutBuf rollout_time_view(RolloutBuf* base, int start_t, int T) {
 // RolloutTrainLength keeps learner rows contiguous while narrowing time views.
 void RolloutTrainLength(RolloutBuf* data, int time) {
     Prec* fields[] = {&data->observations, &data->values, &data->logprobs,
-        &data->rewards, &data->terminals, &data->action_mask};
+        &data->rewards, &data->terminals, &data->expert, &data->action_mask};
     for (Prec* field : fields) {
         field->shape[1] = time;
     }
-    data->actions.shape[1] = data->behavior.shape[1] = data->targets.shape[1] = time;
+    data->actions.shape[1] = data->teacher.shape[1] = time;
+    data->behavior.shape[1] = data->targets.shape[1] = time;
 }
 
 // Env batch. Device IO is always PuffeRL.env (EnvBuf).
@@ -474,6 +488,8 @@ struct VecEnv {
     float* rewards;
     float* terminals;
     unsigned char* action_mask;
+    float* expert_weights;
+    float* expert_actions;
     int* worker_state;
     int shutdown;
     pthread_t* threads;
@@ -489,6 +505,8 @@ struct EnvBuf {
     Float rewards;    // (total_agents,)
     Float terminals;  // (total_agents,)
     Byte action_mask; // (total_agents, mask_size); always allocated
+    Float expert_weights; // (total_agents,) NaN for free rows
+    Float expert_actions; // (total_agents, num_atns)
 };
 
 // Owned runnable policy instance. policies[0] is trainable; policies[i>0] are
@@ -551,6 +569,9 @@ const char* LOSS_NAMES[] = {
     "loss/kl",
     "loss/clipfrac",
     "importance",
+    "loss/imitation",
+    "loss/teacher",
+    "expert_share",
 };
 
 typedef struct {
@@ -563,6 +584,11 @@ typedef struct {
 typedef struct PuffeRL {
     Policy* policies;        // [num_policies]; policies[0] trainable, rest frozen
     int num_policies;
+    // Frozen network run on the learner's rows when train.teacher names a
+    // save; the learner imitates its sampled actions on free rows.
+    bool teaching;
+    Policy teacher;
+    Prec teacher_scratch;    // (2, learner rows per buffer) discarded logprobs, values
     Weights actor_weights; // async rollout snapshot of policies[0]; unused when async=0
     Activations train_activs;
     Allocator weight_alloc;      // async actor weights
@@ -843,6 +869,51 @@ Float puf_slice(Float p, int t, int start, int count) {
     };
 }
 
+// Records each row's imitation weight and, on expert rows, replaces the sampled
+// action in the rollout and the env dispatch with the expert's.
+__global__ void apply_expert(precision_t* expert, float* actions, float* env_actions,
+        const float* weights, const float* expert_actions, int n) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n) {
+        return;
+    }
+    float weight = weights[row];
+    expert[row] = from_float(weight);
+    if (isnan(weight)) {
+        return;
+    }
+    for (int h = 0; h < NUM_ATNS; ++h) {
+        actions[row * NUM_ATNS + h] = expert_actions[row * NUM_ATNS + h];
+        env_actions[row * NUM_ATNS + h] = expert_actions[row * NUM_ATNS + h];
+    }
+}
+
+// Runs the teacher on the learner's n rows at sub and stores its sampled
+// action as the row's imitation target.
+static void teacher_sample(PuffeRL* pufferl, int buf, int t, int sub, int n,
+        RolloutBuf rollouts, cudaStream_t stream) {
+    Policy* teacher = &pufferl->teacher;
+    Prec* state = &teacher->buffer_states[buf];
+    if (teacher->arch.network.num_layers > 0) {
+        int state_n = (int)state->shape[0] * n * (int)state->shape[2];
+        zero_term_state<<<grid_size(state_n), BLOCK_SIZE, 0, stream>>>(
+            *state, pufferl->env.terminals, 0, sub, n);
+    }
+    Prec obs = puf_slice(rollouts.observations, t, sub, n);
+    Prec dec = arch_forward(&teacher->arch, teacher->weights, teacher->buf_acts[buf],
+        obs, *state, stream);
+
+    // The teacher's sample fills both action outputs; its log probability and
+    // value land in scratch.
+    Float actions = puf_slice(rollouts.teacher, t, sub, n);
+    Prec mask = puf_slice(rollouts.action_mask, t, sub, n);
+    precision_t* scratch = pufferl->teacher_scratch.data;
+    sample_logits<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+        dec, Prec{}, pufferl->act_sizes, actions.data, actions.data,
+        scratch, scratch + n, pufferl->rng_states[buf],
+        mask.data, (int)rollouts.action_mask.shape[2], pufferl->hypers.value_head);
+}
+
 static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
         cudaStream_t stream, bool warm_stateless = false) {
     Hypers* hypers = &pufferl->hypers;
@@ -940,6 +1011,16 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
             lp_b.data, val_b.data,
             pufferl->rng_states[buf] + off,
             mask_b.data, mask_stride, hypers->value_head);
+        if (!pol->frozen) {
+            Prec expert_b = puf_slice(rollouts.expert, t, sub, n);
+            apply_expert<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(expert_b.data,
+                act_b.data, env->actions.data + (long)sub * act_cols,
+                env->expert_weights.data + sub, env->expert_actions.data + (long)sub * NUM_ATNS,
+                n);
+        }
+        if (!pol->frozen && pufferl->teaching) {
+            teacher_sample(pufferl, buf, t, sub, n, rollouts, stream);
+        }
 #ifdef PUF_CONDITIONAL_GROUPS
         if (hypers->klpo && !pol->frozen) {
             Float behavior = puf_slice(rollouts.behavior, t, sub, n);
@@ -1112,6 +1193,13 @@ static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
         cudaHostAllocPortable);
     cudaHostAlloc((void**)&vec->action_mask, mask_bytes, cudaHostAllocPortable);
     memset(vec->action_mask, 1, mask_bytes);
+    // All-ones bytes are NaN floats: every row starts free.
+    cudaHostAlloc((void**)&vec->expert_weights, total_agents * sizeof(float),
+        cudaHostAllocPortable);
+    cudaHostAlloc((void**)&vec->expert_actions, total_agents * NUM_ATNS * sizeof(float),
+        cudaHostAllocPortable);
+    memset(vec->expert_weights, 0xff, total_agents * sizeof(float));
+    memset(vec->expert_actions, 0, total_agents * NUM_ATNS * sizeof(float));
 
     float frozen_pct = dict_get(vk, "hist_policy_percent");
     for (int buf = 0; buf < num_buffers; buf++) {
@@ -1162,6 +1250,8 @@ static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
                 a->rewards = vec->rewards + phys;
                 a->terminals = vec->terminals + phys;
                 a->action_mask = vec->action_mask + (size_t)phys * vec->mask_size;
+                a->expert_weight = vec->expert_weights + phys;
+                a->expert_actions = vec->expert_actions + (size_t)phys * NUM_ATNS;
             }
             eptr->tag = tag;
             eptr->boundary_reached = 0;
@@ -1185,6 +1275,11 @@ static void cpu_upload(PuffeRL* p, int start, int n, cudaStream_t stream) {
     cudaMemcpyAsync(e->action_mask.data + (size_t)start * mask,
         v->action_mask + (size_t)start * mask,
         n * mask * sizeof(unsigned char), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(e->expert_weights.data + start, v->expert_weights + start,
+        n * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(e->expert_actions.data + (size_t)start * NUM_ATNS,
+        v->expert_actions + (size_t)start * NUM_ATNS,
+        n * NUM_ATNS * sizeof(float), cudaMemcpyHostToDevice, stream);
 }
 
 // CPU worker handshake. Atomic on worker_state[]; calloc leaves BUF_STARTING.
@@ -1695,6 +1790,12 @@ static void prepare_rollout(PuffeRL* pufferl, RolloutBuf src, int slot,
         rollouts->values.data, src.values.data, T, B, 1, buffer_rows, learner_rows);
     transpose_102<<<grid_size(T * B * mask_c), BLOCK_SIZE, 0, stream>>>(
         rollouts->action_mask.data, src.action_mask.data, T, B, mask_c, buffer_rows, learner_rows);
+    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
+        rollouts->expert.data, src.expert.data, T, B, 1, buffer_rows, learner_rows);
+    if (pufferl->teaching) {
+        transpose_102<<<grid_size(T * B * num_atns), BLOCK_SIZE, 0, stream>>>(
+            rollouts->teacher.data, src.teacher.data, T, B, num_atns, buffer_rows, learner_rows);
+    }
 
     if (hypers->klpo) {
         transpose_102<<<grid_size(T * B * mask_c), BLOCK_SIZE, 0, stream>>>(
@@ -1774,6 +1875,10 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
         graph.mb_rewards = slice_rows(selected.rewards, dest_off, Nmb);
         graph.mb_values = slice_rows(selected.values, dest_off, Nmb);
         graph.mb_action_mask = slice_rows(selected.action_mask, dest_off, Nmb);
+        graph.mb_expert = slice_rows(selected.expert, dest_off, Nmb);
+        if (pufferl->teaching) {
+            graph.mb_teacher = slice_rows(selected.teacher, dest_off, Nmb);
+        }
         graph.mb_state = state;
         DecoderWeights* dw_train = (DecoderWeights*)primary->weights.decoder;
         Prec p_logstd = {};
@@ -1809,7 +1914,7 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
             ppo_loss_fwd_bwd(dec, p_logstd, graph,
                 pufferl->act_sizes, pufferl->losses,
                 hypers->clip_coef, hypers->vf_clip_coef, hypers->vf_coef,
-                pufferl->ppo_bufs.ent_coef,
+                pufferl->ppo_bufs.ent_coef, pufferl->ppo_bufs.teacher_coef,
                 pufferl->ppo_bufs, hypers->value_head, pufferl->is_continuous, stream);
         }
 
@@ -1873,6 +1978,10 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
     }
     // Host write + H2D stay outside the graph; device ptr is what kernels read.
     cudaMemcpyAsync(pufferl->ppo_bufs.ent_coef, &current_ent_coef,
+        sizeof(float), cudaMemcpyHostToDevice, train_stream);
+    float teacher_coef = pufferl->teaching ? hypers->teacher_weight * (float)fmax(0.0,
+        1.0 - (double)pufferl->global_step / hypers->teacher_steps) : 0.0f;
+    cudaMemcpyAsync(pufferl->ppo_bufs.teacher_coef, &teacher_coef,
         sizeof(float), cudaMemcpyHostToDevice, train_stream);
 
     if (hypers->prioritized_replay) {
@@ -2127,6 +2236,23 @@ static void master_weights_setup(Float* mw, Prec* param,
     }
 }
 
+// Builds a policy and registers its weights, and per-buffer rollout
+// activations and recurrent state for rows agents, into activ_alloc.
+static void policy_register(Policy* pol, ArchConfig config, Allocator* activ_alloc,
+        int num_buffers, int rows) {
+    pol->arch = build_arch(config);
+    pol->weights = weights_create(&pol->arch, &pol->params_alloc);
+    pol->buf_acts = (Activations*)calloc(1, num_buffers * sizeof(Activations));
+    pol->buffer_states = (Prec*)calloc(1, num_buffers * sizeof(Prec));
+    for (int i = 0; i < num_buffers; i++) {
+        pol->buf_acts[i] = arch_reg_rollout(&pol->arch, pol->weights, activ_alloc, rows);
+        // Stateless policies leave this shared-API scratch state unused.
+        pol->buffer_states[i] = {
+            .shape = {std::max(config.num_layers, 1), rows, config.hidden_size}};
+        alloc_register(activ_alloc, &pol->buffer_states[i]);
+    }
+}
+
 PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     // Older paired PPO states predate the learner selector. Their saved config
     // remains authoritative; only the newly introduced options need defaults.
@@ -2142,6 +2268,11 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     }
     if (!dict_find(train, "klpo_beta")) {
         dict_set(train, "klpo_beta", 0.1);
+    }
+    if (!dict_find(train, "teacher")) {
+        dict_set_str(train, "teacher", "None");
+        dict_set(train, "teacher_weight", 0);
+        dict_set(train, "teacher_steps", 0);
     }
     const char* learner = dict_get_str(train, "learner");
     const char* returns = dict_get_str(train, "klpo_returns");
@@ -2194,6 +2325,8 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         .ent_coef = puf_ini_get(ini, "train", "ent_coef"),
         .min_ent_coef_ratio = puf_ini_get(ini, "train", "min_ent_coef_ratio"),
         .anneal_ent_coef = puf_ini_get(ini, "train", "anneal_ent_coef") != 0,
+        .teacher_weight = (float)puf_ini_get(ini, "train", "teacher_weight"),
+        .teacher_steps = (long)puf_ini_get(ini, "train", "teacher_steps"),
         .gamma = puf_ini_get(ini, "train", "gamma"),
         .gamma_end = puf_ini_get(ini, "train", "gamma_end"),
         .gamma_episodes = (long)puf_ini_get(ini, "train", "gamma_episodes"),
@@ -2314,6 +2447,8 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         .rewards =     {.shape = {total_agents}},
         .terminals =   {.shape = {total_agents}},
         .action_mask = {.shape = {total_agents, act_n}},
+        .expert_weights = {.shape = {total_agents}},
+        .expert_actions = {.shape = {total_agents, NUM_ATNS}},
     };
     EnvBuf* env = &pufferl->env;
     size_t mask_bytes = total_agents * act_n * sizeof(unsigned char);
@@ -2327,6 +2462,11 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     cudaMemset(env->rewards.data, 0, total_agents * sizeof(float));
     cudaMemset(env->terminals.data, 0, total_agents * sizeof(float));
     cudaMemset(env->action_mask.data, 1, mask_bytes);
+    // GPU envs write no expert rows; all-ones bytes leave every row free.
+    cudaMalloc((void**)&env->expert_weights.data, total_agents * sizeof(float));
+    cudaMalloc((void**)&env->expert_actions.data, total_agents * NUM_ATNS * sizeof(float));
+    cudaMemset(env->expert_weights.data, 0xff, total_agents * sizeof(float));
+    cudaMemset(env->expert_actions.data, 0, total_agents * NUM_ATNS * sizeof(float));
 
     env_setup(pufferl, vec, &vec_kwargs, env_kwargs);
     pufferl->vec = vec;
@@ -2373,32 +2513,42 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         && "num_policies > 1 requires hist_policy_hidden_size and hist_policy_num_layers > 0");
     pufferl->policies = (Policy*)calloc(1, pufferl->num_policies * sizeof(Policy));
 
+    ArchConfig arch_config = {
+        .input_size = input_size, .output_size = decoder_output_size,
+        .value_cols = value_cols(hypers.value_head), .horizon = hypers.horizon,
+        .continuous = is_continuous, .layer_norm = hypers.layer_norm,
+    };
     for (int b = 0; b < pufferl->num_policies; b++) {
         Policy* pol = &pufferl->policies[b];
         pol->frozen = (b > 0);
-        int h = pol->frozen ? hist_hidden : hidden_size;
-        int L = pol->frozen ? hist_layers : num_layers;
+        ArchConfig config = arch_config;
+        config.hidden_size = pol->frozen ? hist_hidden : hidden_size;
+        config.num_layers = pol->frozen ? hist_layers : num_layers;
         int slice = vec->policy_layout[b + 1] - vec->policy_layout[b];
         assert(slice > 0 && "policy has no agents");
+        policy_register(pol, config, pol->frozen ? &pol->activ_alloc : acts,
+            num_buffers, slice);
+    }
 
-        pol->arch = build_arch({
-            .input_size = input_size, .hidden_size = h, .num_layers = L,
-            .output_size = decoder_output_size,
-            .value_cols = value_cols(hypers.value_head), .horizon = hypers.horizon,
-            .continuous = is_continuous, .layer_norm = hypers.layer_norm,
-        });
-        pol->weights = weights_create(&pol->arch, &pol->params_alloc);
-        Allocator* aalloc = pol->frozen ? &pol->activ_alloc : acts;
-        pol->buf_acts = (Activations*)calloc(
-            1, num_buffers * sizeof(Activations));
-        pol->buffer_states = (Prec*)calloc(1, num_buffers * sizeof(Prec));
-        for (int i = 0; i < num_buffers; i++) {
-            pol->buf_acts[i] = arch_reg_rollout(
-                &pol->arch, pol->weights, aalloc, slice);
-            // Stateless policies leave this shared-API scratch state unused.
-            pol->buffer_states[i] = {.shape = {std::max(L, 1), slice, h}};
-            alloc_register(aalloc, &pol->buffer_states[i]);
+    // The teacher shares the frozen opponents' shape, or the learner's without them.
+    const char* teacher_path = puf_ini_get_str(ini, "train", "teacher");
+    pufferl->teaching = strcmp(teacher_path, "None") != 0;
+    if (pufferl->teaching) {
+        if (is_continuous || hypers.klpo || !(hypers.teacher_weight > 0)
+                || hypers.teacher_steps <= 0) {
+            fprintf(stderr, "train.teacher requires discrete PPO, a positive teacher_weight "
+                "and positive teacher_steps\n");
+            exit(1);
         }
+        Policy* teacher = &pufferl->teacher;
+        teacher->frozen = true;
+        ArchConfig config = arch_config;
+        config.hidden_size = hist_hidden > 0 ? hist_hidden : hidden_size;
+        config.num_layers = hist_hidden > 0 ? hist_layers : num_layers;
+        int rows = vec->policy_layout[1];
+        policy_register(teacher, config, &teacher->activ_alloc, num_buffers, rows);
+        pufferl->teacher_scratch = {.shape = {2, rows}};
+        alloc_register(&teacher->activ_alloc, &pufferl->teacher_scratch);
     }
 
     // Train-only extras on policies[0] (trainable).
@@ -2420,8 +2570,8 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         fprintf(stderr, "learner rows must be divisible by minibatch rows\n");
         exit(1);
     }
-    register_rollout_buffers(&pufferl->rollouts,
-        acts, rollout_horizon, total_agents, input_size, num_action_heads, act_n, hypers.klpo);
+    register_rollout_buffers(&pufferl->rollouts, acts, rollout_horizon, total_agents,
+        input_size, num_action_heads, act_n, hypers.klpo, pufferl->teaching);
     // Carry path: per-slot initial RNN states. reset_every_horizon zeros train_state.
     if (!hypers.reset_every_horizon) {
         pufferl->rollouts.initial_states = {
@@ -2429,15 +2579,16 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         alloc_register(acts, &pufferl->rollouts.initial_states);
     }
     register_train_buffers(pufferl->train_buf, acts, minibatch_segments, horizon);
-    register_rollout_buffers(&pufferl->train_rollouts,
-        acts, learner_agents, horizon, input_size, num_action_heads, act_n, hypers.klpo);
+    register_rollout_buffers(&pufferl->train_rollouts, acts, learner_agents, horizon,
+        input_size, num_action_heads, act_n, hypers.klpo, pufferl->teaching);
     register_ppo_buffers(pufferl->ppo_bufs, acts, minibatch_segments,
         hypers.horizon, decoder_output_size, value_cols(hypers.value_head), is_continuous);
     pufferl->train_state = {.shape = {state_layers, learner_agents, hidden_size}};
     alloc_register(acts, &pufferl->train_state);
     if (hypers.prioritized_replay) {
         RegisterReplay(&pufferl->replay, acts, learner_agents, minibatch_segments,
-            horizon, input_size, num_action_heads, act_n, state_layers, hidden_size, hypers.klpo);
+            horizon, input_size, num_action_heads, act_n, state_layers, hidden_size, hypers.klpo,
+            pufferl->teaching);
     }
 
     cudaMalloc((void**)&pufferl->rng_offset, (num_buffers + 1) * sizeof(long));
@@ -2467,6 +2618,15 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
             .shape = {pol->params_alloc.total_bytes / (long)sizeof(precision_t)},
         };
     }
+    if (pufferl->teaching) {
+        Policy* teacher = &pufferl->teacher;
+        alloc_create(&teacher->params_alloc);
+        alloc_create(&teacher->activ_alloc);
+        teacher->param = {
+            .data = (precision_t*)teacher->params_alloc.mem,
+            .shape = {teacher->params_alloc.total_bytes / (long)sizeof(precision_t)},
+        };
+    }
     if (hypers.async) {
         alloc_create(&pufferl->weight_alloc);
     }
@@ -2492,6 +2652,17 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         Policy* pol = &pufferl->policies[b];
         master_weights_setup(&pol->master_weights, &pol->param,
             !pol->frozen, pufferl->default_stream);
+    }
+    if (pufferl->teaching) {
+        Policy* teacher = &pufferl->teacher;
+        master_weights_setup(&teacher->master_weights, &teacher->param,
+            false, pufferl->default_stream);
+        puf_load_weights_into(teacher->master_weights, teacher->param,
+            pufferl->default_stream, teacher_path);
+        for (int i = 0; i < num_buffers; i++) {
+            Prec* state = &teacher->buffer_states[i];
+            cudaMemset(state->data, 0, numel(state->shape) * sizeof(precision_t));
+        }
     }
     if (hypers.async) {
         puf_copy(&pufferl->actor_param, &primary->param, pufferl->default_stream);
@@ -2999,79 +3170,182 @@ typedef struct {
 #define EVAL_SCORE 1
 #define EVAL_MATCH 2
 
-#define SELFPLAY_MAX_HIST 8
 #define SELFPLAY_MAX_LADDER 16
-#define SELFPLAY_PATH_MAX 4096
-// One historical opponent ↔ policies[policy_idx] (env tag == policy_idx).
-typedef struct {
-    int policy_idx;
-    long opp_started_step;
-} SelfplayHist;
+#define LEAGUE_MAX_SLOTS 8
+#define LEAGUE_PATH_MAX 4096
+// Win counts halve over this many learner decisions, so a member that has not
+// played for a while drifts back toward the prior and is drawn again.
+#define LEAGUE_HALF_LIFE 10e6
 
+// One opponent the learner can meet. elo is the member's fixed rating, the
+// learner's estimate when the save joined, or NAN; wins and games are the
+// learner's decayed results against it.
 typedef struct {
-    int num_hist;
+    char path[LEAGUE_PATH_MAX];
+    double elo;
+    double wins;
+    double games;
+} LeagueMember;
+
+// The self-play league. Opponent slot s plays policies[s + 1]. Slot 0 holds
+// the learner's newest save, and the other slots redraw members every
+// redraw_steps by prioritized fictitious self-play. The env may report each
+// slot's matches and wins as slot_<s + 1>_matches and slot_<s + 1>_wins; they
+// credit the member loaded in that slot. Without reports, draws are uniform.
+typedef struct {
+    LeagueMember* members;
+    int size;
     int max_size;
-    long opp_timeout_steps;
+    int num_slots;
+    // slot_member[s] indexes members, or is -1 before the first load.
+    int slot_member[LEAGUE_MAX_SLOTS];
+    long slot_step[LEAGUE_MAX_SLOTS];
+    long redraw_steps;
+    long credit_step;
     unsigned int rng;
-    char (*pool)[SELFPLAY_PATH_MAX];
-    int pool_size;
-    SelfplayHist hist[SELFPLAY_MAX_HIST];
-    // The first rival_slots opponents play another run's newest rival_recent
-    // saves instead of this run's pool; empty rival_dir disables rivals.
-    char rival_dir[SELFPLAY_PATH_MAX];
-    int rival_slots;
-    int rival_recent;
-} Selfplay;
+} League;
 
-void selfplay_add_checkpoint(Selfplay* sp, const char* path) {
-    for (int i = 0; i < sp->pool_size; i++) {
-        if (strcmp(sp->pool[i], path) == 0) return;
-    }
-    if (sp->pool_size == sp->max_size) {
-        memmove(sp->pool, sp->pool + 1, (sp->max_size - 1) * sizeof(*sp->pool));
-        sp->pool_size--;
-    }
-    snprintf(sp->pool[sp->pool_size++], sizeof(sp->pool[0]), "%s", path);
+// Learner win rate against member, starting from one half.
+static double league_win_rate(const LeagueMember* member) {
+    return (member->wins + 0.5) / (member->games + 1);
 }
 
-const char* selfplay_sample(Selfplay* sp) {
-    int idx = (int)(rand_r(&sp->rng) % (unsigned int)sp->pool_size);
-    return sp->pool[idx];
+static bool league_loaded(const League* league, int index) {
+    for (int s = 0; s < league->num_slots; s++) {
+        if (league->slot_member[s] == index) return true;
+    }
+    return false;
+}
+
+// Adds a save unless present and returns its index. A full league first evicts
+// the unloaded member the learner beats most, the oldest among ties.
+static int league_join(League* league, const char* path, double elo) {
+    for (int i = 0; i < league->size; i++) {
+        if (strcmp(league->members[i].path, path) == 0) return i;
+    }
+    if (league->size == league->max_size) {
+        int evict = -1;
+        for (int i = 0; i < league->size; i++) {
+            if (!league_loaded(league, i) && (evict < 0 || league_win_rate(&league->members[i])
+                    > league_win_rate(&league->members[evict]))) {
+                evict = i;
+            }
+        }
+        memmove(league->members + evict, league->members + evict + 1,
+            (league->size - evict - 1) * sizeof(LeagueMember));
+        league->size--;
+        for (int s = 0; s < league->num_slots; s++) {
+            if (league->slot_member[s] > evict) league->slot_member[s]--;
+        }
+    }
+
+    LeagueMember* member = &league->members[league->size];
+    *member = (LeagueMember){.elo = elo};
+    snprintf(member->path, sizeof(member->path), "%s", path);
+    return league->size++;
+}
+
+// Reads "elo path" lines, one fixed-rated member each.
+static void league_read_anchors(League* league, const char* file) {
+    FILE* fp = fopen(file, "r");
+    assert(fp && "selfplay.anchors must name a readable file");
+    double elo;
+    char path[LEAGUE_PATH_MAX];
+    while (fscanf(fp, "%lf %4095s", &elo, path) == 2) {
+        league_join(league, path, elo);
+    }
+    fclose(fp);
+}
+
+// Draws a member with weight (1 - p)^2, where p is the learner's win rate.
+static int league_draw(League* league) {
+    double total = 0;
+    for (int i = 0; i < league->size; i++) {
+        double loss = 1 - league_win_rate(&league->members[i]);
+        total += loss * loss;
+    }
+    double target = total * rand_r(&league->rng) / ((double)RAND_MAX + 1);
+    for (int i = 0; i < league->size - 1; i++) {
+        double loss = 1 - league_win_rate(&league->members[i]);
+        target -= loss * loss;
+        if (target < 0) return i;
+    }
+    return league->size - 1;
+}
+
+// Decays every member's counts to step, then credits each slot's matches
+// since the previous log to the member loaded there.
+static void league_credit(League* league, Dict* log, long step) {
+    double decay = exp2(-(step - league->credit_step) / LEAGUE_HALF_LIFE);
+    league->credit_step = step;
+    for (int i = 0; i < league->size; i++) {
+        league->members[i].wins *= decay;
+        league->members[i].games *= decay;
+    }
+
+    // vec_log reports each count divided by env/n.
+    double n = dict_get(log, "env/n");
+    for (int s = 0; s < league->num_slots; s++) {
+        char key[64];
+        snprintf(key, sizeof(key), "env/slot_%d_matches", s + 1);
+        DictItem* matches = dict_find(log, key);
+        snprintf(key, sizeof(key), "env/slot_%d_wins", s + 1);
+        DictItem* wins = dict_find(log, key);
+        if (!matches || !wins || league->slot_member[s] < 0) continue;
+        LeagueMember* member = &league->members[league->slot_member[s]];
+        member->games += matches->value * n;
+        member->wins += wins->value * n;
+    }
+}
+
+// Learner rating by maximum likelihood against the rated members it has
+// played, each with the win-rate prior; NAN, with error NAN, before any.
+static double league_rating(const League* league, double* error) {
+    const double scale = 400 / log(10.0);
+    double rating = 0, games = 0;
+    for (int i = 0; i < league->size; i++) {
+        const LeagueMember* member = &league->members[i];
+        if (isfinite(member->elo) && member->games > 0) {
+            rating += member->elo * member->games;
+            games += member->games;
+        }
+    }
+    *error = NAN;
+    if (games == 0) return NAN;
+
+    // Newton steps on the log-likelihood in natural log-odds units.
+    rating /= games;
+    double information = 0;
+    for (int iteration = 0; iteration < 50; iteration++) {
+        double gradient = 0;
+        information = 0;
+        for (int i = 0; i < league->size; i++) {
+            const LeagueMember* member = &league->members[i];
+            if (!isfinite(member->elo) || member->games == 0) continue;
+            double expected = 1 / (1 + exp((member->elo - rating) / scale));
+            gradient += member->wins + 0.5 - (member->games + 1) * expected;
+            information += (member->games + 1) * expected * (1 - expected);
+        }
+        double step = scale * gradient / information;
+        rating += fmax(-400.0, fmin(400.0, step));
+        if (fabs(step) < 1e-6) break;
+    }
+    *error = scale / sqrt(information);
+    return rating;
+}
+
+// Loads member into slot and starts fresh matches in the slot's envs.
+static void league_play(League* league, PuffeRL* pufferl, int slot, int index, long step) {
+    league->slot_member[slot] = index;
+    league->slot_step[slot] = step;
+    const LeagueMember* member = &league->members[index];
+    pufferl_load_policy(pufferl, slot + 1, member->path);
+    pufferl_reset_policy_envs(pufferl, slot + 1);
+    printf("league: slot %d plays %s (win rate %.2f over %.0f, elo %.0f)\n", slot + 1,
+        member->path, league_win_rate(member), member->games, member->elo);
 }
 
 #include "checkpoint.cuh"
-
-// Draws one of the rival run's newest saves into path. A save is complete once
-// its .state directory is renamed into place; returns false before the first.
-bool selfplay_sample_rival(Selfplay* sp, char* path, size_t size) {
-    std::vector<long> steps;
-    std::error_code error;
-    for (const auto& entry : std::filesystem::directory_iterator(sp->rival_dir, error)) {
-        const auto& state = entry.path();
-        std::string stem = state.stem().string();
-        if (state.extension() == ".state" && !stem.empty()
-                && stem.find_first_not_of("0123456789") == std::string::npos
-                && std::filesystem::exists(state / "state.ini")) {
-            steps.push_back(std::stol(stem));
-        }
-    }
-    if (error || steps.empty()) return false;
-    std::sort(steps.begin(), steps.end(), std::greater<long>());
-    size_t recent = std::min(steps.size(), (size_t)sp->rival_recent);
-    long step = steps[rand_r(&sp->rng) % recent];
-    snprintf(path, size, "%s/%016ld.state/weights.f32", sp->rival_dir, step);
-    return true;
-}
-
-// Chooses the checkpoint for opponent slot, falling back to this run's pool
-// while the rival has no save. path receives a rival choice.
-const char* selfplay_opponent(Selfplay* sp, int slot, char* path, size_t size) {
-    if (slot < sp->rival_slots && selfplay_sample_rival(sp, path, size)) {
-        printf("selfplay: opponent %d plays rival %s\n", slot + 1, path);
-        return path;
-    }
-    return selfplay_sample(sp);
-}
 
 typedef struct {
     char section[64];
@@ -3548,11 +3822,11 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         puf_ini_put(ini, "vec.hist_policy_percent", "0");
     } else {
         int npol = puf_ini_get(ini, "vec", "num_policies");
-        assert(npol >= 2 && npol <= SELFPLAY_MAX_HIST + 1
-            && "selfplay requires vec.num_policies in 2..SELFPLAY_MAX_HIST+1");
+        assert(npol >= 2 && npol <= LEAGUE_MAX_SLOTS + 1
+            && "selfplay requires vec.num_policies in 2..LEAGUE_MAX_SLOTS+1");
         assert(puf_ini_get(ini, "vec", "hist_policy_percent") > 0
             && "selfplay requires vec.hist_policy_percent > 0");
-        // Pool opps are this run's checkpoints; hist arch must match policy.
+        // League members share the learner's architecture.
         char hb[32], lb[32];
         snprintf(hb, sizeof(hb), "%d",
             (int)puf_ini_get(ini, "policy", "hidden_size"));
@@ -3595,7 +3869,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         }
     }
 
-    Selfplay selfplay = {0};
+    League league = {0};
     if (use_selfplay) {
         char initial_checkpoint[4096];
         snprintf(initial_checkpoint, sizeof(initial_checkpoint),
@@ -3603,46 +3877,34 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         if (!resuming) {
             puf_save_weights(pufferl, initial_checkpoint);
         }
-        selfplay.num_hist = pufferl->num_policies - 1;
-        assert(selfplay.num_hist > 0 && selfplay.num_hist <= SELFPLAY_MAX_HIST
-            && "selfplay requires num_policies in 2..SELFPLAY_MAX_HIST+1");
-        selfplay.max_size = puf_ini_get(ini, "selfplay", "max_size");
-        assert(selfplay.max_size > 0 && "selfplay.max_size must be positive");
-        selfplay.pool = (char (*)[SELFPLAY_PATH_MAX])calloc(
-            selfplay.max_size, sizeof(*selfplay.pool));
-        selfplay.opp_timeout_steps = puf_ini_get(ini, "selfplay", "opp_timeout_steps");
-        selfplay.rng = puf_ini_get(ini, "selfplay", "seed") + pufferl->hypers.rank;
-        const char* rival = puf_ini_get_str(ini, "selfplay", "rival_dir");
-        if (strcmp(rival, "None") != 0) {
-            snprintf(selfplay.rival_dir, sizeof(selfplay.rival_dir), "%s", rival);
+        league.num_slots = pufferl->num_policies - 1;
+        league.max_size = puf_ini_get(ini, "selfplay", "max_size");
+        assert(league.max_size > league.num_slots
+            && "selfplay.max_size must exceed the opponent slots");
+        league.members = (LeagueMember*)calloc(league.max_size, sizeof(LeagueMember));
+        league.redraw_steps = puf_ini_get(ini, "selfplay", "opp_timeout_steps");
+        league.rng = puf_ini_get(ini, "selfplay", "seed") + pufferl->hypers.rank;
+        league.credit_step = pufferl->global_step * pufferl->hypers.world_size;
+        for (int s = 0; s < league.num_slots; s++) {
+            league.slot_member[s] = -1;
         }
-        selfplay.rival_slots = selfplay.rival_dir[0]
-            ? puf_ini_get(ini, "selfplay", "rival_slots") : 0;
-        selfplay.rival_recent = puf_ini_get(ini, "selfplay", "rival_recent");
-        assert(selfplay.rival_slots >= 0 && selfplay.rival_slots <= selfplay.num_hist
-            && selfplay.rival_recent > 0
-            && "selfplay rivals need 0..num_hist slots and rival_recent > 0");
-        long current_step = pufferl->global_step * pufferl->hypers.world_size;
 
+        // The learner's starting weights are its first save; anchors join before it.
         if (!resuming) {
-            const char* opponent = puf_ini_get_str(ini, "selfplay", "initial_opponent_path");
-            selfplay_add_checkpoint(&selfplay,
-                strcmp(opponent, "None") == 0 ? initial_checkpoint : opponent);
-        }
-        for (int s = 0; s < selfplay.num_hist; s++) {
-            SelfplayHist* hist = &selfplay.hist[s];
-            hist->policy_idx = s + 1;
-            if (!resuming) {
-                char rival[SELFPLAY_PATH_MAX];
-                pufferl_load_policy(pufferl, hist->policy_idx,
-                    selfplay_opponent(&selfplay, s, rival, sizeof(rival)));
+            const char* anchors = puf_ini_get_str(ini, "selfplay", "anchors");
+            if (strcmp(anchors, "None") != 0) {
+                league_read_anchors(&league, anchors);
             }
-            hist->opp_started_step = current_step;
+            league_play(&league, pufferl, 0, league_join(&league, initial_checkpoint, NAN),
+                league.credit_step);
+            for (int s = 1; s < league.num_slots; s++) {
+                league_play(&league, pufferl, s, league_draw(&league), league.credit_step);
+            }
         }
     }
 
     if (resuming) {
-        checkpoint::Load(resume, pufferl, &selfplay);
+        checkpoint::Load(resume, pufferl, &league);
     }
     train_stop_requested = 0;
     auto previous_int = ctx->world_size == 1 ? signal(SIGINT, RequestTrainStop) : SIG_DFL;
@@ -3654,7 +3916,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         char initial[4096];
         snprintf(initial, sizeof(initial), "%s/%016ld.bin", checkpoint_dir, pufferl->global_step);
         puf_save_weights(pufferl, initial);
-        checkpoint::Save(initial, ini, pufferl, &selfplay);
+        checkpoint::Save(initial, ini, pufferl, &league);
     }
     long total_timesteps = puf_ini_get(ini, "train", "total_timesteps");
     long batch_size = (long)pufferl->vec->policy_layout[1]
@@ -3741,25 +4003,6 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
                     "%s", saved_checkpoint);
             }
         }
-        if (use_selfplay && saved_checkpoint[0]) {
-            selfplay_add_checkpoint(&selfplay, saved_checkpoint);
-        }
-
-        // Opponent replacement starts fresh matches between rollouts.
-        if (use_selfplay && selfplay.opp_timeout_steps > 0) {
-            long step = pufferl->global_step * pufferl->hypers.world_size;
-            for (int s = 0; s < selfplay.num_hist; s++) {
-                SelfplayHist* hist = &selfplay.hist[s];
-                if (step - hist->opp_started_step >= selfplay.opp_timeout_steps) {
-                    char rival[SELFPLAY_PATH_MAX];
-                    pufferl_load_policy(pufferl, hist->policy_idx,
-                        selfplay_opponent(&selfplay, s, rival, sizeof(rival)));
-                    pufferl_reset_policy_envs(pufferl, hist->policy_idx);
-                    hist->opp_started_step = step;
-                }
-            }
-        }
-
         if (last_log.size && wall_clock()
                 < pufferl->last_log_time + 0.6 && !finished
                 && !saved_checkpoint[0]) {
@@ -3800,8 +4043,33 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         double completed = dict_get(&new_log, "env/n");
         pufferl->completed_episodes += llround(matches ? matches->value * completed : completed);
         dict_set(&new_log, "episodes", pufferl->completed_episodes);
+
+        // League results since the last log belong to the members loaded now,
+        // so credit them before a new save or a redraw changes a slot.
+        if (use_selfplay) {
+            long step = global_step * pufferl->hypers.world_size;
+            league_credit(&league, &new_log, step);
+            double error;
+            double elo = league_rating(&league, &error);
+            if (saved_checkpoint[0]) {
+                league_play(&league, pufferl, 0, league_join(&league, saved_checkpoint, elo), step);
+            }
+            for (int s = 1; s < league.num_slots; s++) {
+                if (league.redraw_steps > 0 && step - league.slot_step[s] >= league.redraw_steps) {
+                    league_play(&league, pufferl, s, league_draw(&league), step);
+                }
+            }
+            dict_set(&new_log, "league/size", league.size);
+            dict_set(&new_log, "league/elo", elo);
+            dict_set(&new_log, "league/elo_se", error);
+            for (int s = 0; s < league.num_slots; s++) {
+                char key[64];
+                snprintf(key, sizeof(key), "league/slot_%d_win_rate", s + 1);
+                dict_set(&new_log, key, league_win_rate(&league.members[league.slot_member[s]]));
+            }
+        }
         if (saved_checkpoint[0] && save_state) {
-            checkpoint::Save(saved_checkpoint, ini, pufferl, &selfplay);
+            checkpoint::Save(saved_checkpoint, ini, pufferl, &league);
         }
 
         float losses_host[NUM_LOSSES];
@@ -3830,11 +4098,6 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         dict_set(&new_log, "perf/train", train_total);
         memset(pufferl->profile.accum, 0, sizeof(pufferl->profile.accum));
 
-        if (use_selfplay) {
-            dict_set(&new_log, "pool/size", selfplay.pool_size);
-            dict_set(&new_log, "pool/num_hist", selfplay.num_hist);
-            dict_set(&new_log, "pool/num_policies", pufferl->num_policies);
-        }
         // n=0 logs omit env/*; keep last complete-episode snapshot.
         int episodes = dict_get(&new_log, "env/n") > 0;
         if (ctx->artifact_owner) {
@@ -4008,18 +4271,18 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         TrainContext eval_ctx = {.world_size = 1, .artifact_owner = 1};
         int n_opp = 0;
         float sum = 0;
-        for (int i = 0; i < selfplay.pool_size && n_opp < max_opp; i++) {
-            if (strcmp(selfplay.pool[i], final_checkpoint) == 0) {
+        for (int i = 0; i < league.size && n_opp < max_opp; i++) {
+            if (strcmp(league.members[i].path, final_checkpoint) == 0) {
                 continue;
             }
-            puf_ini_put(ini, "base.load_enemy_model_path", selfplay.pool[i]);
+            puf_ini_put(ini, "base.load_enemy_model_path", league.members[i].path);
             PuffeRL* ep = eval_make(ini, &eval_ctx, EVAL_MATCH, 0);
             EvalResult r = eval_loop(ini, ep, EVAL_MATCH, 0, 0, pool_games, NULL, 0);
             close_pufferl(ep);
             sum += r.score;
             n_opp++;
             printf("selfplay_eval vs %s games=%d score=%.4f draw=%.4f\n",
-                selfplay.pool[i], r.games, r.score, r.draw);
+                league.members[i].path, r.games, r.score, r.draw);
         }
         if (n_opp) {
             result.score = result.scores[0] = sum / n_opp;
@@ -4063,7 +4326,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         dict_clear(&log_history.items[i]);
     }
     free(log_history.items);
-    free(selfplay.pool);
+    free(league.members);
     puf_ini_free(&eval_ini);
     return result;
 }

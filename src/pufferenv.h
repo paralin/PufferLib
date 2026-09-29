@@ -27,6 +27,12 @@ typedef struct Agent {
     float* rewards;
     float* terminals;
     unsigned char* action_mask;
+    // An expert row, written with the observation. When expert_weight is
+    // finite, the trainer executes expert_actions in place of its sample and
+    // trains the learner to imitate them with that weight; weight 0 only
+    // advances the recurrent state. NaN marks a free row.
+    float* expert_weight;
+    float* expert_actions;
     int policy;
 } Agent;
 

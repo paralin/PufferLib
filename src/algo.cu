@@ -1981,6 +1981,8 @@ struct TrainGraph {
     Prec mb_values;      // view: frozen rollout V (vf-clip)
     Prec mb_returns;     // view: aliases mb_gae_v after GAE (V+A)
     Prec mb_action_mask; // view (B, T, mask_size)
+    Prec mb_expert;      // view (B, T) imitation weight; NaN for free rows
+    Float mb_teacher;    // view (B, T, num_atns) teacher's action; null without a teacher
     Prec mb_imp;         // scratch
     Prec mb_gae_v;       // scratch: live V in, overwritten with returns
 };
@@ -2066,8 +2068,8 @@ __device__ __forceinline__ float value_estimate(const precision_t* __restrict__ 
 enum LossIdx {
     LOSS_PG = 0, LOSS_VF = 1, LOSS_ENT = 2, LOSS_TOTAL = 3,
     LOSS_OLD_APPROX_KL = 4, LOSS_APPROX_KL = 5, LOSS_CLIPFRAC = 6,
-    LOSS_IMP = 7,
-    LOSS_N = 8, NUM_LOSSES = 9,
+    LOSS_IMP = 7, LOSS_IMITATION = 8, LOSS_TEACHER = 9, LOSS_EXPERT = 10,
+    LOSS_N = 11, NUM_LOSSES = 12,
 };
 
 constexpr int PPO_THREADS = 256;
@@ -2103,6 +2105,8 @@ struct PPOGraphArgs {
     const precision_t* values;
     const precision_t* returns;
     const float* importance;
+    const precision_t* expert;
+    const float* teacher;
 };
 
 struct PPOKernelArgs {
@@ -2118,6 +2122,7 @@ struct PPOKernelArgs {
     int num_atns;
     float clip_coef, vf_clip_coef, vf_coef;
     const float* ent_coef;  // device ptr — host by-value bakes into CUDA graphs
+    const float* teacher_coef;
     int T_seq, A_total, N;
     ValueHead value_head;
     bool is_continuous;
@@ -2128,6 +2133,7 @@ struct PPOBufs {
     Float new_logprobs;  // (N, T) written by cache_imp_and_v
     Float ppo_partials;
     float* ent_coef;     // device scalar (graphs cannot bake host by-value)
+    float* teacher_coef; // device scalar
 };
 
 void register_ppo_buffers(PPOBufs& bufs, Allocator* alloc, int N, int T, int A_total,
@@ -2141,6 +2147,7 @@ void register_ppo_buffers(PPOBufs& bufs, Allocator* alloc, int N, int T, int A_t
         .new_logprobs = {.shape = {N, T}},
         .ppo_partials = {.shape = {ppo_grid * LOSS_N}},
         .ent_coef = NULL,
+        .teacher_coef = NULL,
     };
     alloc_register(alloc, &bufs.grad_logits);
     alloc_register(alloc, &bufs.grad_values);
@@ -2150,6 +2157,8 @@ void register_ppo_buffers(PPOBufs& bufs, Allocator* alloc, int N, int T, int A_t
     }
     alloc_register(alloc, &bufs.ppo_partials);
     cudaMalloc((void**)&bufs.ent_coef, sizeof(float));
+    cudaMalloc((void**)&bufs.teacher_coef, sizeof(float));
+    cudaMemset(bufs.teacher_coef, 0, sizeof(float));
 }
 
 // Discrete only. mask is always present (env mask or synthetic all-ones).
@@ -2204,6 +2213,7 @@ __global__ void cache_imp_and_v(
         const float* __restrict__ actions,
         const precision_t* __restrict__ old_logprobs,
         const precision_t* __restrict__ action_mask,
+        const precision_t* __restrict__ expert,
         Prec logstd,
         const int* __restrict__ act_sizes,
         precision_t* __restrict__ imp_out,
@@ -2272,7 +2282,8 @@ __global__ void cache_imp_and_v(
 #endif
     }
     new_lp_out[idx] = new_lp;
-    imp_out[idx] = from_float(__expf(new_lp - to_float(old_logprobs[idx])));
+    imp_out[idx] = from_float(isnan(to_float(expert[idx]))
+        ? __expf(new_lp - to_float(old_logprobs[idx])) : 1.0f);
 }
 
 Prec arch_forward_train(Arch* p, Weights& w,
@@ -2290,7 +2301,7 @@ Prec arch_forward_train(Arch* p, Weights& w,
     Prec dec = *puf_unsqueeze(&dec_out, 0, B, TT);
     cache_imp_and_v<<<grid_size(B * TT), BLOCK_SIZE, 0, stream>>>(
         dec, g.mb_actions.data, g.mb_logprobs.data, g.mb_action_mask.data,
-        logstd, act_sizes, g.mb_imp.data, g.mb_gae_v.data, logps, new_lp, value_head);
+        g.mb_expert.data, logstd, act_sizes, g.mb_imp.data, g.mb_gae_v.data, logps, new_lp, value_head);
     return dec;
 }
 
@@ -2346,24 +2357,29 @@ __global__ void ppo_loss_compute(
         int logits_base = nt * (a.A_total + vc);
         int at_base = nt * a.A_total;  // logits-grad + mask base (A_total cols)
 
+        // An expert row trains only the imitation term: its action came from
+        // the expert, so it carries no policy-gradient, value or entropy term.
+        float expert_weight = to_float(g.expert[nt]);
+        bool expert = !isnan(expert_weight);
+        float free = expert ? 0.0f : 1.0f;
         float adv_for_pg = to_float(g.advantages[nt]);
         float ret = to_float(g.returns[nt]);
         float ent_coef = *a.ent_coef;
-        float d_entropy_term = inv_NT * (-ent_coef);
-        float logratio = a.new_logprobs[nt] - to_float(g.old_logprobs[nt]);
+        float d_entropy_term = inv_NT * (-ent_coef) * free;
+        float logratio = expert ? 0.0f : a.new_logprobs[nt] - to_float(g.old_logprobs[nt]);
         float ratio = __expf(logratio);
 
-        float v_loss = a.value_head.bins > 0
+        float v_loss = free * (a.value_head.bins > 0
             ? value_hl_gauss_loss(a.values_pred + logits_base, a.value_head, ret,
-                inv_NT * a.vf_coef, a.grad_values_pred + nt * vc)
+                free * inv_NT * a.vf_coef, a.grad_values_pred + nt * vc)
             : value_clipped_loss(to_float(a.values_pred[logits_base]),
                 to_float(g.values[nt]), ret, a.vf_clip_coef,
-                inv_NT * a.vf_coef, a.grad_values_pred + nt);
+                free * inv_NT * a.vf_coef, a.grad_values_pred + nt));
         float clip_lo = 1.0f - a.clip_coef;
         float clip_hi = 1.0f + a.clip_coef;
         float ratio_clipped = fmaxf(clip_lo, fminf(clip_hi, ratio));
         float weight = g.importance ? g.importance[nt / a.T_seq] : 1.0f;
-        float wa = -weight * adv_for_pg;
+        float wa = -weight * adv_for_pg * free;
         float pg_loss1 = wa * ratio;
         float pg_loss2 = wa * ratio_clipped;
         float pg_loss = fmaxf(pg_loss1, pg_loss2);
@@ -2371,7 +2387,15 @@ __global__ void ppo_loss_compute(
         if (pg_loss2 > pg_loss1 && (ratio <= clip_lo || ratio >= clip_hi)) {
             d_ratio = 0.0f;
         }
-        float d_new_logp = d_ratio * ratio;
+        float imitation = expert ? -expert_weight * a.new_logprobs[nt] : 0.0f;
+        float d_new_logp = expert ? -expert_weight * weight * inv_NT : d_ratio * ratio;
+
+        // Free rows also imitate the teacher's sampled action, an unbiased
+        // estimate of the cross-entropy to its distribution.
+        const float* teacher = g.teacher && !expert ? g.teacher + nt * a.num_atns : NULL;
+        float teacher_coef = teacher ? *a.teacher_coef : 0.0f;
+        float d_teacher = -teacher_coef * weight * inv_NT;
+        float teacher_nll = 0.0f;
         float total_entropy = 0.0f;
 
         if (a.is_continuous) {
@@ -2392,8 +2416,11 @@ __global__ void ppo_loss_compute(
             }
         } else {
 #ifdef PUF_CONDITIONAL_GROUPS
+            if (teacher) {
+                teacher_nll = -ConditionalScore(a.grad_logits + at_base, teacher);
+            }
             total_entropy = ConditionalGradient(a.grad_logits + at_base,
-                g.actions + nt * a.num_atns, d_new_logp, d_entropy_term);
+                g.actions + nt * a.num_atns, d_new_logp, teacher, d_teacher, d_entropy_term);
 #else
 #ifdef PUFFER_NETHACK
             int verb = (int)g.actions[nt * a.num_atns];
@@ -2412,6 +2439,10 @@ __global__ void ppo_loss_compute(
                 }
 #endif
                 int act = (int)g.actions[nt * a.num_atns + h];
+                int teacher_act = teacher ? (int)teacher[h] : -1;
+                if (teacher) {
+                    teacher_nll -= a.grad_logits[at_base + logits_offset + teacher_act];
+                }
                 float ent = 0.0f;
                 for (int j = 0; j < A; ++j) {
                     float logp = a.grad_logits[at_base + logits_offset + j];
@@ -2435,6 +2466,7 @@ __global__ void ppo_loss_compute(
                     float p = __expf(logp);
                     a.grad_logits[at_base + logits_offset + j] =
                         ((j == act ? 1.0f : 0.0f) - p) * d_logp
+                        + ((j == teacher_act ? 1.0f : 0.0f) - p) * d_teacher
                         + d_entropy_term * p * (-ent - logp);
                 }
                 logits_offset += A;
@@ -2442,8 +2474,8 @@ __global__ void ppo_loss_compute(
 #endif
         }
 
-        float thread_loss = (pg_loss + a.vf_coef * v_loss
-            - ent_coef * total_entropy) * inv_NT;
+        float thread_loss = (pg_loss + a.vf_coef * v_loss - free * ent_coef * total_entropy
+            + weight * (imitation + teacher_coef * teacher_nll)) * inv_NT;
 
         block_losses[LOSS_PG][tid] = pg_loss * inv_NT;
         block_losses[LOSS_VF][tid] = v_loss * inv_NT;
@@ -2454,6 +2486,9 @@ __global__ void ppo_loss_compute(
         block_losses[LOSS_CLIPFRAC][tid] =
             (fabsf(ratio - 1.0f) > a.clip_coef ? 1.0f : 0.0f) * inv_NT;
         block_losses[LOSS_IMP][tid] = ratio * inv_NT;
+        block_losses[LOSS_IMITATION][tid] = imitation * inv_NT;
+        block_losses[LOSS_TEACHER][tid] = teacher_nll * inv_NT;
+        block_losses[LOSS_EXPERT][tid] = (1.0f - free) * inv_NT;
     }
 
     block_reduce_sum(&block_losses[0][0], &ppo_partials[blockIdx.x * LOSS_N],
@@ -2482,7 +2517,7 @@ void ppo_loss_fwd_bwd(
         TrainGraph& graph,
         int* act_sizes, float* losses_acc,
         float clip_coef, float vf_clip_coef, float vf_coef, const float* ent_coef,
-        PPOBufs& bufs, ValueHead value_head, bool is_continuous,
+        const float* teacher_coef, PPOBufs& bufs, ValueHead value_head, bool is_continuous,
         cudaStream_t stream) {
     int N = dec_out.shape[0], T = dec_out.shape[1], fused_cols = dec_out.shape[2];
     int A_total = fused_cols - value_cols(value_head);  // value columns follow the logits
@@ -2497,6 +2532,8 @@ void ppo_loss_fwd_bwd(
         .values = graph.mb_values.data,
         .returns = graph.mb_returns.data,
         .importance = graph.mb_importance,
+        .expert = graph.mb_expert.data,
+        .teacher = graph.mb_teacher.data,
     };
 
     PPOKernelArgs args = {
@@ -2513,6 +2550,7 @@ void ppo_loss_fwd_bwd(
         .clip_coef = clip_coef, .vf_clip_coef = vf_clip_coef,
         .vf_coef = vf_coef,
         .ent_coef = ent_coef,
+        .teacher_coef = teacher_coef,
         .T_seq = T, .A_total = A_total, .N = N,
         .value_head = value_head,
         .is_continuous = is_continuous,

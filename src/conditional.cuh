@@ -46,10 +46,27 @@ __device__ void ConditionalTable(const precision_t* logits, float* logps, int n)
     }
 }
 
+// ConditionalScore returns the log probability of a factor chain from cached tables.
+__device__ float ConditionalScore(const float* logps, const float* actions) {
+    float result = 0;
+    int offset = 0;
+    for (int group = 0; group < kConditionalGroupCount; ++group) {
+        int size = ConditionalGroupSize(group);
+        int final_base = offset + size;
+        int time_base = final_base + size * size;
+        int initial = (int)actions[3 * group];
+        int final = (int)actions[3 * group + 1];
+        int time = (int)actions[3 * group + 2];
+        result += logps[offset + initial] + logps[final_base + initial * size + final]
+            + logps[time_base + (initial * size + final) * kConditionalTimes + time];
+        offset = time_base + size * size * kConditionalTimes;
+    }
+    return result;
+}
+
 // ConditionalLogProb caches every table and scores the sampled factor chain.
 __device__ float ConditionalLogProb(const precision_t* logits,
         const float* actions, float* logps) {
-    float result = 0;
     int offset = 0;
     for (int group = 0; group < kConditionalGroupCount; ++group) {
         int size = ConditionalGroupSize(group);
@@ -64,14 +81,9 @@ __device__ float ConditionalLogProb(const precision_t* logits,
                 ConditionalTable(logits + row, logps + row, kConditionalTimes);
             }
         }
-        int initial = (int)actions[3 * group];
-        int final = (int)actions[3 * group + 1];
-        int time = (int)actions[3 * group + 2];
-        result += logps[offset + initial] + logps[final_base + initial * size + final]
-            + logps[time_base + (initial * size + final) * kConditionalTimes + time];
         offset = time_base + size * size * kConditionalTimes;
     }
-    return result;
+    return ConditionalScore(logps, actions);
 }
 
 // ConditionalDraw samples one table and accumulates its selected log mass.
@@ -125,10 +137,18 @@ __device__ float ConditionalEntropy(const float* logps, int size) {
     return result;
 }
 
+// ChainGradient is d times the derivative of one chain's log probability with
+// respect to a table logit. Tables off the chain's path contribute nothing.
+__device__ float ChainGradient(bool on_path, bool selected, float probability, float d) {
+    return on_path ? d * ((selected ? 1.0f : 0.0f) - probability) : 0.0f;
+}
+
 // ConditionalGradient replaces cached log probabilities with exact chain-rule
-// gradients. Entropy includes every conditional table, weighted by its prefix.
-__device__ float ConditionalGradient(float* logps, const float* actions,
-        float d_logp, float d_entropy) {
+// gradients of d_logp times the log probability of actions, plus d_teacher
+// times that of teacher when teacher is set. Entropy includes every
+// conditional table, weighted by its prefix.
+__device__ float ConditionalGradient(float* logps, const float* actions, float d_logp,
+        const float* teacher, float d_teacher, float d_entropy) {
     float total_entropy = 0;
     int offset = 0;
     for (int group = 0; group < kConditionalGroupCount; ++group) {
@@ -136,6 +156,9 @@ __device__ float ConditionalGradient(float* logps, const float* actions,
         int selected_initial = (int)actions[3 * group];
         int selected_final = (int)actions[3 * group + 1];
         int selected_time = (int)actions[3 * group + 2];
+        int teacher_initial = teacher ? (int)teacher[3 * group] : -1;
+        int teacher_final = teacher ? (int)teacher[3 * group + 1] : -1;
+        int teacher_time = teacher ? (int)teacher[3 * group + 2] : -1;
         int final_base = offset + size;
         int time_base = final_base + size * size;
         float initial_entropy = ConditionalEntropy(logps + offset, size);
@@ -157,8 +180,10 @@ __device__ float ConditionalGradient(float* logps, const float* actions,
                 for (int time = 0; time < kConditionalTimes; ++time) {
                     float lp = logps[time_row + time];
                     float probability = expf(lp);
-                    float pg = initial == selected_initial && final == selected_final
-                        ? d_logp * ((time == selected_time ? 1.0f : 0.0f) - probability) : 0;
+                    float pg = ChainGradient(initial == selected_initial
+                            && final == selected_final, time == selected_time, probability, d_logp)
+                        + ChainGradient(initial == teacher_initial && final == teacher_final,
+                            time == teacher_time, probability, d_teacher);
                     logps[time_row + time] = pg
                         + d_entropy * prefix * probability * (-time_entropy - lp);
                 }
@@ -168,8 +193,10 @@ __device__ float ConditionalGradient(float* logps, const float* actions,
             for (int final = 0; final < size; ++final) {
                 float lp = logps[final_row + final];
                 float probability = expf(lp);
-                float pg = initial == selected_initial
-                    ? d_logp * ((final == selected_final ? 1.0f : 0.0f) - probability) : 0;
+                float pg = ChainGradient(initial == selected_initial,
+                        final == selected_final, probability, d_logp)
+                    + ChainGradient(initial == teacher_initial,
+                        final == teacher_final, probability, d_teacher);
                 logps[final_row + final] = pg + d_entropy * initial_probability * probability
                     * (-final_entropy - lp + time_entropies[final] - expected_time_entropy);
             }
@@ -178,8 +205,9 @@ __device__ float ConditionalGradient(float* logps, const float* actions,
         for (int initial = 0; initial < size; ++initial) {
             float lp = logps[offset + initial];
             float probability = expf(lp);
-            logps[offset + initial] = d_logp
-                * ((initial == selected_initial ? 1.0f : 0.0f) - probability)
+            logps[offset + initial] =
+                ChainGradient(true, initial == selected_initial, probability, d_logp)
+                + ChainGradient(true, initial == teacher_initial, probability, d_teacher)
                 + d_entropy * probability * (-initial_entropy - lp
                     + downstream[initial] - expected_downstream);
         }

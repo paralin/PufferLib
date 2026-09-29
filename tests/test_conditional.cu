@@ -15,7 +15,13 @@ __device__ float to_float(float value) { return value; }
 constexpr int kCases = 8;
 constexpr int kWidth = ConditionalWidth();
 constexpr float kPolicyDerivative = 0.7f;
+constexpr float kTeacherDerivative = -0.4f;
 constexpr float kEntropyDerivative = -0.03f;
+
+// Teacher returns the chain each row imitates: the next row's actions.
+__host__ __device__ const float* Teacher(const float* actions, int row) {
+    return actions + (row + 1) % kCases * NUM_ATNS;
+}
 
 __global__ void Evaluate(const float* logits, const float* actions,
         float* gradients, float* scores) {
@@ -24,10 +30,11 @@ __global__ void Evaluate(const float* logits, const float* actions,
         return;
     }
     float* gradient = gradients + row * kWidth;
-    scores[2 * row] = ConditionalLogProb(logits + row * kWidth,
+    scores[3 * row] = ConditionalLogProb(logits + row * kWidth,
         actions + row * NUM_ATNS, gradient);
-    scores[2 * row + 1] = ConditionalGradient(gradient, actions + row * NUM_ATNS,
-        kPolicyDerivative, kEntropyDerivative);
+    scores[3 * row + 1] = ConditionalScore(gradient, Teacher(actions, row));
+    scores[3 * row + 2] = ConditionalGradient(gradient, actions + row * NUM_ATNS,
+        kPolicyDerivative, Teacher(actions, row), kTeacherDerivative, kEntropyDerivative);
 }
 
 std::vector<double> Probabilities(const std::vector<double>& logits, int offset, int count) {
@@ -45,8 +52,10 @@ std::vector<double> Probabilities(const std::vector<double>& logits, int offset,
 
 // Enumerate the joint distribution independently of the device's chain-rule gradient.
 double Reference(const std::vector<double>& logits, const float* actions,
-        double* log_probability, double* entropy) {
+        const float* teacher, double* log_probability, double* teacher_log_probability,
+        double* entropy) {
     *log_probability = 0;
+    *teacher_log_probability = 0;
     *entropy = 0;
     int offset = 0;
     for (int group = 0; group < kConditionalGroupCount; ++group) {
@@ -67,12 +76,17 @@ double Reference(const std::vector<double>& logits, const float* actions,
                             && time == actions[3 * group + 2]) {
                         *log_probability += std::log(mass);
                     }
+                    if (initial == teacher[3 * group] && final == teacher[3 * group + 1]
+                            && time == teacher[3 * group + 2]) {
+                        *teacher_log_probability += std::log(mass);
+                    }
                 }
             }
         }
         offset = time_base + size * size * kConditionalTimes;
     }
-    return kPolicyDerivative * *log_probability + kEntropyDerivative * *entropy;
+    return kPolicyDerivative * *log_probability
+        + kTeacherDerivative * *teacher_log_probability + kEntropyDerivative * *entropy;
 }
 
 void Check(cudaError_t status) {
@@ -87,7 +101,7 @@ int main() {
     Check(cudaMallocManaged(&logits, kCases * kWidth * sizeof(float)));
     Check(cudaMallocManaged(&actions, kCases * NUM_ATNS * sizeof(float)));
     Check(cudaMallocManaged(&gradients, kCases * kWidth * sizeof(float)));
-    Check(cudaMallocManaged(&scores, kCases * 2 * sizeof(float)));
+    Check(cudaMallocManaged(&scores, kCases * 3 * sizeof(float)));
     for (int row = 0; row < kCases; ++row) {
         for (int col = 0; col < kWidth; ++col) {
             logits[row * kWidth + col] = row == 0 ? 0 :
@@ -106,16 +120,18 @@ int main() {
     for (int row = 0; row < kCases; ++row) {
         std::vector<double> input(logits + row * kWidth, logits + (row + 1) * kWidth);
         const float* action = actions + row * NUM_ATNS;
-        double logp, entropy;
-        Reference(input, action, &logp, &entropy);
-        score_error = std::fmax(score_error, std::fabs(logp - scores[2 * row]));
-        score_error = std::fmax(score_error, std::fabs(entropy - scores[2 * row + 1]));
+        const float* teacher = Teacher(actions, row);
+        double logp, teacher_logp, entropy;
+        Reference(input, action, teacher, &logp, &teacher_logp, &entropy);
+        score_error = std::fmax(score_error, std::fabs(logp - scores[3 * row]));
+        score_error = std::fmax(score_error, std::fabs(teacher_logp - scores[3 * row + 1]));
+        score_error = std::fmax(score_error, std::fabs(entropy - scores[3 * row + 2]));
         for (int col = 0; col < kWidth; ++col) {
             constexpr double epsilon = 1e-4;
             input[col] += epsilon;
-            double plus = Reference(input, action, &logp, &entropy);
+            double plus = Reference(input, action, teacher, &logp, &teacher_logp, &entropy);
             input[col] -= 2 * epsilon;
-            double minus = Reference(input, action, &logp, &entropy);
+            double minus = Reference(input, action, teacher, &logp, &teacher_logp, &entropy);
             input[col] += epsilon;
             double expected = (plus - minus) / (2 * epsilon);
             gradient_error = std::fmax(gradient_error,
