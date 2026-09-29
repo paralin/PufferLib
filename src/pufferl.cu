@@ -2179,6 +2179,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
             .snoo_lr = (float)puf_ini_get(ini, "train", "snoo_lr"),
             .snoo_momentum = (float)puf_ini_get(ini, "train", "snoo_momentum"),
             .tail_steps = (int)puf_ini_get(ini, "train", "tail_steps"),
+            .soap = puf_ini_get(ini, "train", "soap") != 0,
         },
         .minibatch_size = puf_ini_get(ini, "train", "minibatch_size"),
         .replay_ratio = puf_ini_get(ini, "train", "replay_ratio"),

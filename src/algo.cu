@@ -1502,6 +1502,45 @@ __global__ void cautious_decay_update(float* __restrict__ w,
     }
 }
 
+// SOAP-Muon. Before Muon whitens a matrix update U, precondition it the way SOAP
+// does: rotate into the eigenbasis of the row and column covariances of U, scale
+// each rotated entry by its running second moment, and rotate back. The bases
+// follow the covariances by one orthogonal-iteration step per optimizer step, the
+// polar factor of covariance times basis from Newton-Schulz.
+constexpr float kSoapCovarianceBeta = 0.95f;
+constexpr float kSoapMomentBeta = 0.95f;
+constexpr float kSoapEpsilon = 1e-8f;
+constexpr int kSoapPolarSteps = 12;
+
+__global__ void soap_identity(precision_t* __restrict__ q, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n * n) {
+        q[idx] = from_float(idx / n == idx % n ? 1.0f : 0.0f);
+    }
+}
+
+// x = 1.5 x - 0.5 t: one Newton-Schulz step toward the polar factor.
+__global__ void soap_polar_step(precision_t* __restrict__ x,
+        const precision_t* __restrict__ t, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        x[idx] = from_float(1.5f * to_float(x[idx]) - 0.5f * to_float(t[idx]));
+    }
+}
+
+// u /= sqrt(v) after v tracks the second moment of u, with Adam's bias correction.
+__global__ void soap_scale(precision_t* __restrict__ u, precision_t* __restrict__ v,
+        const long* __restrict__ step, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float x = to_float(u[idx]);
+        float moment = kSoapMomentBeta * to_float(v[idx]) + (1.0f - kSoapMomentBeta) * x * x;
+        v[idx] = from_float(moment);
+        float correction = 1.0f - powf(kSoapMomentBeta, (float)(*step + 1));
+        u[idx] = from_float(x / (sqrtf(moment / correction) + kSoapEpsilon));
+    }
+}
+
 // Snoo (Sparse Nesterov Outer Optimizer). Every interval steps the weights walk
 // back to the last outer weights and Nesterov SGD moves those along the
 // displacement the inner steps made.
@@ -1572,6 +1611,7 @@ struct MuonOptions {
     float snoo_lr;
     float snoo_momentum;
     int tail_steps;      // horizon of the tail EMA that saves blend in
+    bool soap;           // eigenbasis second-moment preconditioning ahead of Muon
 };
 
 // Fraction of the way a save moves from the last iterate to the tail EMA.
@@ -1599,6 +1639,8 @@ struct Muon {
     Float outer;           // Snoo outer weights (param-sized when enabled)
     Float outer_velocity;  // Snoo outer momentum
     Float tail;            // tail EMA of the weights
+    Prec soap;             // per matrix: row and column covariance and basis, second moment
+    Prec soap_a, soap_b, soap_c, soap_d;  // SOAP scratch
     Prec gram, gram_buf, x_buf;
     Allocator* param_alloc;
 };
@@ -1623,7 +1665,7 @@ void muon_init(Muon* m, Allocator* param_alloc, const MuonOptions& options,
     alloc_register(alloc, &m->mb);
     m->slow = {.shape = {params}};
     alloc_register(alloc, &m->slow);
-    long max_M = 0, max_N = 0, lanes = 0, matrices = 0;
+    long max_M = 0, max_N = 0, lanes = 0, matrices = 0, soap_total = 0;
     for (int _i = 0; _i < param_alloc->num_regs; _i++) {
         AllocEntry& e = param_alloc->regs[_i];
         if (ndim(e.shape) >= 2) {
@@ -1631,6 +1673,7 @@ void muon_init(Muon* m, Allocator* param_alloc, const MuonOptions& options,
             max_M = max(max_M, min(R, C));
             max_N = max(max_N, max(R, C));
             lanes += max(R, C);
+            soap_total += 2 * R * R + 2 * C * C + R * C;
             ++matrices;
         }
     }
@@ -1648,6 +1691,15 @@ void muon_init(Muon* m, Allocator* param_alloc, const MuonOptions& options,
     alloc_register(alloc, &m->outer_velocity);
     m->tail = {.shape = {options.tail_steps > 0 ? params : 1}};
     alloc_register(alloc, &m->tail);
+    long soap_n = options.soap ? 1 : 0;
+    m->soap = {.shape = {options.soap ? soap_total : 1}};
+    m->soap_a = {.shape = {soap_n ? max_N : 1, soap_n ? max_N : 1}};
+    m->soap_b = m->soap_a;
+    m->soap_c = m->soap_a;
+    m->soap_d = {.shape = {soap_n ? max_M : 1, soap_n ? max_N : 1}};
+    for (Prec* buffer : {&m->soap, &m->soap_a, &m->soap_b, &m->soap_c, &m->soap_d}) {
+        alloc_register(alloc, buffer);
+    }
     m->gram =     {.shape = {max_M, max_M}};
     m->gram_buf = {.shape = {max_M, max_M}};
     m->x_buf =    {.shape = {max_M, max_N}};
@@ -1663,6 +1715,21 @@ void muon_reset(Muon* m, float lr) {
     cudaMemset(m->step, 0, sizeof(long));
     for (Float* state : {&m->mb, &m->slow, &m->lane_energy, &m->outer_velocity}) {
         cudaMemset(state->data, 0, numel(state->shape) * sizeof(float));
+    }
+    if (m->options.soap) {
+        cudaMemset(m->soap.data, 0, numel(m->soap.shape) * sizeof(precision_t));
+        long offset = 0;
+        for (int _i = 0; _i < m->param_alloc->num_regs; _i++) {
+            AllocEntry& e = m->param_alloc->regs[_i];
+            if (ndim(e.shape) < 2) {
+                continue;
+            }
+            long R = e.shape[0], C = numel(e.shape) / R;
+            precision_t* rows = m->soap.data + offset + R * R + C * C;
+            soap_identity<<<grid_size(R * R), BLOCK_SIZE>>>(rows, (int)R);
+            soap_identity<<<grid_size(C * C), BLOCK_SIZE>>>(rows + R * R, (int)C);
+            offset += 2 * R * R + 2 * C * C + R * C;
+        }
     }
 }
 
@@ -1699,6 +1766,54 @@ void muon_ship_weights(Muon* m, Float weights, float* out) {
     }
 }
 
+// Replaces the R x C update u with its SOAP-preconditioned form. The state of
+// this matrix starts at soap_offset of m->soap.
+static void soap_precondition(Muon* m, Prec& u, long R, long C, long soap_offset,
+        cudaStream_t stream) {
+    precision_t* base = m->soap.data + soap_offset;
+    Prec rows = {.data = base, .shape = {R, R}};
+    Prec cols = {.data = base + R * R, .shape = {C, C}};
+    Prec rows_basis = {.data = base + R * R + C * C, .shape = {R, R}};
+    Prec cols_basis = {.data = base + 2 * R * R + C * C, .shape = {C, C}};
+    Prec moment = {.data = base + 2 * R * R + 2 * C * C, .shape = {R, C}};
+    puf_mm(&u, &u, &rows, stream, 1.0f - kSoapCovarianceBeta, kSoapCovarianceBeta);
+    puf_mm_tn(&u, &u, &cols, stream, 1.0f - kSoapCovarianceBeta, kSoapCovarianceBeta);
+
+    // One orthogonal-iteration step per basis: the polar factor of covariance times basis.
+    auto follow = [&](Prec* covariance, Prec* basis, long n) {
+        Prec x = {.data = m->soap_a.data, .shape = {n, n}};
+        Prec gram = {.data = m->soap_b.data, .shape = {n, n}};
+        Prec product = {.data = m->soap_c.data, .shape = {n, n}};
+        int count = (int)(n * n);
+        puf_mm_nn(covariance, basis, &x, stream);
+        int blocks = min((int)grid_size(count), 256);
+        muon_sum_sq_partials<<<blocks, 256, 0, stream>>>(m->norm_partials, x.data, count);
+        muon_sum_sq_reduce<<<1, 256, 0, stream>>>(m->ns_norm, m->norm_partials, blocks);
+        muon_l2_normalize<<<grid_size(count), BLOCK_SIZE, 0, stream>>>(
+            x.data, m->ns_norm, 1.0f, 1e-7f, count);
+        for (int i = 0; i < kSoapPolarSteps; ++i) {
+            puf_mm_tn(&x, &x, &gram, stream);
+            puf_mm_nn(&x, &gram, &product, stream);
+            soap_polar_step<<<grid_size(count), BLOCK_SIZE, 0, stream>>>(
+                x.data, product.data, count);
+        }
+        puf_copy(basis, &x, stream);
+    };
+    follow(&rows, &rows_basis, R);
+    follow(&cols, &cols_basis, C);
+
+    // Rotate in, scale by the second moment, rotate back.
+    Prec rotated = {.data = m->soap_d.data, .shape = {R, C}};
+    Prec mixed = {.data = m->soap_c.data, .shape = {R, C}};
+    puf_mm_tn(&rows_basis, &u, &mixed, stream);
+    puf_mm_nn(&mixed, &cols_basis, &rotated, stream);
+    int count = (int)(R * C);
+    soap_scale<<<grid_size(count), BLOCK_SIZE, 0, stream>>>(
+        rotated.data, moment.data, m->step, count);
+    puf_mm(&rotated, &cols_basis, &mixed, stream);
+    puf_mm_nn(&rows_basis, &mixed, &u, stream);
+}
+
 void muon_step(Muon* m, Float weights, Prec grads,
         float max_grad_norm, cudaStream_t stream = 0) {
     const MuonOptions& o = m->options;
@@ -1725,6 +1840,7 @@ void muon_step(Muon* m, Float weights, Prec grads,
     int num_maps = o.anvil ? 6 : 5;
     float margin = o.anvil ? anvil_margin : 1.0f;
     long lane_offset = 0;
+    long soap_offset = 0;
     long matrix = 0;
 
     // Per-param NS into workspace; write scaled update back into flat grads.
@@ -1751,6 +1867,11 @@ void muon_step(Muon* m, Float weights, Prec grads,
         Prec x_buf = {.data = m->x_buf.data, .shape = {R, C}};
         Prec gram = {.data = m->gram.data, .shape = {M, M}};
         Prec gram_buf = {.data = m->gram_buf.data, .shape = {M, M}};
+
+        if (o.soap) {
+            soap_precondition(m, x, R, C, soap_offset, stream);
+            soap_offset += 2 * R * R + 2 * C * C + R * C;
+        }
 
         int nblk = min((int)grid_size(ne), 256);
         muon_sum_sq_partials<<<nblk, 256, 0, stream>>>(

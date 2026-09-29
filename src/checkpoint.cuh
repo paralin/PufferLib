@@ -110,6 +110,8 @@ void StateFiles(const fs::path& root, PuffeRL* p, bool write) {
         numel(p->muon.outer_velocity.shape) * sizeof(float), write);
     DeviceFile(root / "tail-ema.f32", p->muon.tail.data,
         numel(p->muon.tail.shape) * sizeof(float), write);
+    DeviceFile(root / "soap-state.bin", p->muon.soap.data,
+        numel(p->muon.soap.shape) * sizeof(precision_t), write);
     DeviceFile(root / "rng-offsets.bytes", p->rng_offset,
         (p->vec->buffers + 1) * sizeof(long), write);
     for (int buffer = 0; buffer < p->vec->buffers; ++buffer) {
