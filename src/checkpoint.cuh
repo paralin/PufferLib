@@ -99,6 +99,10 @@ void StateFiles(const fs::path& root, PuffeRL* p, bool write) {
     PolicyFile(root / "weights.f32", &p->policies[0], p->default_stream, write);
     DeviceFile(root / "momentum.f32", p->muon.mb.data,
         numel(p->muon.mb.shape) * sizeof(float), write);
+    DeviceFile(root / "momentum-slow.f32", p->muon.slow.data,
+        numel(p->muon.slow.shape) * sizeof(float), write);
+    DeviceFile(root / "lane-energy.f32", p->muon.lane_energy.data,
+        numel(p->muon.lane_energy.shape) * sizeof(float), write);
     DeviceFile(root / "rng-offsets.bytes", p->rng_offset,
         (p->vec->buffers + 1) * sizeof(long), write);
     for (int buffer = 0; buffer < p->vec->buffers; ++buffer) {

@@ -1294,10 +1294,10 @@ __global__ void muon_clip_nesterov(float* __restrict__ mb,
     }
 }
 
-// x *= 1 / max(sqrt(sum_sq), eps)  — NS input normalize
+// x *= 1 / max(margin * sqrt(sum_sq), eps)  — NS input normalize
 __global__ void muon_l2_normalize(precision_t* __restrict__ dst,
-        const float* __restrict__ sum_sq_ptr, float eps, int n) {
-    float inv_norm = 1.0f / fmaxf(sqrtf(*sum_sq_ptr), eps);
+        const float* __restrict__ sum_sq_ptr, float margin, float eps, int n) {
+    float inv_norm = 1.0f / fmaxf(margin * sqrtf(*sum_sq_ptr), eps);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         dst[idx] = from_float(to_float(dst[idx]) * inv_norm);
@@ -1325,6 +1325,88 @@ __global__ void muon_weight_update(float* __restrict__ wb,
     }
 }
 
+// ANVIL (modded-nanogpt record 360). Both velocity rails are decayed sums of the
+// clipped gradient: mb is the fast rail (beta = momentum), slow the long one.
+__global__ void anvil_clip_rails(float* __restrict__ mb, float* __restrict__ slow,
+        precision_t* __restrict__ gc, const float* __restrict__ sum_sq_ptr,
+        float max_norm, float eps, float mu, float slow_beta, int n) {
+    float clip_coef = fminf(max_norm / (sqrtf(*sum_sq_ptr) + eps), 1.0f);
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float g = to_float(gc[idx]) * clip_coef;
+        mb[idx] = mu * mb[idx] + g;
+        slow[idx] = slow_beta * slow[idx] + g;
+        gc[idx] = from_float(g);
+    }
+}
+
+// Nesterov lookahead. A matrix looks ahead from the gradient toward the blend of
+// both rails, each rescaled to a moving average; a vector keeps the fast rail.
+__global__ void anvil_lookahead(precision_t* __restrict__ gc,
+        const float* __restrict__ mb, const float* __restrict__ slow,
+        float mu, float slow_beta, float fast_weight, bool matrix, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float g = to_float(gc[idx]);
+        if (!matrix) {
+            gc[idx] = from_float(g + mu * mb[idx]);
+            return;
+        }
+        float blend = fast_weight * (1.0f - mu) * mb[idx]
+            + (1.0f - fast_weight) * (1.0f - slow_beta) * slow[idx];
+        gc[idx] = from_float(g + mu * (blend - g));
+    }
+}
+
+// Lanes run along the longer matrix dimension. Each lane keeps an average of its
+// mean squared update; gain is its inverse root, power its summed squares.
+__global__ void anvil_lane_gain(float* __restrict__ energy, float* __restrict__ gain,
+        float* __restrict__ power, const precision_t* __restrict__ x,
+        float lane_beta, int R, int C) {
+    int lane = blockIdx.x * blockDim.x + threadIdx.x;
+    int lanes = max(R, C);
+    if (lane >= lanes) {
+        return;
+    }
+    bool tall = R >= C;
+    int length = tall ? C : R;
+    float sum = 0.0f;
+    for (int j = 0; j < length; ++j) {
+        float v = to_float(x[tall ? (long)lane * C + j : (long)j * C + lane]);
+        sum += v * v;
+    }
+    energy[lane] += (1.0f - lane_beta) * (sum / length - energy[lane]);
+    gain[lane] = rsqrtf(fmaxf(energy[lane], 1e-10f));
+    power[lane] = sum;
+}
+
+// sums = {sum power, sum power * gain^2}: the matrix norm squared before and after.
+__global__ void anvil_lane_sums(float* __restrict__ sums,
+        const float* __restrict__ gain, const float* __restrict__ power, int lanes) {
+    __shared__ float sdata[512];
+    int tid = threadIdx.x;
+    float before = 0.0f, after = 0.0f;
+    for (int i = tid; i < lanes; i += blockDim.x) {
+        before += power[i];
+        after += power[i] * gain[i] * gain[i];
+    }
+    sdata[tid] = before;
+    sdata[blockDim.x + tid] = after;
+    block_reduce_sum(sdata, sums, tid, blockDim.x, 2);
+}
+
+// dst = scale * lane gain * (norm before / norm after) * src
+__global__ void anvil_lane_apply(precision_t* __restrict__ dst,
+        const precision_t* __restrict__ src, const float* __restrict__ gain,
+        const float* __restrict__ sums, float scale, int R, int C) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < R * C) {
+        int lane = R >= C ? idx / C : idx % C;
+        float ratio = sqrtf(sums[0]) / fmaxf(sqrtf(sums[1]), 1e-10f);
+        dst[idx] = from_float(scale * ratio * gain[lane] * to_float(src[idx]));
+    }
+}
+
 constexpr double ns_coeffs[5][3] = {
     {4.0848, -6.8946, 2.9270},
     {3.9505, -6.3029, 2.6377},
@@ -1333,21 +1415,44 @@ constexpr double ns_coeffs[5][3] = {
     {2.8366, -3.0525, 1.2012},
 };
 
+// Whitening cascade of ANVIL, re-derived for its record rather than taken from
+// the Polar Express reference. Six maps against Muon's five.
+constexpr double anvil_maps[6][3] = {
+    {3.923798038567, -6.095026865488, 3.905234618423},
+    {3.278126713798, -3.328923386476, 0.989127286973},
+    {3.505298394150, -5.137358782410, 1.968325560615},
+    {2.815058591845, -3.685181239622, 1.417196497642},
+    {2.245503932403, -2.443826979899, 0.963091710461},
+    {2.256537145403, -2.166840097229, 0.929501253245},
+};
+constexpr float anvil_slow_beta = 0.98f;
+constexpr float anvil_fast_weight = 0.4385f;
+constexpr float anvil_lane_beta = 0.9f;
+constexpr float anvil_margin = 1.05f;
+
 // Muon optimizer. Our benchmarks show this is a major
 // upgrade over Adam (weight decay not needed in RL).
 struct Muon {
+    bool anvil;
     double momentum;
     // Scalars / scratch: raw device ptrs. Tensors: allocator.
     float* lr;
     float* grad_norm;
     float* ns_norm;
     float* norm_partials;  // 256
-    Float mb;              // flat momentum buffer (param-sized)
+    Float mb;              // flat momentum buffer (param-sized); ANVIL's fast rail
+    Float slow;            // ANVIL's slow rail (param-sized)
+    Float lane_energy;     // ANVIL's per-lane update energy, matrices in order
+    float* lane_gain;      // ANVIL scratch, one per lane of the widest matrix
+    float* lane_power;
+    float* lane_sums;      // 2
     Prec gram, gram_buf, x_buf;
     Allocator* param_alloc;
 };
 
-void muon_init(Muon* m, Allocator* param_alloc, double momentum, Allocator* alloc) {
+void muon_init(Muon* m, Allocator* param_alloc, double momentum, bool anvil,
+        Allocator* alloc) {
+    m->anvil = anvil;
     m->momentum = momentum;
     m->param_alloc = param_alloc;
     cudaMalloc((void**)&m->lr, sizeof(float));
@@ -1356,15 +1461,23 @@ void muon_init(Muon* m, Allocator* param_alloc, double momentum, Allocator* allo
     cudaMalloc((void**)&m->norm_partials, 256 * sizeof(float));
     m->mb = {.shape = {param_alloc->total_bytes / (long)sizeof(precision_t)}};
     alloc_register(alloc, &m->mb);
-    long max_M = 0, max_N = 0;
+    m->slow = {.shape = {param_alloc->total_bytes / (long)sizeof(precision_t)}};
+    alloc_register(alloc, &m->slow);
+    long max_M = 0, max_N = 0, lanes = 0;
     for (int _i = 0; _i < param_alloc->num_regs; _i++) {
         AllocEntry& e = param_alloc->regs[_i];
         if (ndim(e.shape) >= 2) {
             long R = e.shape[0], C = numel(e.shape) / R;
             max_M = max(max_M, min(R, C));
             max_N = max(max_N, max(R, C));
+            lanes += max(R, C);
         }
     }
+    m->lane_energy = {.shape = {lanes}};
+    alloc_register(alloc, &m->lane_energy);
+    cudaMalloc((void**)&m->lane_gain, max_N * sizeof(float));
+    cudaMalloc((void**)&m->lane_power, max_N * sizeof(float));
+    cudaMalloc((void**)&m->lane_sums, 2 * sizeof(float));
     m->gram =     {.shape = {max_M, max_M}};
     m->gram_buf = {.shape = {max_M, max_M}};
     m->x_buf =    {.shape = {max_M, max_N}};
@@ -1381,9 +1494,19 @@ void muon_step(Muon* m, Float weights, Prec grads,
         m->norm_partials, grads.data, n_grad);
     muon_sum_sq_reduce<<<1, 256, 0, stream>>>(
         m->grad_norm, m->norm_partials, sum_blocks);
-    muon_clip_nesterov<<<grid_size(n_grad), BLOCK_SIZE, 0, stream>>>(
-        m->mb.data, grads.data, m->grad_norm,
-        max_grad_norm, 1e-6f, (float)m->momentum, n_grad);
+    if (m->anvil) {
+        anvil_clip_rails<<<grid_size(n_grad), BLOCK_SIZE, 0, stream>>>(
+            m->mb.data, m->slow.data, grads.data, m->grad_norm,
+            max_grad_norm, 1e-6f, (float)m->momentum, anvil_slow_beta, n_grad);
+    } else {
+        muon_clip_nesterov<<<grid_size(n_grad), BLOCK_SIZE, 0, stream>>>(
+            m->mb.data, grads.data, m->grad_norm,
+            max_grad_norm, 1e-6f, (float)m->momentum, n_grad);
+    }
+    const double (*maps)[3] = m->anvil ? anvil_maps : ns_coeffs;
+    int num_maps = m->anvil ? 6 : 5;
+    float margin = m->anvil ? anvil_margin : 1.0f;
+    long lane_offset = 0;
 
     // Per-param NS into workspace; write scaled update back into flat grads.
     // 1D params already hold their update in-place (scale 1).
@@ -1394,6 +1517,12 @@ void muon_step(Muon* m, Float weights, Prec grads,
             / sizeof(precision_t);
         precision_t* gc_ptr = grads.data + offset;
         long ne = numel(e.shape);
+        if (m->anvil) {
+            anvil_lookahead<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
+                gc_ptr, m->mb.data + offset, m->slow.data + offset,
+                (float)m->momentum, anvil_slow_beta, anvil_fast_weight,
+                ndim(e.shape) >= 2, (int)ne);
+        }
         if (ndim(e.shape) < 2) {
             continue;
         }
@@ -1412,10 +1541,10 @@ void muon_step(Muon* m, Float weights, Prec grads,
         muon_sum_sq_reduce<<<1, 256, 0, stream>>>(
             m->ns_norm, m->norm_partials, nblk);
         muon_l2_normalize<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
-            x.data, m->ns_norm, 1e-7f, (int)ne);
+            x.data, m->ns_norm, margin, 1e-7f, (int)ne);
 
-        // 5 steps land in x_buf. 4 = you break it.
-        for (int i = 0; i < 5; ++i) {
+        // Muon's 5 steps land in x_buf. 4 = you break it.
+        for (int i = 0; i < num_maps; ++i) {
             Prec& src = (i % 2 == 0) ? x : x_buf;
             Prec& dst = (i % 2 == 0) ? x_buf : x;
             if (tall) {
@@ -1425,19 +1554,32 @@ void muon_step(Muon* m, Float weights, Prec grads,
             }
             puf_copy(&gram_buf, &gram, stream);
             puf_mm_nn(&gram, &gram, &gram_buf, stream,
-                (float)ns_coeffs[i][2], (float)ns_coeffs[i][1]);
+                (float)maps[i][2], (float)maps[i][1]);
             puf_copy(&dst, &src, stream);
             if (tall) {
                 puf_mm_nn(&src, &gram_buf, &dst,
-                    stream, 1.0f, (float)ns_coeffs[i][0]);
+                    stream, 1.0f, (float)maps[i][0]);
             } else {
                 puf_mm_nn(&gram_buf, &src, &dst,
-                    stream, 1.0f, (float)ns_coeffs[i][0]);
+                    stream, 1.0f, (float)maps[i][0]);
             }
         }
+        Prec& result = (num_maps % 2 == 0) ? x : x_buf;
         float scale = sqrtf(fmaxf(1.0f, (float)R / (float)C));
-        muon_store_update<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
-            gc_ptr, x_buf.data, scale, (int)ne);
+        if (m->anvil) {
+            long lanes = max(R, C);
+            anvil_lane_gain<<<grid_size(lanes), BLOCK_SIZE, 0, stream>>>(
+                m->lane_energy.data + lane_offset, m->lane_gain, m->lane_power,
+                result.data, anvil_lane_beta, (int)R, (int)C);
+            anvil_lane_sums<<<1, 256, 0, stream>>>(
+                m->lane_sums, m->lane_gain, m->lane_power, (int)lanes);
+            anvil_lane_apply<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
+                gc_ptr, result.data, m->lane_gain, m->lane_sums, scale, (int)R, (int)C);
+            lane_offset += lanes;
+        } else {
+            muon_store_update<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
+                gc_ptr, result.data, scale, (int)ne);
+        }
     }
     muon_weight_update<<<grid_size(n_grad), BLOCK_SIZE, 0, stream>>>(
         weights.data, grads.data, m->lr, 0.0f, n_grad);

@@ -312,6 +312,7 @@ typedef struct {
     float min_lr_ratio;
     bool anneal_lr;
     float momentum;
+    bool anvil;
     int minibatch_size;
     float replay_ratio;
     bool prioritized_replay;
@@ -2156,6 +2157,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         .min_lr_ratio = puf_ini_get(ini, "train", "min_lr_ratio"),
         .anneal_lr = puf_ini_get(ini, "train", "anneal_lr") != 0,
         .momentum = puf_ini_get(ini, "train", "momentum"),
+        .anvil = puf_ini_get(ini, "train", "anvil") != 0,
         .minibatch_size = puf_ini_get(ini, "train", "minibatch_size"),
         .replay_ratio = puf_ini_get(ini, "train", "replay_ratio"),
         .prioritized_replay = puf_ini_get(ini, "train", "prioritized_replay") != 0,
@@ -2428,7 +2430,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         }
     }
 
-    muon_init(&pufferl->muon, &primary->params_alloc, hypers.momentum, acts);
+    muon_init(&pufferl->muon, &primary->params_alloc, hypers.momentum, hypers.anvil, acts);
 
     // Allocate all policy param/activ pools, then train grads + shared acts.
     for (int b = 0; b < pufferl->num_policies; b++) {
@@ -2491,6 +2493,9 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     cudaMemset(pufferl->losses, 0, NUM_LOSSES * sizeof(float));
     cudaMemcpy(pufferl->muon.lr, &hypers.lr, sizeof(float), cudaMemcpyHostToDevice);
     cudaMemset(pufferl->muon.mb.data, 0, numel(pufferl->muon.mb.shape) * sizeof(float));
+    cudaMemset(pufferl->muon.slow.data, 0, numel(pufferl->muon.slow.shape) * sizeof(float));
+    cudaMemset(pufferl->muon.lane_energy.data, 0,
+        numel(pufferl->muon.lane_energy.shape) * sizeof(float));
 
 #ifdef PUFFER_NETHACK
     nethack_policy_init(ini);

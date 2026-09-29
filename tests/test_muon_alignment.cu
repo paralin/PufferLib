@@ -111,7 +111,7 @@ int main(int argc, char** argv) {
         Reference* r = &refs[i];
         memcpy(r->param.shape, e.shape, sizeof(r->param.shape));
         alloc_register(&r->params, &r->param);
-        muon_init(&r->muon, &r->params, p->muon.momentum, &r->scratch);
+        muon_init(&r->muon, &r->params, p->muon.momentum, p->muon.anvil, &r->scratch);
         alloc_create(&r->params);
         alloc_create(&r->scratch);
         long count = numel(e.shape);
