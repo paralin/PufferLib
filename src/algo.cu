@@ -1407,6 +1407,137 @@ __global__ void anvil_lane_apply(precision_t* __restrict__ dst,
     }
 }
 
+// Norm control (modded-nanogpt records 29 and 46). Per matrix: an update that
+// moves the weight outward has its radial component halved, an update smaller
+// than the floor fraction of the weight norm is lifted to it, and after the step
+// the weight is rescaled to the radius the radial move alone intended.
+constexpr float kNormControlBrake = 0.5f;
+
+// stats = {u.w, w.w, u.u} of one matrix; one block.
+__global__ void norm_control_stats(float* __restrict__ stats,
+        const precision_t* __restrict__ u, const float* __restrict__ w, int n) {
+    __shared__ float sdata[3 * 256];
+    int tid = threadIdx.x;
+    float uw = 0.0f, ww = 0.0f, uu = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        float a = to_float(u[i]), b = w[i];
+        uw += a * b;
+        ww += b * b;
+        uu += a * a;
+    }
+    sdata[tid] = uw;
+    sdata[blockDim.x + tid] = ww;
+    sdata[2 * blockDim.x + tid] = uu;
+    block_reduce_sum(sdata, stats, tid, blockDim.x, 3);
+}
+
+// plan = {shift, scale, radius}: the update becomes scale * (u + shift * w), and
+// the pinned weight norm is radius. The brake and floor norms follow from stats
+// in closed form because the brake only rescales u along w.
+__global__ void norm_control_plan(float* __restrict__ plan,
+        const float* __restrict__ stats, const float* __restrict__ lr_ptr, float floor) {
+    float uw = stats[0], ww = fmaxf(stats[1], 1e-12f), uu = stats[2];
+    float w_norm = fmaxf(sqrtf(ww), 1e-8f);
+    float shift = 0.0f, along = uw, power = uu;
+    if (uw < 0.0f) {
+        shift = (kNormControlBrake - 1.0f) * uw / ww;
+        along = kNormControlBrake * uw;
+        power = uu + (kNormControlBrake * kNormControlBrake - 1.0f) * uw * uw / ww;
+    }
+    float u_norm = fmaxf(sqrtf(fmaxf(power, 0.0f)), 1e-8f);
+    float scale = u_norm < floor * w_norm ? floor * w_norm / u_norm : 1.0f;
+    plan[0] = shift;
+    plan[1] = scale;
+    plan[2] = fmaxf(w_norm - *lr_ptr * scale * along / w_norm, 1e-8f);
+}
+
+__global__ void norm_control_apply(precision_t* __restrict__ u,
+        const float* __restrict__ w, const float* __restrict__ plan, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        u[idx] = from_float(plan[1] * (to_float(u[idx]) + plan[0] * w[idx]));
+    }
+}
+
+// *out = sum of squares; one block.
+__global__ void sum_sq_f32(float* __restrict__ out, const float* __restrict__ src, int n) {
+    __shared__ float sdata[256];
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        sum += src[i] * src[i];
+    }
+    sdata[tid] = sum;
+    block_reduce_sum(sdata, out, tid, blockDim.x, 1);
+}
+
+__global__ void norm_control_pin(float* __restrict__ w, const float* __restrict__ sum_sq,
+        const float* __restrict__ plan, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        w[idx] *= plan[2] / fmaxf(sqrtf(*sum_sq), 1e-8f);
+    }
+}
+
+// Cautious weight decay: shrink only the weights the step is already shrinking,
+// that is where the gate agrees in sign with the weight.
+__device__ __forceinline__ float cautious_factor(float w, float gate, float lr, float wd) {
+    return gate * w >= 0.0f ? 1.0f - lr * wd : 1.0f;
+}
+
+__global__ void cautious_decay_rail(float* __restrict__ w, const float* __restrict__ gate,
+        const float* __restrict__ lr_ptr, float wd, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        w[idx] *= cautious_factor(w[idx], gate[idx], *lr_ptr, wd);
+    }
+}
+
+__global__ void cautious_decay_update(float* __restrict__ w,
+        const precision_t* __restrict__ gate, const float* __restrict__ lr_ptr,
+        float wd, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        w[idx] *= cautious_factor(w[idx], to_float(gate[idx]), *lr_ptr, wd);
+    }
+}
+
+// Snoo (Sparse Nesterov Outer Optimizer). Every interval steps the weights walk
+// back to the last outer weights and Nesterov SGD moves those along the
+// displacement the inner steps made.
+__global__ void snoo_seed(float* __restrict__ outer, const float* __restrict__ w,
+        const long* __restrict__ step, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n && *step == 0) {
+        outer[idx] = w[idx];
+    }
+}
+
+__global__ void snoo_sync(float* __restrict__ w, float* __restrict__ outer,
+        float* __restrict__ velocity, const long* __restrict__ step,
+        int interval, float lr, float mu, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n && (*step + 1) % interval == 0) {
+        float delta = outer[idx] - w[idx];
+        velocity[idx] = mu * velocity[idx] + delta;
+        w[idx] = outer[idx] - lr * (delta + mu * velocity[idx]);
+        outer[idx] = w[idx];
+    }
+}
+
+// Tail EMA of the weights over about horizon steps, seeded by the first step.
+__global__ void tail_ema_update(float* __restrict__ ema, const float* __restrict__ w,
+        const long* __restrict__ step, float rate, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        ema[idx] = *step == 0 ? w[idx] : ema[idx] + rate * (w[idx] - ema[idx]);
+    }
+}
+
+__global__ void advance_step(long* __restrict__ step) {
+    ++*step;
+}
+
 constexpr double ns_coeffs[5][3] = {
     {4.0848, -6.8946, 2.9270},
     {3.9505, -6.3029, 2.6377},
@@ -1430,13 +1561,29 @@ constexpr float anvil_fast_weight = 0.4385f;
 constexpr float anvil_lane_beta = 0.9f;
 constexpr float anvil_margin = 1.05f;
 
+// Optimizer features beyond plain Muon; each is off at its zero value.
+struct MuonOptions {
+    double momentum;
+    bool anvil;          // ANVIL rails, whitening cascade and lane equalizer
+    bool norm_control;   // radial brake and radius pin per matrix
+    float norm_floor;    // with norm control, least update norm as a fraction of the weight norm; 0 disables
+    float weight_decay;  // cautious, per unit learning rate, matrices only
+    int snoo_interval;   // inner steps per Snoo outer step
+    float snoo_lr;
+    float snoo_momentum;
+    int tail_steps;      // horizon of the tail EMA that saves blend in
+};
+
+// Fraction of the way a save moves from the last iterate to the tail EMA.
+constexpr float kTailBlend = 0.65f;
+
 // Muon optimizer. Our benchmarks show this is a major
 // upgrade over Adam (weight decay not needed in RL).
 struct Muon {
-    bool anvil;
-    double momentum;
+    MuonOptions options;
     // Scalars / scratch: raw device ptrs. Tensors: allocator.
     float* lr;
+    long* step;            // optimizer steps taken; the device owns every schedule
     float* grad_norm;
     float* ns_norm;
     float* norm_partials;  // 256
@@ -1446,24 +1593,37 @@ struct Muon {
     float* lane_gain;      // ANVIL scratch, one per lane of the widest matrix
     float* lane_power;
     float* lane_sums;      // 2
+    float* norm_stats;     // norm control scratch, 3
+    float* norm_plan;      // norm control plan of every matrix, 3 each
+    float* pin_sum_sq;     // 1
+    Float outer;           // Snoo outer weights (param-sized when enabled)
+    Float outer_velocity;  // Snoo outer momentum
+    Float tail;            // tail EMA of the weights
     Prec gram, gram_buf, x_buf;
     Allocator* param_alloc;
 };
 
-void muon_init(Muon* m, Allocator* param_alloc, double momentum, bool anvil,
+// Offset in elements of a param in the flat weight and gradient buffers, which
+// share one aligned layout including padding.
+static long muon_param_offset(const Muon* m, const AllocEntry& e) {
+    return ((char*)*e.data_ptr - (char*)m->param_alloc->mem) / sizeof(precision_t);
+}
+
+void muon_init(Muon* m, Allocator* param_alloc, const MuonOptions& options,
         Allocator* alloc) {
-    m->anvil = anvil;
-    m->momentum = momentum;
+    m->options = options;
     m->param_alloc = param_alloc;
     cudaMalloc((void**)&m->lr, sizeof(float));
+    cudaMalloc((void**)&m->step, sizeof(long));
     cudaMalloc((void**)&m->grad_norm, sizeof(float));
     cudaMalloc((void**)&m->ns_norm, sizeof(float));
     cudaMalloc((void**)&m->norm_partials, 256 * sizeof(float));
-    m->mb = {.shape = {param_alloc->total_bytes / (long)sizeof(precision_t)}};
+    long params = param_alloc->total_bytes / (long)sizeof(precision_t);
+    m->mb = {.shape = {params}};
     alloc_register(alloc, &m->mb);
-    m->slow = {.shape = {param_alloc->total_bytes / (long)sizeof(precision_t)}};
+    m->slow = {.shape = {params}};
     alloc_register(alloc, &m->slow);
-    long max_M = 0, max_N = 0, lanes = 0;
+    long max_M = 0, max_N = 0, lanes = 0, matrices = 0;
     for (int _i = 0; _i < param_alloc->num_regs; _i++) {
         AllocEntry& e = param_alloc->regs[_i];
         if (ndim(e.shape) >= 2) {
@@ -1471,6 +1631,7 @@ void muon_init(Muon* m, Allocator* param_alloc, double momentum, bool anvil,
             max_M = max(max_M, min(R, C));
             max_N = max(max_N, max(R, C));
             lanes += max(R, C);
+            ++matrices;
         }
     }
     m->lane_energy = {.shape = {lanes}};
@@ -1478,6 +1639,15 @@ void muon_init(Muon* m, Allocator* param_alloc, double momentum, bool anvil,
     cudaMalloc((void**)&m->lane_gain, max_N * sizeof(float));
     cudaMalloc((void**)&m->lane_power, max_N * sizeof(float));
     cudaMalloc((void**)&m->lane_sums, 2 * sizeof(float));
+    cudaMalloc((void**)&m->norm_stats, 3 * sizeof(float));
+    cudaMalloc((void**)&m->norm_plan, 3 * matrices * sizeof(float));
+    cudaMalloc((void**)&m->pin_sum_sq, sizeof(float));
+    m->outer = {.shape = {options.snoo_interval > 0 ? params : 1}};
+    alloc_register(alloc, &m->outer);
+    m->outer_velocity = {.shape = {options.snoo_interval > 0 ? params : 1}};
+    alloc_register(alloc, &m->outer_velocity);
+    m->tail = {.shape = {options.tail_steps > 0 ? params : 1}};
+    alloc_register(alloc, &m->tail);
     m->gram =     {.shape = {max_M, max_M}};
     m->gram_buf = {.shape = {max_M, max_M}};
     m->x_buf =    {.shape = {max_M, max_N}};
@@ -1486,41 +1656,88 @@ void muon_init(Muon* m, Allocator* param_alloc, double momentum, bool anvil,
     alloc_register(alloc, &m->x_buf);
 }
 
+// Starts a fresh run of the optimizer: empty momentum and the given learning rate.
+// The Snoo outer weights and the tail EMA seed themselves from step zero.
+void muon_reset(Muon* m, float lr) {
+    cudaMemcpy(m->lr, &lr, sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemset(m->step, 0, sizeof(long));
+    for (Float* state : {&m->mb, &m->slow, &m->lane_energy, &m->outer_velocity}) {
+        cudaMemset(state->data, 0, numel(state->shape) * sizeof(float));
+    }
+}
+
+// Copies the weights a save publishes into out: the last iterate blended toward
+// the tail EMA, each matrix rescaled to the norm it trained at. Averaging shrinks
+// norms, and the network learned at the unaveraged scale.
+void muon_ship_weights(Muon* m, Float weights, float* out) {
+    long n = numel(weights.shape);
+    cudaMemcpy(out, weights.data, n * sizeof(float), cudaMemcpyDeviceToHost);
+    long steps = 0;
+    cudaMemcpy(&steps, m->step, sizeof(long), cudaMemcpyDeviceToHost);
+    if (m->options.tail_steps <= 0 || steps == 0) {
+        return;
+    }
+    std::vector<float> ema(n);
+    cudaMemcpy(ema.data(), m->tail.data, n * sizeof(float), cudaMemcpyDeviceToHost);
+    for (int _i = 0; _i < m->param_alloc->num_regs; _i++) {
+        AllocEntry& e = m->param_alloc->regs[_i];
+        long offset = muon_param_offset(m, e);
+        long ne = numel(e.shape);
+        double before = 0.0, after = 0.0;
+        for (long i = offset; i < offset + ne; ++i) {
+            float shipped = out[i] + kTailBlend * (ema[i] - out[i]);
+            before += (double)out[i] * out[i];
+            after += (double)shipped * shipped;
+            out[i] = shipped;
+        }
+        if (ndim(e.shape) >= 2 && after > 0.0) {
+            float ratio = (float)sqrt(before / after);
+            for (long i = offset; i < offset + ne; ++i) {
+                out[i] *= ratio;
+            }
+        }
+    }
+}
+
 void muon_step(Muon* m, Float weights, Prec grads,
         float max_grad_norm, cudaStream_t stream = 0) {
+    const MuonOptions& o = m->options;
     int n_grad = (int)numel(grads.shape);
     int sum_blocks = min((int)grid_size(n_grad), 256);
     muon_sum_sq_partials<<<sum_blocks, 256, 0, stream>>>(
         m->norm_partials, grads.data, n_grad);
     muon_sum_sq_reduce<<<1, 256, 0, stream>>>(
         m->grad_norm, m->norm_partials, sum_blocks);
-    if (m->anvil) {
+    if (o.anvil) {
         anvil_clip_rails<<<grid_size(n_grad), BLOCK_SIZE, 0, stream>>>(
             m->mb.data, m->slow.data, grads.data, m->grad_norm,
-            max_grad_norm, 1e-6f, (float)m->momentum, anvil_slow_beta, n_grad);
+            max_grad_norm, 1e-6f, (float)o.momentum, anvil_slow_beta, n_grad);
     } else {
         muon_clip_nesterov<<<grid_size(n_grad), BLOCK_SIZE, 0, stream>>>(
             m->mb.data, grads.data, m->grad_norm,
-            max_grad_norm, 1e-6f, (float)m->momentum, n_grad);
+            max_grad_norm, 1e-6f, (float)o.momentum, n_grad);
     }
-    const double (*maps)[3] = m->anvil ? anvil_maps : ns_coeffs;
-    int num_maps = m->anvil ? 6 : 5;
-    float margin = m->anvil ? anvil_margin : 1.0f;
+    if (o.snoo_interval > 0) {
+        snoo_seed<<<grid_size(n_grad), BLOCK_SIZE, 0, stream>>>(
+            m->outer.data, weights.data, m->step, n_grad);
+    }
+    const double (*maps)[3] = o.anvil ? anvil_maps : ns_coeffs;
+    int num_maps = o.anvil ? 6 : 5;
+    float margin = o.anvil ? anvil_margin : 1.0f;
     long lane_offset = 0;
+    long matrix = 0;
 
     // Per-param NS into workspace; write scaled update back into flat grads.
     // 1D params already hold their update in-place (scale 1).
     for (int _i = 0; _i < m->param_alloc->num_regs; _i++) {
         AllocEntry& e = m->param_alloc->regs[_i];
-        // Params and grads have the same aligned layout, including padding.
-        long offset = ((char*)*e.data_ptr - (char*)m->param_alloc->mem)
-            / sizeof(precision_t);
+        long offset = muon_param_offset(m, e);
         precision_t* gc_ptr = grads.data + offset;
         long ne = numel(e.shape);
-        if (m->anvil) {
+        if (o.anvil) {
             anvil_lookahead<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
                 gc_ptr, m->mb.data + offset, m->slow.data + offset,
-                (float)m->momentum, anvil_slow_beta, anvil_fast_weight,
+                (float)o.momentum, anvil_slow_beta, anvil_fast_weight,
                 ndim(e.shape) >= 2, (int)ne);
         }
         if (ndim(e.shape) < 2) {
@@ -1566,7 +1783,7 @@ void muon_step(Muon* m, Float weights, Prec grads,
         }
         Prec& result = (num_maps % 2 == 0) ? x : x_buf;
         float scale = sqrtf(fmaxf(1.0f, (float)R / (float)C));
-        if (m->anvil) {
+        if (o.anvil) {
             long lanes = max(R, C);
             anvil_lane_gain<<<grid_size(lanes), BLOCK_SIZE, 0, stream>>>(
                 m->lane_energy.data + lane_offset, m->lane_gain, m->lane_power,
@@ -1580,9 +1797,54 @@ void muon_step(Muon* m, Float weights, Prec grads,
             muon_store_update<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
                 gc_ptr, result.data, scale, (int)ne);
         }
+        if (o.norm_control) {
+            float* plan = m->norm_plan + 3 * matrix;
+            norm_control_stats<<<1, 256, 0, stream>>>(
+                m->norm_stats, gc_ptr, weights.data + offset, (int)ne);
+            norm_control_plan<<<1, 1, 0, stream>>>(
+                plan, m->norm_stats, m->lr, o.norm_floor);
+            norm_control_apply<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
+                gc_ptr, weights.data + offset, plan, (int)ne);
+        }
+        ++matrix;
     }
     muon_weight_update<<<grid_size(n_grad), BLOCK_SIZE, 0, stream>>>(
         weights.data, grads.data, m->lr, 0.0f, n_grad);
+
+    // Matrices settle after the step: pin the radius, then decay what is aligned.
+    matrix = 0;
+    for (int _i = 0; _i < m->param_alloc->num_regs; _i++) {
+        AllocEntry& e = m->param_alloc->regs[_i];
+        if (ndim(e.shape) < 2) {
+            continue;
+        }
+        long offset = muon_param_offset(m, e);
+        int ne = (int)numel(e.shape);
+        float* w = weights.data + offset;
+        if (o.norm_control) {
+            sum_sq_f32<<<1, 256, 0, stream>>>(m->pin_sum_sq, w, ne);
+            norm_control_pin<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
+                w, m->pin_sum_sq, m->norm_plan + 3 * matrix, ne);
+        }
+        if (o.weight_decay > 0 && o.anvil) {
+            cautious_decay_rail<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
+                w, m->slow.data + offset, m->lr, o.weight_decay, ne);
+        } else if (o.weight_decay > 0) {
+            cautious_decay_update<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
+                w, grads.data + offset, m->lr, o.weight_decay, ne);
+        }
+        ++matrix;
+    }
+    if (o.snoo_interval > 0) {
+        snoo_sync<<<grid_size(n_grad), BLOCK_SIZE, 0, stream>>>(
+            weights.data, m->outer.data, m->outer_velocity.data, m->step,
+            o.snoo_interval, o.snoo_lr, o.snoo_momentum, n_grad);
+    }
+    if (o.tail_steps > 0) {
+        tail_ema_update<<<grid_size(n_grad), BLOCK_SIZE, 0, stream>>>(
+            m->tail.data, weights.data, m->step, 2.0f / (o.tail_steps + 1), n_grad);
+    }
+    advance_step<<<1, 1, 0, stream>>>(m->step);
 }
 
 // Train layout is (B, T). Views are sliced each mb; scratch is allocated.

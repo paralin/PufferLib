@@ -311,8 +311,8 @@ typedef struct {
     float lr;
     float min_lr_ratio;
     bool anneal_lr;
-    float momentum;
-    bool anvil;
+    float lr_cooldown;
+    MuonOptions muon;
     int minibatch_size;
     float replay_ratio;
     bool prioritized_replay;
@@ -1643,6 +1643,14 @@ float cosine_annealing(float base, float min_v, long t, long T) {
     return min_v + 0.5f * (base - min_v) * (1.0f + (float)cos(M_PI * u));
 }
 
+// Flat at base, then linear down to min_v over the last cooldown fraction of
+// [0, T).
+float linear_cooldown(float base, float min_v, float cooldown, long t, long T) {
+    double u = ((double)t / (double)T - (1.0 - cooldown)) / cooldown;
+    u = fmin(fmax(u, 0.0), 1.0);
+    return base + (float)u * (min_v - base);
+}
+
 // Scales learner rewards, then clips them when clip is positive.
 __global__ void transform_rewards_kernel(precision_t* dst, float scale, float clip, int n) {
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n;
@@ -1843,7 +1851,11 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
     // cosine and never reach min_lr / min_ent.
     long total_epochs = hypers->klpo ? hypers->total_timesteps
         : hypers->total_timesteps / hypers->world_size / batch_size;
-    if (anneal_lr) {
+    if (hypers->lr_cooldown > 0) {
+        float lr = linear_cooldown(hypers->lr, hypers->min_lr_ratio * hypers->lr,
+            hypers->lr_cooldown, current_epoch, total_epochs);
+        cudaMemcpy(muon->lr, &lr, sizeof(float), cudaMemcpyHostToDevice);
+    } else if (anneal_lr) {
         float lr_min = hypers->min_lr_ratio * hypers->lr;
         float lr = cosine_annealing(hypers->lr, lr_min, current_epoch, total_epochs);
         cudaMemcpy(muon->lr, &lr, sizeof(float), cudaMemcpyHostToDevice);
@@ -2051,8 +2063,8 @@ const char* puf_checkpoint_path_key(Ini* ini, const char* key,
 void puf_save_weights(PuffeRL* p, const char* path) {
     Float mw = p->policies[0].master_weights;
     int64_t nbytes = numel(mw.shape) * sizeof(float);
-    char* buf = (char*)malloc(nbytes);
-    cudaMemcpy(buf, mw.data, nbytes, cudaMemcpyDeviceToHost);
+    float* buf = (float*)malloc(nbytes);
+    muon_ship_weights(&p->muon, mw, buf);
     char tmp[4096];
     snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, getpid());
     FILE* fp = fopen(tmp, "wb");
@@ -2156,8 +2168,18 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         .lr = puf_ini_get(ini, "train", "learning_rate"),
         .min_lr_ratio = puf_ini_get(ini, "train", "min_lr_ratio"),
         .anneal_lr = puf_ini_get(ini, "train", "anneal_lr") != 0,
-        .momentum = puf_ini_get(ini, "train", "momentum"),
-        .anvil = puf_ini_get(ini, "train", "anvil") != 0,
+        .lr_cooldown = puf_ini_get(ini, "train", "lr_cooldown"),
+        .muon = {
+            .momentum = puf_ini_get(ini, "train", "momentum"),
+            .anvil = puf_ini_get(ini, "train", "anvil") != 0,
+            .norm_control = puf_ini_get(ini, "train", "norm_control") != 0,
+            .norm_floor = (float)puf_ini_get(ini, "train", "norm_floor"),
+            .weight_decay = (float)puf_ini_get(ini, "train", "weight_decay"),
+            .snoo_interval = (int)puf_ini_get(ini, "train", "snoo_interval"),
+            .snoo_lr = (float)puf_ini_get(ini, "train", "snoo_lr"),
+            .snoo_momentum = (float)puf_ini_get(ini, "train", "snoo_momentum"),
+            .tail_steps = (int)puf_ini_get(ini, "train", "tail_steps"),
+        },
         .minibatch_size = puf_ini_get(ini, "train", "minibatch_size"),
         .replay_ratio = puf_ini_get(ini, "train", "replay_ratio"),
         .prioritized_replay = puf_ini_get(ini, "train", "prioritized_replay") != 0,
@@ -2430,7 +2452,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         }
     }
 
-    muon_init(&pufferl->muon, &primary->params_alloc, hypers.momentum, hypers.anvil, acts);
+    muon_init(&pufferl->muon, &primary->params_alloc, hypers.muon, acts);
 
     // Allocate all policy param/activ pools, then train grads + shared acts.
     for (int b = 0; b < pufferl->num_policies; b++) {
@@ -2491,11 +2513,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     cudaMemcpy(pufferl->act_sizes, act_sizes,
         num_action_heads*sizeof(int), cudaMemcpyHostToDevice);
     cudaMemset(pufferl->losses, 0, NUM_LOSSES * sizeof(float));
-    cudaMemcpy(pufferl->muon.lr, &hypers.lr, sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemset(pufferl->muon.mb.data, 0, numel(pufferl->muon.mb.shape) * sizeof(float));
-    cudaMemset(pufferl->muon.slow.data, 0, numel(pufferl->muon.slow.shape) * sizeof(float));
-    cudaMemset(pufferl->muon.lane_energy.data, 0,
-        numel(pufferl->muon.lane_energy.shape) * sizeof(float));
+    muon_reset(&pufferl->muon, hypers.lr);
 
 #ifdef PUFFER_NETHACK
     nethack_policy_init(ini);

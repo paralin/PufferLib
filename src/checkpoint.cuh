@@ -103,6 +103,13 @@ void StateFiles(const fs::path& root, PuffeRL* p, bool write) {
         numel(p->muon.slow.shape) * sizeof(float), write);
     DeviceFile(root / "lane-energy.f32", p->muon.lane_energy.data,
         numel(p->muon.lane_energy.shape) * sizeof(float), write);
+    DeviceFile(root / "optimizer-step.bytes", p->muon.step, sizeof(long), write);
+    DeviceFile(root / "snoo-outer.f32", p->muon.outer.data,
+        numel(p->muon.outer.shape) * sizeof(float), write);
+    DeviceFile(root / "snoo-velocity.f32", p->muon.outer_velocity.data,
+        numel(p->muon.outer_velocity.shape) * sizeof(float), write);
+    DeviceFile(root / "tail-ema.f32", p->muon.tail.data,
+        numel(p->muon.tail.shape) * sizeof(float), write);
     DeviceFile(root / "rng-offsets.bytes", p->rng_offset,
         (p->vec->buffers + 1) * sizeof(long), write);
     for (int buffer = 0; buffer < p->vec->buffers; ++buffer) {

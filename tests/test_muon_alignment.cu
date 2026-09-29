@@ -111,7 +111,7 @@ int main(int argc, char** argv) {
         Reference* r = &refs[i];
         memcpy(r->param.shape, e.shape, sizeof(r->param.shape));
         alloc_register(&r->params, &r->param);
-        muon_init(&r->muon, &r->params, p->muon.momentum, p->muon.anvil, &r->scratch);
+        muon_init(&r->muon, &r->params, p->muon.options, &r->scratch);
         alloc_create(&r->params);
         alloc_create(&r->scratch);
         long count = numel(e.shape);
@@ -121,7 +121,7 @@ int main(int argc, char** argv) {
         cudaMalloc(&r->weights.data, count * sizeof(float));
         cudaMemcpy(r->weights.data, initial + offset,
             count * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(r->muon.lr, &lr, sizeof(float), cudaMemcpyHostToDevice);
+        muon_reset(&r->muon, lr);
     }
 
     precision_t* gradients = (precision_t*)calloc(n, sizeof(precision_t));
