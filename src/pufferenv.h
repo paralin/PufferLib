@@ -62,6 +62,24 @@ static inline void puf_set_bot_policy(Env* env, int bot_policy) {
 }
 #endif
 
+// One save of the learner's weights, with the layout and return units needed
+// to run it: values estimate the gamma-discounted sum of rewards times
+// reward_scale. weights is valid only during the call.
+typedef struct PufLearnerSave {
+    const float* weights;
+    long count;
+    int hidden_size, num_layers, layer_norm, value_bins;
+    float value_min, value_max, reward_scale, gamma;
+} PufLearnerSave;
+
+// The trainer reports every save of the learner's weights, starting with its
+// initial weights, from the training thread. Default no-op; envs that plan
+// with the learner's network #define PUF_HAS_LEARNER_SAVES and define it.
+#ifndef PUF_HAS_LEARNER_SAVES
+static inline void puf_learner_saved(const PufLearnerSave* save) {
+}
+#endif
+
 typedef uint16_t bf16;
 
 static inline bf16 f32_to_bf16(float f) {

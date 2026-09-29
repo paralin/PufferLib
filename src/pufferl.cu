@@ -1941,6 +1941,16 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
     puf_stamp<<<1, 1, 0, stream>>>(st + TE_E);
 }
 
+// The discount in use: gamma, moving geometrically in 1 - gamma toward
+// gamma_end over gamma_episodes completed episodes.
+float puf_current_gamma(const PuffeRL* pufferl) {
+    const Hypers* hypers = &pufferl->hypers;
+    if (hypers->gamma_episodes <= 0) return hypers->gamma;
+    double fraction = fmin(1.0, (double)pufferl->completed_episodes / hypers->gamma_episodes);
+    return 1.0 - (1.0 - hypers->gamma)
+        * pow((1.0 - hypers->gamma_end) / (1.0 - hypers->gamma), fraction);
+}
+
 void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
     Hypers* hypers = &pufferl->hypers;
     RolloutBuf src = src_arg ? *src_arg : pufferl->rollouts;
@@ -1991,13 +2001,7 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
         cudaMemcpyAsync(pufferl->replay.beta, &beta,
             sizeof(float), cudaMemcpyHostToDevice, train_stream);
     }
-    float gamma = hypers->gamma;
-    if (hypers->gamma_episodes > 0) {
-        double fraction = fmin(1.0,
-            (double)pufferl->completed_episodes / hypers->gamma_episodes);
-        gamma = 1.0 - (1.0 - hypers->gamma)
-            * pow((1.0 - hypers->gamma_end) / (1.0 - hypers->gamma), fraction);
-    }
+    float gamma = puf_current_gamma(pufferl);
     cudaMemcpyAsync(pufferl->current_gamma, &gamma,
         sizeof(float), cudaMemcpyHostToDevice, train_stream);
 
@@ -2181,8 +2185,22 @@ void puf_save_weights(PuffeRL* p, const char* path) {
     assert(fwrite(buf, 1, nbytes, fp) == (size_t)nbytes
         && "failed to write weights");
     fclose(fp);
-    free(buf);
     assert(rename(tmp, path) == 0 && "failed to publish weights");
+    const Hypers* hypers = &p->hypers;
+    PufLearnerSave save = {
+        .weights = buf,
+        .count = numel(mw.shape),
+        .hidden_size = hypers->hidden_size,
+        .num_layers = hypers->num_layers,
+        .layer_norm = hypers->layer_norm,
+        .value_bins = hypers->value_head.bins,
+        .value_min = hypers->value_head.min,
+        .value_max = hypers->value_head.max,
+        .reward_scale = hypers->reward_scale,
+        .gamma = puf_current_gamma(p),
+    };
+    puf_learner_saved(&save);
+    free(buf);
 }
 
 void puf_load_weights_into(Float dst, Prec params,
