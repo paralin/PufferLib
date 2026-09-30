@@ -3214,6 +3214,8 @@ typedef struct {
 // Win counts halve over this many learner decisions, so a member that has not
 // played for a while drifts back toward the prior and is drawn again.
 #define LEAGUE_HALF_LIFE 10e6
+// Shortfall draw weight every member keeps, so no member goes undrawn.
+#define LEAGUE_SHORTFALL_FLOOR 0.01
 
 // One opponent the learner can meet. elo is the member's fixed rating, the
 // learner's estimate when the save joined, or NAN; wins and games are the
@@ -3227,14 +3229,16 @@ typedef struct {
 
 // The self-play league. Opponent slot s plays policies[s + 1]. Slot 0 holds
 // the learner's newest save, and the other slots redraw members every
-// redraw_steps by prioritized fictitious self-play. The env may report each
-// slot's matches and wins as slot_<s + 1>_matches and slot_<s + 1>_wins; they
-// credit the member loaded in that slot. Without reports, draws are uniform.
+// redraw_steps by prioritized fictitious self-play, or by rating shortfall
+// when shortfall is set. The env may report each slot's matches and wins as
+// slot_<s + 1>_matches and slot_<s + 1>_wins; they credit the member loaded in
+// that slot. Without reports, draws are uniform.
 typedef struct {
     LeagueMember* members;
     int size;
     int max_size;
     int num_slots;
+    bool shortfall;
     // slot_member[s] indexes members, or is -1 before the first load.
     int slot_member[LEAGUE_MAX_SLOTS];
     long slot_step[LEAGUE_MAX_SLOTS];
@@ -3295,17 +3299,30 @@ static void league_read_anchors(League* league, const char* file) {
     fclose(fp);
 }
 
-// Draws a member with weight (1 - p)^2, where p is the learner's win rate.
-static int league_draw(League* league) {
+// Returns member's draw weight. By default it is (1 - p)^2, where p is the
+// learner's win rate. With shortfall it is how far p falls below the score the
+// ratings predict against the learner's rating, plus LEAGUE_SHORTFALL_FLOOR,
+// so a member that beats the learner more often than its rating says is drawn
+// until the learner meets that score. A member without a rating then weighs
+// the floor.
+static double league_weight(const League* league, int index, double rating) {
+    const LeagueMember* member = &league->members[index];
+    double p = league_win_rate(member);
+    if (!league->shortfall) return (1 - p) * (1 - p);
+    if (!isfinite(member->elo) || !isfinite(rating)) return LEAGUE_SHORTFALL_FLOOR;
+    double expected = 1 / (1 + pow(10, (member->elo - rating) / 400));
+    return fmax(0, expected - p) + LEAGUE_SHORTFALL_FLOOR;
+}
+
+// Draws a member by league_weight at the learner's rating.
+static int league_draw(League* league, double rating) {
     double total = 0;
     for (int i = 0; i < league->size; i++) {
-        double loss = 1 - league_win_rate(&league->members[i]);
-        total += loss * loss;
+        total += league_weight(league, i, rating);
     }
     double target = total * rand_r(&league->rng) / ((double)RAND_MAX + 1);
     for (int i = 0; i < league->size - 1; i++) {
-        double loss = 1 - league_win_rate(&league->members[i]);
-        target -= loss * loss;
+        target -= league_weight(league, i, rating);
         if (target < 0) return i;
     }
     return league->size - 1;
@@ -3921,6 +3938,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             && "selfplay.max_size must exceed the opponent slots");
         league.members = (LeagueMember*)calloc(league.max_size, sizeof(LeagueMember));
         league.redraw_steps = puf_ini_get(ini, "selfplay", "opp_timeout_steps");
+        league.shortfall = puf_ini_get(ini, "selfplay", "shortfall") != 0;
         league.rng = puf_ini_get(ini, "selfplay", "seed") + pufferl->hypers.rank;
         league.credit_step = pufferl->global_step * pufferl->hypers.world_size;
         for (int s = 0; s < league.num_slots; s++) {
@@ -3936,7 +3954,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             league_play(&league, pufferl, 0, league_join(&league, initial_checkpoint, NAN),
                 league.credit_step);
             for (int s = 1; s < league.num_slots; s++) {
-                league_play(&league, pufferl, s, league_draw(&league), league.credit_step);
+                league_play(&league, pufferl, s, league_draw(&league, NAN), league.credit_step);
             }
         }
     }
@@ -4094,7 +4112,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             }
             for (int s = 1; s < league.num_slots; s++) {
                 if (league.redraw_steps > 0 && step - league.slot_step[s] >= league.redraw_steps) {
-                    league_play(&league, pufferl, s, league_draw(&league), step);
+                    league_play(&league, pufferl, s, league_draw(&league, elo), step);
                 }
             }
             dict_set(&new_log, "league/size", league.size);
