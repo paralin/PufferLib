@@ -11,6 +11,7 @@
 
 // C standard
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -3860,14 +3861,45 @@ static void RequestTrainStop(int) {
     train_stop_requested = 1;
 }
 
+// A hung GPU call never returns to the loop's deadline and signal checks, so
+// a watchdog thread ends the process with TRAIN_STALL_EXIT when no update
+// completes within stall_seconds. The launcher can then resume from the last
+// full-state save. A wake well past its deadline means the process was
+// stopped, as a capture pauses training, so it grants a fresh interval.
+#define TRAIN_STALL_EXIT 75
+static std::atomic<double> train_heartbeat{0};
+
+static void* WatchTrainStall(void* arg) {
+    double seconds = *(double*)arg;
+    double deadline = train_heartbeat.load() + seconds;
+    for (;;) {
+        double wait = fmax(deadline - wall_clock(), 0);
+        struct timespec pause = {(time_t)wait, (long)((wait - floor(wait)) * 1e9)};
+        nanosleep(&pause, NULL);
+        double now = wall_clock();
+        double next = train_heartbeat.load() + seconds;
+        if (next > now) {
+            deadline = next;
+        } else if (now > deadline + 1) {
+            deadline = now + seconds;
+        } else {
+            fprintf(stderr, "no update completed in %.0f s; exiting\n", seconds);
+            _exit(TRAIN_STALL_EXIT);
+        }
+    }
+    return NULL;
+}
+
 TrainResult run_train(Ini* ini, TrainContext* ctx) {
     double checkpoint_seconds = puf_ini_get(ini, "base", "checkpoint_seconds");
     double first_checkpoint_seconds = puf_ini_get(ini, "base", "first_checkpoint_seconds");
     double stop_at = puf_ini_get(ini, "base", "stop_at_unix");
+    double stall_seconds = puf_ini_get(ini, "base", "stall_seconds");
     bool save_state = puf_ini_get(ini, "base", "save_training_state");
     checkpoint::Require(isfinite(checkpoint_seconds) && checkpoint_seconds >= 0
         && isfinite(first_checkpoint_seconds) && first_checkpoint_seconds >= 0
-        && isfinite(stop_at) && stop_at >= 0, "invalid checkpoint interval or deadline");
+        && isfinite(stop_at) && stop_at >= 0 && isfinite(stall_seconds) && stall_seconds >= 0,
+        "invalid checkpoint interval, deadline or stall limit");
     checkpoint::Require(ctx->world_size == 1
         || (!save_state && checkpoint_seconds == 0 && stop_at == 0),
         "full-state checkpoints and timed stops require one GPU");
@@ -3965,6 +3997,11 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     train_stop_requested = 0;
     auto previous_int = ctx->world_size == 1 ? signal(SIGINT, RequestTrainStop) : SIG_DFL;
     auto previous_term = ctx->world_size == 1 ? signal(SIGTERM, RequestTrainStop) : SIG_DFL;
+    train_heartbeat = wall_clock();
+    pthread_t stall_watch;
+    if (stall_seconds > 0) {
+        pthread_create(&stall_watch, NULL, WatchTrainStall, &stall_seconds);
+    }
     double next_checkpoint = wall_clock() + (first_checkpoint_seconds > 0
         ? first_checkpoint_seconds : checkpoint_seconds);
     bool stopped = false;
@@ -4038,6 +4075,8 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             rollouts(pufferl);
             train_impl(pufferl, NULL);
         }
+
+        train_heartbeat = wall_clock();
 
         bool finished = pufferl->hypers.klpo ? pufferl->global_step >= local_timesteps
             : epoch + 1 >= local_timesteps / batch_size;
@@ -4177,6 +4216,10 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         if (stopped) {
             break;
         }
+    }
+    if (stall_seconds > 0) {
+        pthread_cancel(stall_watch);
+        pthread_join(stall_watch, NULL);
     }
     if (ctx->world_size == 1) {
         signal(SIGINT, previous_int);
