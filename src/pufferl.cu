@@ -3230,16 +3230,18 @@ typedef struct {
 
 // The self-play league. Opponent slot s plays policies[s + 1]. Slot 0 holds
 // the learner's newest save, and the other slots redraw members every
-// redraw_steps by prioritized fictitious self-play, or by rating shortfall
-// when shortfall is set. The env may report each slot's matches and wins as
-// slot_<s + 1>_matches and slot_<s + 1>_wins; they credit the member loaded in
-// that slot. Without reports, draws are uniform.
+// redraw_steps by prioritized fictitious self-play, by rating shortfall when
+// shortfall is set, or toward even matches when even is set. The env may
+// report each slot's matches and wins as slot_<s + 1>_matches and
+// slot_<s + 1>_wins; they credit the member loaded in that slot. Without
+// reports, draws are uniform.
 typedef struct {
     LeagueMember* members;
     int size;
     int max_size;
     int num_slots;
     bool shortfall;
+    bool even;
     // slot_member[s] indexes members, or is -1 before the first load.
     int slot_member[LEAGUE_MAX_SLOTS];
     long slot_step[LEAGUE_MAX_SLOTS];
@@ -3301,14 +3303,16 @@ static void league_read_anchors(League* league, const char* file) {
 }
 
 // Returns member's draw weight. By default it is (1 - p)^2, where p is the
-// learner's win rate. With shortfall it is how far p falls below the score the
-// ratings predict against the learner's rating, plus LEAGUE_SHORTFALL_FLOOR,
-// so a member that beats the learner more often than its rating says is drawn
-// until the learner meets that score. A member without a rating then weighs
-// the floor.
+// learner's win rate. With even it is p(1 - p), which peaks at one half, so
+// the learner mostly meets members it beats about half the time. With
+// shortfall it is how far p falls below the score the ratings predict against
+// the learner's rating, plus LEAGUE_SHORTFALL_FLOOR, so a member that beats
+// the learner more often than its rating says is drawn until the learner meets
+// that score. A member without a rating then weighs the floor.
 static double league_weight(const League* league, int index, double rating) {
     const LeagueMember* member = &league->members[index];
     double p = league_win_rate(member);
+    if (league->even) return p * (1 - p);
     if (!league->shortfall) return (1 - p) * (1 - p);
     if (!isfinite(member->elo) || !isfinite(rating)) return LEAGUE_SHORTFALL_FLOOR;
     double expected = 1 / (1 + pow(10, (member->elo - rating) / 400));
@@ -3971,6 +3975,9 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         league.members = (LeagueMember*)calloc(league.max_size, sizeof(LeagueMember));
         league.redraw_steps = puf_ini_get(ini, "selfplay", "opp_timeout_steps");
         league.shortfall = puf_ini_get(ini, "selfplay", "shortfall") != 0;
+        league.even = puf_ini_get(ini, "selfplay", "even") != 0;
+        assert(!(league.shortfall && league.even)
+            && "selfplay.shortfall and selfplay.even are exclusive");
         league.rng = puf_ini_get(ini, "selfplay", "seed") + pufferl->hypers.rank;
         league.credit_step = pufferl->global_step * pufferl->hypers.world_size;
         for (int s = 0; s < league.num_slots; s++) {
