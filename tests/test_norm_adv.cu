@@ -1,5 +1,5 @@
-// Check train.norm_adv, the constant teacher weight at teacher_steps <= 0 and
-// selfplay.pfsp_mix league weights.
+// Check train.norm_adv, the constant teacher weight at teacher_steps <= 0,
+// selfplay.pfsp_mix league weights and the vec.hist_policy_* value head.
 // Build from the repo root (Linux/CUDA):
 //   mkdir -p build
 //   nvcc -O2 -arch=native -std=c++17 -DPRECISION_FLOAT \
@@ -359,6 +359,101 @@ static void test_pfsp_mix() {
     assert(mixed > even);
 }
 
+// Samples rows of a decoder output with cols columns through head and
+// returns the decoded values.
+static std::vector<float> sample_values(const std::vector<float>& dec_host, int rows,
+        int cols, ValueHead head) {
+    Prec dec = {.data = upload_prec(dec_host), .shape = {rows, cols}};
+    precision_t* mask = upload_prec(std::vector<float>(rows * TEST_CLASSES, 1.0f));
+    precision_t* out = upload_prec(std::vector<float>(2 * rows, 0.0f));
+    float* actions = NULL;
+    int* act_sizes = NULL;
+    curandStatePhilox4_32_10_t* rng = NULL;
+    assert(cudaMalloc((void**)&actions, 2 * rows * sizeof(float)) == cudaSuccess);
+    assert(cudaMalloc((void**)&act_sizes, sizeof(int)) == cudaSuccess);
+    assert(cudaMalloc((void**)&rng, rows * sizeof(*rng)) == cudaSuccess);
+    int classes = TEST_CLASSES;
+    cudaMemcpy(act_sizes, &classes, sizeof(int), cudaMemcpyHostToDevice);
+    rng_init<<<grid_size(rows), BLOCK_SIZE>>>(rng, 7, rows);
+    sample_logits<<<grid_size(rows), BLOCK_SIZE>>>(dec, Prec{}, act_sizes,
+        actions, actions + rows, out, out + rows, rng, mask, TEST_CLASSES, head);
+    assert(cudaDeviceSynchronize() == cudaSuccess);
+
+    float* wide = NULL;
+    assert(cudaMalloc((void**)&wide, rows * sizeof(float)) == cudaSuccess);
+    cast<<<grid_size(rows), BLOCK_SIZE>>>(wide, out + rows, rows);
+    std::vector<float> values = download(wide, rows);
+    for (void* ptr : {(void*)dec.data, (void*)mask, (void*)out, (void*)actions,
+            (void*)act_sizes, (void*)rng, (void*)wide}) {
+        cudaFree(ptr);
+    }
+    return values;
+}
+
+// A layer_norm = 1, value_bins = 51 learner can run legacy opponents and
+// teachers with layer_norm = 0 and a scalar value head.
+static void test_hist_policy_head() {
+    ValueHead learner = {.bins = 51, .min = -2.0f, .max = 3.0f};
+    bool ln;
+    ValueHead head;
+
+    // -1 inherits the learner's layer_norm and bins.
+    assert(hist_policy_head(true, learner, -1, -1, &ln, &head));
+    assert(ln && head.bins == 51 && head.min == -2.0f && head.max == 3.0f);
+    // 0 selects no layer_norm and a scalar value; the range still follows the learner.
+    assert(hist_policy_head(true, learner, 0, 0, &ln, &head));
+    assert(!ln && head.bins == 0 && value_cols(head) == 1 && head.min == -2.0f);
+    // A scalar learner can face a binned opponent.
+    ValueHead scalar = {.bins = 0, .min = -1.0f, .max = 1.0f};
+    assert(hist_policy_head(false, scalar, 1, 21, &ln, &head));
+    assert(ln && head.bins == 21 && value_cols(head) == 21);
+    // Unsupported options and an empty bin range fail.
+    assert(!hist_policy_head(true, learner, 2, -1, &ln, &head));
+    assert(!hist_policy_head(true, learner, -2, -1, &ln, &head));
+    assert(!hist_policy_head(true, learner, -1, 1, &ln, &head));
+    assert(!hist_policy_head(true, learner, -1, -2, &ln, &head));
+    assert(!hist_policy_head(true, learner, -1, VALUE_MAX_BINS + 1, &ln, &head));
+    assert(hist_policy_head(true, learner, -1, VALUE_MAX_BINS, &ln, &head));
+    ValueHead empty = {.bins = 0, .min = 1.0f, .max = 1.0f};
+    assert(!hist_policy_head(false, empty, -1, 51, &ln, &head));
+
+    // Built archs carry the resolved shape.
+    ArchConfig config = {.input_size = OBS_SIZE, .hidden_size = 16, .num_layers = 1,
+        .output_size = TEST_CLASSES, .value_cols = value_cols(learner), .horizon = 4,
+        .continuous = false, .layer_norm = true};
+    Arch learner_arch = build_arch(config);
+    assert(hist_policy_head(true, learner, 0, 0, &ln, &head));
+    config.layer_norm = ln;
+    config.value_cols = value_cols(head);
+    Arch legacy_arch = build_arch(config);
+    assert(learner_arch.network.layer_norm && learner_arch.decoder.value_cols == 51);
+    assert(!legacy_arch.network.layer_norm && legacy_arch.decoder.value_cols == 1);
+
+    // Sampling reads each policy's own value columns after its logits.
+    const int rows = 9;
+    int scalar_cols = TEST_CLASSES + 1;
+    std::vector<float> legacy(rows * scalar_cols);
+    for (int i = 0; i < (int)legacy.size(); i++) {
+        legacy[i] = 0.6f * sinf(0.29f * i);
+    }
+    legacy = round_prec(legacy);
+    std::vector<float> values = sample_values(legacy, rows, scalar_cols, head);
+    for (int r = 0; r < rows; r++) {
+        assert(values[r] == legacy[r * scalar_cols + TEST_CLASSES]);
+    }
+    int binned_cols = TEST_CLASSES + learner.bins;
+    std::vector<float> binned(rows * binned_cols, 0.0f);
+    for (int r = 0; r < rows; r++) {
+        binned[r * binned_cols + TEST_CLASSES + learner.bins - 1] = 30.0f;
+    }
+    values = sample_values(binned, rows, binned_cols, learner);
+    float top = learner.min + (learner.bins - 0.5f) * (learner.max - learner.min) / learner.bins;
+    for (int r = 0; r < rows; r++) {
+        assert(fabsf(values[r] - top) < kTolerance * fabsf(top) + 1e-3f);
+    }
+    printf("hist policy head: ok\n");
+}
+
 int main() {
     Harness h;
     harness_init(&h);
@@ -366,6 +461,7 @@ int main() {
     test_norm_adv_degenerate(&h);
     test_teacher_coef();
     test_pfsp_mix();
+    test_hist_policy_head();
     printf("test_norm_adv: ok\n");
     return 0;
 }

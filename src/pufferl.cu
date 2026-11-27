@@ -513,12 +513,13 @@ struct EnvBuf {
 
 // Owned runnable policy instance. policies[0] is trainable; policies[i>0] are
 // frozen opponents (selfplay/match). Frozen policies are rollout-only (no train
-// acts/grads/muon) and may use a different arch via hist_policy_hidden_size /
-// hist_policy_num_layers. Primary registers rollout acts into PuffeRL.activ_alloc
-// (shared with train); frozen policies use their own activ_alloc.
+// acts/grads/muon) and may use a different arch via vec.hist_policy_*.
+// Primary registers rollout acts into PuffeRL.activ_alloc (shared with train);
+// frozen policies use their own activ_alloc.
 typedef struct {
     bool frozen;
     Arch arch;
+    ValueHead value_head;  // decodes this policy's value columns
     Weights weights;
     Allocator params_alloc;
     Allocator activ_alloc;
@@ -913,7 +914,7 @@ static void teacher_sample(PuffeRL* pufferl, int buf, int t, int sub, int n,
     sample_logits<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
         dec, Prec{}, pufferl->act_sizes, actions.data, actions.data,
         scratch, scratch + n, pufferl->rng_states[buf],
-        mask.data, (int)rollouts.action_mask.shape[2], pufferl->hypers.value_head);
+        mask.data, (int)rollouts.action_mask.shape[2], teacher->value_head);
 }
 
 static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
@@ -1012,7 +1013,7 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
             act_b.data, env->actions.data + (long)sub * act_cols,
             lp_b.data, val_b.data,
             pufferl->rng_states[buf] + off,
-            mask_b.data, mask_stride, hypers->value_head);
+            mask_b.data, mask_stride, pol->value_head);
         if (!pol->frozen) {
             Prec expert_b = puf_slice(rollouts.expert, t, sub, n);
             apply_expert<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(expert_b.data,
@@ -2308,6 +2309,30 @@ static void policy_register(Policy* pol, ArchConfig config, Allocator* activ_all
     }
 }
 
+// vec.hist_policy_layer_norm or vec.hist_policy_value_bins; configs saved
+// before these options existed inherit the learner's.
+static int hist_policy_opt(Dict* vec, const char* key) {
+    return dict_find(vec, key) ? (int)dict_get(vec, key) : -1;
+}
+
+// Resolves the layer_norm and value head of frozen opponents and the teacher
+// from the learner's. -1 inherits; value_min and value_max always follow the
+// learner. Returns false for an unsupported option.
+static bool hist_policy_head(bool layer_norm, ValueHead value_head,
+        int layer_norm_opt, int value_bins_opt,
+        bool* hist_layer_norm, ValueHead* hist_value_head) {
+    if (layer_norm_opt < -1 || layer_norm_opt > 1 || value_bins_opt < -1
+            || value_bins_opt == 1 || value_bins_opt > VALUE_MAX_BINS) {
+        return false;
+    }
+    *hist_layer_norm = layer_norm_opt >= 0 ? layer_norm_opt != 0 : layer_norm;
+    *hist_value_head = value_head;
+    if (value_bins_opt >= 0) {
+        hist_value_head->bins = value_bins_opt;
+    }
+    return hist_value_head->bins == 0 || hist_value_head->min < hist_value_head->max;
+}
+
 PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     // Older paired PPO states predate the learner selector. Their saved config
     // remains authoritative; only the newly introduced options need defaults.
@@ -2567,6 +2592,17 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     // All policies: policies[0] trainable, rest historical/frozen (rollout-only).
     int hist_hidden = dict_get(&vec_kwargs, "hist_policy_hidden_size");
     int hist_layers = dict_get(&vec_kwargs, "hist_policy_num_layers");
+    bool hist_layer_norm;
+    ValueHead hist_value_head;
+    if (!hist_policy_head(hypers.layer_norm, hypers.value_head,
+            hist_policy_opt(&vec_kwargs, "hist_policy_layer_norm"),
+            hist_policy_opt(&vec_kwargs, "hist_policy_value_bins"),
+            &hist_layer_norm, &hist_value_head)) {
+        fprintf(stderr, "vec.hist_policy_layer_norm must be -1, 0 or 1; "
+            "vec.hist_policy_value_bins must be -1, 0 or 2..%d with value_min < value_max\n",
+            VALUE_MAX_BINS);
+        exit(1);
+    }
     pufferl->num_policies = vec->num_policies;
     assert(!(pufferl->num_policies > 1 && (hist_hidden <= 0 || hist_layers <= 0))
         && "num_policies > 1 requires hist_policy_hidden_size and hist_policy_num_layers > 0");
@@ -2583,6 +2619,12 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         ArchConfig config = arch_config;
         config.hidden_size = pol->frozen ? hist_hidden : hidden_size;
         config.num_layers = pol->frozen ? hist_layers : num_layers;
+        pol->value_head = hypers.value_head;
+        if (pol->frozen) {
+            config.layer_norm = hist_layer_norm;
+            config.value_cols = value_cols(hist_value_head);
+            pol->value_head = hist_value_head;
+        }
         int slice = vec->policy_layout[b + 1] - vec->policy_layout[b];
         assert(slice > 0 && "policy has no agents");
         policy_register(pol, config, pol->frozen ? &pol->activ_alloc : acts,
@@ -2604,6 +2646,13 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         ArchConfig config = arch_config;
         config.hidden_size = hist_hidden > 0 ? hist_hidden : hidden_size;
         config.num_layers = hist_hidden > 0 ? hist_layers : num_layers;
+        config.layer_norm = hist_layer_norm;
+        config.value_cols = value_cols(hist_value_head);
+        teacher->value_head = hist_value_head;
+        if (config.layer_norm && config.num_layers == 0) {
+            fprintf(stderr, "vec.hist_policy_layer_norm requires recurrent teacher layers\n");
+            exit(1);
+        }
         int rows = vec->policy_layout[1];
         policy_register(teacher, config, &teacher->activ_alloc, num_buffers, rows);
         pufferl->teacher_scratch = {.shape = {2, rows}};
@@ -3845,6 +3894,8 @@ static PuffeRL* eval_make(Ini* ini, TrainContext* ctx, int mode, int render) {
     }
     puf_ini_put(ini, "base.reset_every_horizon", "0");
     puf_ini_put(ini, "train.learner", "ppo");
+    // Eval never trains; a teacher would take the enemy's vec.hist_policy_* head.
+    puf_ini_put(ini, "train.teacher", "None");
     if (render) {
         puf_ini_put(ini, "train.horizon", "1");
     }
@@ -3953,6 +4004,17 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             (int)puf_ini_get(ini, "policy", "num_layers"));
         puf_ini_put(ini, "vec.hist_policy_hidden_size", hb);
         puf_ini_put(ini, "vec.hist_policy_num_layers", lb);
+        // Learner saves fill the league, so its layer_norm and value head must
+        // be the learner's; the teacher follows the same options.
+        Dict* vec = puf_ini_section(ini, "vec", 0);
+        int ln_opt = hist_policy_opt(vec, "hist_policy_layer_norm");
+        int vb_opt = hist_policy_opt(vec, "hist_policy_value_bins");
+        if ((ln_opt >= 0 && (ln_opt != 0) != (puf_ini_get(ini, "policy", "layer_norm") != 0))
+                || (vb_opt >= 0 && vb_opt != (int)puf_ini_get(ini, "policy", "value_bins"))) {
+            fprintf(stderr, "selfplay requires vec.hist_policy_layer_norm and "
+                "vec.hist_policy_value_bins to resolve to the learner's (use -1)\n");
+            exit(1);
+        }
         double ladder[SELFPLAY_MAX_LADDER];
         assert((puf_ini_get(ini, "selfplay", "eval_bot_games") <= 0
             || puf_ini_get_list(ini, "selfplay", "eval_bots", ladder,
