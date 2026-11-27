@@ -2127,10 +2127,16 @@ struct PPOKernelArgs {
     float clip_coef, vf_clip_coef, vf_coef;
     const float* ent_coef;  // device ptr — host by-value bakes into CUDA graphs
     const float* teacher_coef;
+    // adv_stats holds the minibatch's free-row advantage (mean, 1 / (std + 1e-8)),
+    // or is NULL to train on raw advantages.
+    const float* adv_stats;
     int T_seq, A_total, N;
     ValueHead value_head;
     bool is_continuous;
 };
+
+// Channels of the per-block advantage partials: free-row count, sum, sum of squares.
+constexpr int ADV_STATS_N = 3;
 
 struct PPOBufs {
     Float grad_logits, grad_values, grad_logstd;
@@ -2138,6 +2144,8 @@ struct PPOBufs {
     Float ppo_partials;
     float* ent_coef;     // device scalar (graphs cannot bake host by-value)
     float* teacher_coef; // device scalar
+    Float adv_partials;  // (ppo_grid, 3) free-row count, sum and sum of squares
+    float* adv_stats;    // device (mean, inv_std) for train.norm_adv
 };
 
 void register_ppo_buffers(PPOBufs& bufs, Allocator* alloc, int N, int T, int A_total,
@@ -2152,6 +2160,8 @@ void register_ppo_buffers(PPOBufs& bufs, Allocator* alloc, int N, int T, int A_t
         .ppo_partials = {.shape = {ppo_grid * LOSS_N}},
         .ent_coef = NULL,
         .teacher_coef = NULL,
+        .adv_partials = {.shape = {ppo_grid * ADV_STATS_N}},
+        .adv_stats = NULL,
     };
     alloc_register(alloc, &bufs.grad_logits);
     alloc_register(alloc, &bufs.grad_values);
@@ -2160,9 +2170,11 @@ void register_ppo_buffers(PPOBufs& bufs, Allocator* alloc, int N, int T, int A_t
         alloc_register(alloc, &bufs.grad_logstd);
     }
     alloc_register(alloc, &bufs.ppo_partials);
+    alloc_register(alloc, &bufs.adv_partials);
     cudaMalloc((void**)&bufs.ent_coef, sizeof(float));
     cudaMalloc((void**)&bufs.teacher_coef, sizeof(float));
     cudaMemset(bufs.teacher_coef, 0, sizeof(float));
+    cudaMalloc((void**)&bufs.adv_stats, 2 * sizeof(float));
 }
 
 // Discrete only. mask is always present (env mask or synthetic all-ones).
@@ -2367,6 +2379,9 @@ __global__ void ppo_loss_compute(
         bool expert = !isnan(expert_weight);
         float free = expert ? 0.0f : 1.0f;
         float adv_for_pg = to_float(g.advantages[nt]);
+        if (a.adv_stats) {
+            adv_for_pg = (adv_for_pg - a.adv_stats[0]) * a.adv_stats[1];
+        }
         float ret = to_float(g.returns[nt]);
         float ent_coef = *a.ent_coef;
         float d_entropy_term = inv_NT * (-ent_coef) * free;
@@ -2515,6 +2530,58 @@ __global__ void ppo_loss_reduce(
     }
 }
 
+// Sums each block's free-row advantages into partials[block * ADV_STATS_N].
+// Expert rows (non-NaN expert weight) are excluded.
+__global__ void ppo_adv_partials(
+        float* __restrict__ partials,
+        const precision_t* __restrict__ advantages,
+        const precision_t* __restrict__ expert, int total) {
+    __shared__ float block_stats[ADV_STATS_N][PPO_THREADS];
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int tid = threadIdx.x;
+    bool free = idx < total && isnan(to_float(expert[idx]));
+    float adv = free ? to_float(advantages[idx]) : 0.0f;
+    block_stats[0][tid] = free ? 1.0f : 0.0f;
+    block_stats[1][tid] = adv;
+    block_stats[2][tid] = adv * adv;
+    block_reduce_sum(&block_stats[0][0], &partials[blockIdx.x * ADV_STATS_N],
+        tid, PPO_THREADS, ADV_STATS_N);
+}
+
+// Folds the block partials in a fixed order into stats = (mean, 1 / (std + 1e-8)),
+// with std the sample standard deviation. Fewer than two free rows keep unit
+// scale, so a lone free row trains on zero advantage and none yields no NaN.
+__global__ void ppo_adv_stats(
+        float* __restrict__ stats,
+        const float* __restrict__ partials, int num_blocks) {
+    __shared__ float block_stats[ADV_STATS_N][PPO_THREADS];
+    int tid = threadIdx.x;
+    float sums[ADV_STATS_N] = {0.0f, 0.0f, 0.0f};
+    for (int b = tid; b < num_blocks; b += PPO_THREADS) {
+        for (int c = 0; c < ADV_STATS_N; c++) {
+            sums[c] += partials[b * ADV_STATS_N + c];
+        }
+    }
+    for (int c = 0; c < ADV_STATS_N; c++) {
+        block_stats[c][tid] = sums[c];
+    }
+    float totals[ADV_STATS_N];
+    block_reduce_sum(&block_stats[0][0], totals, tid, PPO_THREADS, ADV_STATS_N);
+    if (tid != 0) {
+        return;
+    }
+
+    float count = totals[0];
+    float mean = count > 0.0f ? totals[1] / count : 0.0f;
+    float inv_std = 1.0f;
+    if (count > 1.0f) {
+        float var = fmaxf(0.0f, (totals[2] - totals[1] * mean) / (count - 1.0f));
+        inv_std = 1.0f / (sqrtf(var) + 1e-8f);
+    }
+    stats[0] = mean;
+    stats[1] = inv_std;
+}
+
 void ppo_loss_fwd_bwd(
         Prec& dec_out,    // (N, T, fused_cols) - fused logits+value from decoder
         Prec& logstd,     // continuous logstd or empty
@@ -2522,11 +2589,20 @@ void ppo_loss_fwd_bwd(
         int* act_sizes, float* losses_acc,
         float clip_coef, float vf_clip_coef, float vf_coef, const float* ent_coef,
         const float* teacher_coef, PPOBufs& bufs, ValueHead value_head, bool is_continuous,
-        cudaStream_t stream) {
+        bool norm_adv, cudaStream_t stream) {
     int N = dec_out.shape[0], T = dec_out.shape[1], fused_cols = dec_out.shape[2];
     int A_total = fused_cols - value_cols(value_head);  // value columns follow the logits
     int total = N * T;
     int ppo_grid = (total + PPO_THREADS - 1) / PPO_THREADS;
+
+    // Free-row advantage statistics stay on device, so the step needs no host
+    // sync and replays inside a graph.
+    if (norm_adv) {
+        ppo_adv_partials<<<ppo_grid, PPO_THREADS, 0, stream>>>(
+            bufs.adv_partials.data, graph.mb_advantages.data, graph.mb_expert.data, total);
+        ppo_adv_stats<<<1, PPO_THREADS, 0, stream>>>(
+            bufs.adv_stats, bufs.adv_partials.data, ppo_grid);
+    }
 
     PPOGraphArgs graph_args = {
         .imp = graph.mb_imp.data,
@@ -2555,6 +2631,7 @@ void ppo_loss_fwd_bwd(
         .vf_coef = vf_coef,
         .ent_coef = ent_coef,
         .teacher_coef = teacher_coef,
+        .adv_stats = norm_adv ? bufs.adv_stats : NULL,
         .T_seq = T, .A_total = A_total, .N = N,
         .value_head = value_head,
         .is_continuous = is_continuous,

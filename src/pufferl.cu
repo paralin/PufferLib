@@ -327,6 +327,7 @@ typedef struct {
     float ent_coef;
     float min_ent_coef_ratio;
     bool anneal_ent_coef;
+    bool norm_adv;
     float teacher_weight;
     long teacher_steps;
     float gamma;
@@ -1916,7 +1917,8 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
                 pufferl->act_sizes, pufferl->losses,
                 hypers->clip_coef, hypers->vf_clip_coef, hypers->vf_coef,
                 pufferl->ppo_bufs.ent_coef, pufferl->ppo_bufs.teacher_coef,
-                pufferl->ppo_bufs, hypers->value_head, pufferl->is_continuous, stream);
+                pufferl->ppo_bufs, hypers->value_head, pufferl->is_continuous,
+                hypers->norm_adv, stream);
         }
 
         Float grad_logits = pufferl->ppo_bufs.grad_logits;
@@ -1950,6 +1952,21 @@ float puf_current_gamma(const PuffeRL* pufferl) {
     double fraction = fmin(1.0, (double)pufferl->completed_episodes / hypers->gamma_episodes);
     return 1.0 - (1.0 - hypers->gamma)
         * pow((1.0 - hypers->gamma_end) / (1.0 - hypers->gamma), fraction);
+}
+
+// The teacher's imitation weight: teacher_weight falling linearly to zero at
+// teacher_steps, or held constant without a positive teacher_steps. Zero
+// without a teacher.
+float puf_teacher_coef(const PuffeRL* pufferl) {
+    const Hypers* hypers = &pufferl->hypers;
+    if (!pufferl->teaching) {
+        return 0.0f;
+    }
+    if (hypers->teacher_steps <= 0) {
+        return hypers->teacher_weight;
+    }
+    return hypers->teacher_weight * (float)fmax(0.0,
+        1.0 - (double)pufferl->global_step / hypers->teacher_steps);
 }
 
 void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
@@ -1990,8 +2007,7 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
     // Host write + H2D stay outside the graph; device ptr is what kernels read.
     cudaMemcpyAsync(pufferl->ppo_bufs.ent_coef, &current_ent_coef,
         sizeof(float), cudaMemcpyHostToDevice, train_stream);
-    float teacher_coef = pufferl->teaching ? hypers->teacher_weight * (float)fmax(0.0,
-        1.0 - (double)pufferl->global_step / hypers->teacher_steps) : 0.0f;
+    float teacher_coef = puf_teacher_coef(pufferl);
     cudaMemcpyAsync(pufferl->ppo_bufs.teacher_coef, &teacher_coef,
         sizeof(float), cudaMemcpyHostToDevice, train_stream);
 
@@ -2313,6 +2329,9 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         dict_set(train, "teacher_weight", 0);
         dict_set(train, "teacher_steps", 0);
     }
+    if (!dict_find(train, "norm_adv")) {
+        dict_set(train, "norm_adv", 0);
+    }
     const char* learner = dict_get_str(train, "learner");
     const char* returns = dict_get_str(train, "klpo_returns");
     if (strcmp(learner, "ppo") != 0 && strcmp(learner, "klpo") != 0) {
@@ -2364,6 +2383,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         .ent_coef = puf_ini_get(ini, "train", "ent_coef"),
         .min_ent_coef_ratio = puf_ini_get(ini, "train", "min_ent_coef_ratio"),
         .anneal_ent_coef = puf_ini_get(ini, "train", "anneal_ent_coef") != 0,
+        .norm_adv = puf_ini_get(ini, "train", "norm_adv") != 0,
         .teacher_weight = (float)puf_ini_get(ini, "train", "teacher_weight"),
         .teacher_steps = (long)puf_ini_get(ini, "train", "teacher_steps"),
         .gamma = puf_ini_get(ini, "train", "gamma"),
@@ -2574,9 +2594,9 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     pufferl->teaching = strcmp(teacher_path, "None") != 0;
     if (pufferl->teaching) {
         if (is_continuous || hypers.klpo || !(hypers.teacher_weight > 0)
-                || hypers.teacher_steps <= 0) {
+                || hypers.teacher_steps < 0) {
             fprintf(stderr, "train.teacher requires discrete PPO, a positive teacher_weight "
-                "and positive teacher_steps\n");
+                "and nonnegative teacher_steps\n");
             exit(1);
         }
         Policy* teacher = &pufferl->teacher;
@@ -3231,7 +3251,8 @@ typedef struct {
 // The self-play league. Opponent slot s plays policies[s + 1]. Slot 0 holds
 // the learner's newest save, and the other slots redraw members every
 // redraw_steps by prioritized fictitious self-play, by rating shortfall when
-// shortfall is set, or toward even matches when even is set. The env may
+// shortfall is set, toward even matches when even is set, or by a blend of
+// the two when pfsp_mix is positive. The env may
 // report each slot's matches and wins as slot_<s + 1>_matches and
 // slot_<s + 1>_wins; they credit the member loaded in that slot. Without
 // reports, draws are uniform.
@@ -3242,6 +3263,8 @@ typedef struct {
     int num_slots;
     bool shortfall;
     bool even;
+    // pfsp_mix in (0, 1] blends the (1 - p)^2 and p(1 - p) weights; 0 disables.
+    double pfsp_mix;
     // slot_member[s] indexes members, or is -1 before the first load.
     int slot_member[LEAGUE_MAX_SLOTS];
     long slot_step[LEAGUE_MAX_SLOTS];
@@ -3308,10 +3331,15 @@ static void league_read_anchors(League* league, const char* file) {
 // shortfall it is how far p falls below the score the ratings predict against
 // the learner's rating, plus LEAGUE_SHORTFALL_FLOOR, so a member that beats
 // the learner more often than its rating says is drawn until the learner meets
-// that score. A member without a rating then weighs the floor.
+// that score. A member without a rating then weighs the floor. With pfsp_mix
+// m it is m(1 - p)^2 + (1 - m)p(1 - p), so hard members keep a share of draws
+// that even alone would starve.
 static double league_weight(const League* league, int index, double rating) {
     const LeagueMember* member = &league->members[index];
     double p = league_win_rate(member);
+    if (league->pfsp_mix > 0) {
+        return league->pfsp_mix * (1 - p) * (1 - p) + (1 - league->pfsp_mix) * p * (1 - p);
+    }
     if (league->even) return p * (1 - p);
     if (!league->shortfall) return (1 - p) * (1 - p);
     if (!isfinite(member->elo) || !isfinite(rating)) return LEAGUE_SHORTFALL_FLOOR;
@@ -3976,8 +4004,13 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         league.redraw_steps = puf_ini_get(ini, "selfplay", "opp_timeout_steps");
         league.shortfall = puf_ini_get(ini, "selfplay", "shortfall") != 0;
         league.even = puf_ini_get(ini, "selfplay", "even") != 0;
+        league.pfsp_mix = puf_ini_get(ini, "selfplay", "pfsp_mix");
         assert(!(league.shortfall && league.even)
             && "selfplay.shortfall and selfplay.even are exclusive");
+        assert(league.pfsp_mix >= 0 && league.pfsp_mix <= 1
+            && "selfplay.pfsp_mix must lie in [0, 1]");
+        assert(!(league.pfsp_mix > 0 && (league.shortfall || league.even))
+            && "selfplay.pfsp_mix excludes selfplay.shortfall and selfplay.even");
         league.rng = puf_ini_get(ini, "selfplay", "seed") + pufferl->hypers.rank;
         league.credit_step = pufferl->global_step * pufferl->hypers.world_size;
         for (int s = 0; s < league.num_slots; s++) {
